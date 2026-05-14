@@ -434,10 +434,21 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 }
 
 func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
-	// Type 25 = SEND_MESSAGE (Message sent by you from another device)
-	// Type 26 = RECEIVE_MESSAGE (Message received from another user)
+	opType := OperationType(op.Type)
 
-	if OperationType(op.Type) == OpContactUpdate {
+	if opType == OpSendMessage {
+		lc.reqSeqMu.Lock()
+		_, ok := lc.sentReqSeqs[op.ReqSeq]
+		if ok {
+			delete(lc.sentReqSeqs, op.ReqSeq)
+			lc.reqSeqMu.Unlock()
+			return
+		}
+		lc.reqSeqMu.Unlock()
+	}
+
+	switch opType {
+	case OpContactUpdate:
 		mid := op.Param1
 		lc.cacheMu.Lock()
 		delete(lc.contactCache, mid)
@@ -452,7 +463,6 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Name:        &name,
 			})
 		}
-		// Also update the DM portal room name
 		var avatar *bridgev2.Avatar
 		if contact.PicturePath != "" {
 			picturePath := contact.PicturePath
@@ -477,16 +487,11 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Avatar: avatar,
 			},
 		})
-		return
-	}
 
-	if OperationType(op.Type) == OpDeleteSelfFromChat {
+	case OpDeleteSelfFromChat:
 		lc.handleSelfLeave(op.Param1)
-		return
-	}
 
-	if OperationType(op.Type) == OpSendChatRemoved {
-		// Check if we initiated this leave (from HandleMatrixLeaveRoom)
+	case OpSendChatRemoved:
 		lc.reqSeqMu.Lock()
 		_, ok := lc.sentReqSeqs[op.ReqSeq]
 		if ok {
@@ -496,61 +501,42 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}
 		lc.reqSeqMu.Unlock()
 		lc.handleSelfLeave(op.Param1)
-		return
-	}
 
-	if OperationType(op.Type) == OpDeleteOtherFromChat {
-		lc.UserLogin.Bridge.Log.Debug().Str("chat_mid", op.Param1).Str("leaver_mid", op.Param2).Str("param3", op.Param3).Msg("OpDeleteOtherFromChat")
+	case OpDeleteOtherFromChat:
 		lc.handleMemberLeave(op.Param1, op.Param2)
-		return
-	}
 
-	if OperationType(op.Type) == OpNotifiedLeaveChat {
-		lc.UserLogin.Bridge.Log.Debug().Str("param1", op.Param1).Str("param2", op.Param2).Msg("OpNotifiedLeaveChat")
-		// Try both param orderings: LINE sometimes sends params swapped compared to other ops
+	case OpNotifiedLeaveChat:
 		lower1 := strings.ToLower(op.Param1)
 		if strings.HasPrefix(lower1, "c") || strings.HasPrefix(lower1, "r") {
 			lc.handleMemberLeave(op.Param1, op.Param2)
 		} else {
 			lc.handleMemberLeave(op.Param2, op.Param1)
 		}
-		return
-	}
 
-	if OperationType(op.Type) == OpNotifiedJoinChat {
+	case OpNotifiedJoinChat:
 		lc.handleMemberJoin(op.Param1, op.Param2)
-		return
-	}
 
-	if OperationType(op.Type) == OpCancelInvitation {
-		// param1 = chatMid, param2 = canceller, param3 = invitee whose invitation was cancelled
+	case OpCancelInvitation:
 		lc.handleMemberLeave(op.Param1, op.Param3)
-		return
-	}
 
-	if OperationType(op.Type) == OpInviteIntoChat || OperationType(op.Type) == OpNotifiedInviteIntoChat {
+	case OpInviteIntoChat, OpNotifiedInviteIntoChat:
 		lc.wg.Add(1)
 		go func() {
 			defer lc.wg.Done()
 			lc.handleInvite(context.Background(), op.Param1)
 		}()
-		return
-	}
 
-	if OperationType(op.Type) == OpChatUpdate2 || OperationType(op.Type) == OpChatUpdate {
+	case OpChatUpdate, OpChatUpdate2:
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", op.Param1).Int("op_type", op.Type).Msg("Received chat update operation")
 		lc.wg.Add(1)
 		go func() {
 			defer lc.wg.Done()
 			lc.syncSingleChat(context.Background(), op)
 		}()
-	}
 
-	if OperationType(op.Type) == OpReadReceipt {
+	case OpReadReceipt:
 		portalID := makePortalID(op.Param1)
 		senderID := makeUserID(op.Param2)
-		// Param 1 is the group id or sender id in 1:1 chats
-		// Param 2 is the user who read the message
 
 		ts, _ := op.CreatedTime.Int64()
 		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
@@ -565,9 +551,8 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			},
 			ReadUpTo: time.UnixMilli(ts),
 		})
-	}
 
-	if OperationType(op.Type) == OpUnsendLocal || OperationType(op.Type) == OpUnsendRemote {
+	case OpUnsendLocal, OpUnsendRemote:
 		chatMid := op.Param1
 		msgID := op.Param2
 		lc.UserLogin.Bridge.Log.Info().Str("msg_id", msgID).Str("chat_mid", chatMid).Int("op_type", op.Type).Msg("Received unsend operation")
@@ -581,9 +566,8 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			},
 			TargetMessage: networkid.MessageID(msgID),
 		})
-	}
 
-	if OperationType(op.Type) == OpReaction {
+	case OpReaction:
 		lc.wg.Add(1)
 		go func() {
 			defer lc.wg.Done()
@@ -667,34 +651,24 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Emoji:         string(mxc),
 			})
 		}()
-	}
 
-	if OperationType(op.Type) == OpSendMessage {
-		lc.reqSeqMu.Lock()
-		_, ok := lc.sentReqSeqs[op.ReqSeq]
-		if ok {
-			delete(lc.sentReqSeqs, op.ReqSeq)
-			lc.reqSeqMu.Unlock()
-			return
+	case OpSendMessage, OpReceiveMessage:
+		if op.Message != nil {
+			if op.Message.ContentType == 18 {
+				lc.handleSystemMessage(op)
+			} else {
+				lc.queueIncomingMessage(op.Message, op.Type)
+			}
 		}
-		lc.reqSeqMu.Unlock()
-	}
 
-	if (OperationType(op.Type) == OpSendMessage || OperationType(op.Type) == OpReceiveMessage) && op.Message != nil {
-		if op.Message.ContentType == 18 {
-			lc.handleSystemMessage(op)
-			return
-		}
-		lc.queueIncomingMessage(op.Message, op.Type)
-		return
+	default:
+		lc.UserLogin.Bridge.Log.Debug().
+			Int("op_type", op.Type).
+			Str("param1", op.Param1).
+			Str("param2", op.Param2).
+			Str("param3", op.Param3).
+			Msg("Unhandled SSE operation")
 	}
-
-	lc.UserLogin.Bridge.Log.Debug().
-		Int("op_type", op.Type).
-		Str("param1", op.Param1).
-		Str("param2", op.Param2).
-		Str("param3", op.Param3).
-		Msg("Unhandled SSE operation")
 }
 
 func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
