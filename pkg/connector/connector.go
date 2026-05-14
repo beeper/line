@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	lineQRLoginFlowID    = "qr"
-	lineEmailLoginFlowID = "email"
+	lineQRLoginFlowID       = "qr"
+	lineEmailLoginFlowID    = "dev.highest.matrix.line.email_login"
+	lineEmailLoginFlowAlias = "email"
 )
 
 type LineConnector struct {
@@ -126,7 +127,7 @@ func (lc *LineConnector) CreateLogin(ctx context.Context, user *bridgev2.User, f
 	switch flowID {
 	case "", lineQRLoginFlowID:
 		return &LineQRLogin{User: user, Certificate: storedCertificateForUser(user)}, nil
-	case lineEmailLoginFlowID:
+	case lineEmailLoginFlowID, lineEmailLoginFlowAlias:
 		return &LineEmailLogin{User: user}, nil
 	default:
 		return nil, bridgev2.ErrInvalidLoginFlowID
@@ -151,6 +152,7 @@ type LineQRLogin struct {
 	client        *line.Client
 	AuthSessionID string
 	Certificate   string
+	LoginKeyID    int
 	QRScanned     bool
 	PINRequired   bool
 
@@ -176,6 +178,7 @@ func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate QR login e2ee secret: %w", err)
 	}
+	lq.LoginKeyID = secretRes.LoginKeyID
 	callbackURL, err := line.QRCodeCallbackURLWithE2EESecret(qrCode.CallbackURL, secretRes.PublicKeyBase64)
 	if err != nil {
 		return nil, err
@@ -210,7 +213,7 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to complete QR login: %w", err)
 		}
-		return finishLineLogin(ctx, lq.User, "", "", res)
+		return finishLineLoginWithLoginKey(ctx, lq.User, "", "", res, lq.LoginKeyID)
 	}
 
 	if !lq.QRScanned {
@@ -224,7 +227,7 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to complete QR login: %w", err)
 			}
-			return finishLineLogin(ctx, lq.User, "", "", res)
+			return finishLineLoginWithLoginKey(ctx, lq.User, "", "", res, lq.LoginKeyID)
 		}
 
 		pin, err := lq.client.CreatePinCode(lq.AuthSessionID)
@@ -490,6 +493,10 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 }
 
 func finishLineLogin(ctx context.Context, user *bridgev2.User, email, password string, res *line.LoginResult) (*bridgev2.LoginStep, error) {
+	return finishLineLoginWithLoginKey(ctx, user, email, password, res, 0)
+}
+
+func finishLineLoginWithLoginKey(ctx context.Context, user *bridgev2.User, email, password string, res *line.LoginResult, loginKeyID int) (*bridgev2.LoginStep, error) {
 	if res == nil {
 		return nil, fmt.Errorf("login result missing")
 	}
@@ -519,7 +526,7 @@ func finishLineLogin(ctx context.Context, user *bridgev2.User, email, password s
 
 	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: email, Password: password, Certificate: res.Certificate, Mid: res.Mid}
 
-	fetchLoginKeys(user, res, meta, client)
+	fetchLoginKeys(user, res, meta, client, loginKeyID)
 
 	detectedLineID := networkid.UserLoginID(profile.Mid)
 
@@ -564,7 +571,7 @@ func linePINStep(stepID, pin string) *bridgev2.LoginStep {
 	}
 }
 
-func fetchLoginKeys(user *bridgev2.User, res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) {
+func fetchLoginKeys(user *bridgev2.User, res *line.LoginResult, meta *UserLoginMetadata, client *line.Client, loginKeyID int) {
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
 		return
 	}
@@ -586,7 +593,7 @@ func fetchLoginKeys(user *bridgev2.User, res *line.LoginResult, meta *UserLoginM
 		user.Bridge.Log.Warn().Err(err).Msg("Login: InitStorage failed")
 		return
 	}
-	exported, err := mgr.InitFromLoginKeyChain(res.E2EEPublicKey, res.EncryptedKeyChain)
+	exported, err := mgr.InitFromLoginKeyChainWithKey(loginKeyID, res.E2EEPublicKey, res.EncryptedKeyChain)
 	if err != nil {
 		user.Bridge.Log.Warn().Err(err).Msg("Login: InitFromLoginKeyChain failed")
 		return
