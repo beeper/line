@@ -5,11 +5,11 @@ import "encoding/json"
 // SticonOwnership represents a sticon ownership entry returned by
 // getSticonOwnershipByMid, mapping an ownership token to sticon details.
 type SticonOwnership struct {
-	ProductID       string `json:"productId"`
-	EmojiID         string `json:"emojiId"`
-	OwnershipToken  string `json:"ownershipToken"`
-	ResourceType    int    `json:"resourceType,omitempty"`
-	Version         int    `json:"version,omitempty"`
+	ProductID      string `json:"productId"`
+	EmojiID        string `json:"emojiId"`
+	OwnershipToken string `json:"ownershipToken"`
+	ResourceType   int    `json:"resourceType,omitempty"`
+	Version        int    `json:"version,omitempty"`
 }
 
 type ReactionPayload struct {
