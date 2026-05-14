@@ -238,7 +238,9 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 				if err := json.Unmarshal([]byte(mentionStr), &mentionData); err != nil {
 					lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to unmarshal MENTION metadata")
 				} else {
-					ghostFormatter, ok := lc.UserLogin.Bridge.Matrix.(interface{ FormatGhostMXID(networkid.UserID) id.UserID })
+					ghostFormatter, ok := lc.UserLogin.Bridge.Matrix.(interface {
+						FormatGhostMXID(networkid.UserID) id.UserID
+					})
 					lc.UserLogin.Bridge.Log.Debug().Bool("formatter_ok", ok).Msg("Checking FormatGhostMXID availability")
 					mentions := &event.Mentions{}
 					type mentionEntry struct {
