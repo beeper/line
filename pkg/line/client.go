@@ -487,14 +487,31 @@ func (c *Client) RefreshAccessToken(refreshToken string) (*TokenV3IssueResult, e
 		return nil, err
 	}
 
+	var wrapper struct {
+		Code    int                 `json:"code"`
+		Message string              `json:"message"`
+		Data    *TokenV3IssueResult `json:"data"`
+	}
+	if err := json.Unmarshal(respBytes, &wrapper); err == nil && wrapper.Data != nil {
+		if wrapper.Code != 0 {
+			return nil, fmt.Errorf("tokenRefresh failed: %s", wrapper.Message)
+		}
+		if wrapper.Data.AccessToken == "" {
+			return nil, fmt.Errorf("tokenRefresh returned empty access token")
+		}
+		c.AccessToken = wrapper.Data.AccessToken
+		return wrapper.Data, nil
+	}
+
 	var res TokenV3IssueResult
 	if err := json.Unmarshal(respBytes, &res); err != nil {
 		return nil, fmt.Errorf("failed to parse refresh response: %w", err)
 	}
-
-	if res.AccessToken != "" {
-		c.AccessToken = res.AccessToken
+	if res.AccessToken == "" {
+		return nil, fmt.Errorf("tokenRefresh returned empty access token")
 	}
+
+	c.AccessToken = res.AccessToken
 
 	return &res, nil
 }

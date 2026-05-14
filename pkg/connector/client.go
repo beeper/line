@@ -29,6 +29,7 @@ type LineClient struct {
 
 	reqSeqMu    sync.Mutex
 	sentReqSeqs map[int]time.Time
+	tokenMu     sync.Mutex
 
 	// cacheMu protects peerKeys, contactCache, mediaFlowCache, and noE2EEGroups.
 	// Hold it only around map accesses — never across network calls.
@@ -115,6 +116,9 @@ var _ bridgev2.ReadReceiptHandlingNetworkAPI = (*LineClient)(nil)
 var _ bridgev2.ReactionHandlingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) refreshAndSave(ctx context.Context) error {
+	lc.tokenMu.Lock()
+	defer lc.tokenMu.Unlock()
+
 	if lc.RefreshToken == "" {
 		return fmt.Errorf("no refresh token available")
 	}
@@ -144,7 +148,10 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 }
 
 func (lc *LineClient) isRefreshRequired(err error) bool {
-	return strings.Contains(err.Error(), "\"code\":119") || strings.Contains(err.Error(), "Access token refresh required")
+	msg := err.Error()
+	return strings.Contains(msg, "\"code\":119") ||
+		strings.Contains(msg, "Access token refresh required") ||
+		(strings.Contains(msg, "\"code\":10051") && strings.Contains(msg, "Authentication Failed"))
 }
 
 func (lc *LineClient) isLoggedOut(err error) bool {
@@ -158,9 +165,13 @@ func (lc *LineClient) recoverToken(ctx context.Context) error {
 	if err := lc.refreshAndSave(ctx); err == nil {
 		lc.UserLogin.Bridge.Log.Info().Msg("Token recovered via refresh")
 		return nil
+	} else {
+		lc.UserLogin.Bridge.Log.Info().Err(err).Msg("Refresh failed, attempting re-login with stored credentials...")
+		if errLogin := lc.tryLogin(ctx); errLogin != nil {
+			return fmt.Errorf("refresh failed: %w; re-login failed: %v", err, errLogin)
+		}
+		return nil
 	}
-	lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
-	return lc.tryLogin(ctx)
 }
 
 func (lc *LineClient) Connect(ctx context.Context) {
@@ -184,7 +195,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		}
 	}
 	if lc.AccessToken == "" {
-		if err := lc.tryLogin(ctx); err != nil {
+		if err := lc.recoverToken(ctx); err != nil {
 			lc.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      "line-login-failed",

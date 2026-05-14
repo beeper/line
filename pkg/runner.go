@@ -516,7 +516,9 @@ func (r *Runner) ChannelDecryptV1(channelID, senderKeyID, receiverKeyID int, cip
 		return "", "", err
 	}
 
-	ptBytes, err := r.rt.E2EEChannelDecryptV1(chanPtr, ctBytes)
+	ptBytes, err := recoverLTSMBytes("E2EEChannelDecryptV1", func() ([]byte, error) {
+		return r.rt.E2EEChannelDecryptV1(chanPtr, ctBytes)
+	})
 	if err != nil {
 		return "", "", err
 	}
@@ -550,13 +552,25 @@ func (r *Runner) ChannelDecryptV2(channelID int, to, from string, senderKeyID, r
 		return "", "", err
 	}
 
-	ptBytes, err := r.rt.E2EEChannelDecryptV2(chanPtr,
-		to, from, senderKeyID, receiverKeyID, contentType, ctBytes)
+	ptBytes, err := recoverLTSMBytes("E2EEChannelDecryptV2", func() ([]byte, error) {
+		return r.rt.E2EEChannelDecryptV2(chanPtr,
+			to, from, senderKeyID, receiverKeyID, contentType, ctBytes)
+	})
 	if err != nil {
 		return "", "", err
 	}
 
 	return string(ptBytes), base64.StdEncoding.EncodeToString(ptBytes), nil
+}
+
+func recoverLTSMBytes(op string, fn func() ([]byte, error)) (out []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			out = nil
+			err = fmt.Errorf("ltsm %s panic: %v", op, recovered)
+		}
+	}()
+	return fn()
 }
 
 // GenerateE2EESecret generates a login secret with PIN and public key.
