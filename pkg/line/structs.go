@@ -322,3 +322,15 @@ type MediaMessageFlowResponse struct {
 	FlowMap        map[string]int `json:"flowMap"`
 	CacheTTLMillis string         `json:"cacheTtlMillis"`
 }
+
+type CreateChatRequest struct {
+	ReqSeq         int      `json:"reqSeq"`
+	Type           int      `json:"type"`
+	Name           string   `json:"name,omitempty"`
+	TargetUserMids []string `json:"targetUserMids"`
+	PicturePath    string   `json:"picturePath,omitempty"`
+}
+
+type CreateChatResponse2 struct {
+	Chat Chat `json:"chat"`
+}

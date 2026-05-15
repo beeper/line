@@ -671,6 +671,79 @@ func (c *Client) SendChatRemoved(reqSeq int64, chatMid, lastReadMessageId string
 	return err
 }
 
+// CreateChat creates a new LINE group chat with the given members and name.
+// The returned Chat will have a ChatMid starting with "c" (group) or "r" (room).
+func (c *Client) CreateChat(mids []string, name string, chatType int) (*Chat, error) {
+	req := CreateChatRequest{
+		ReqSeq:         1,
+		Type:           chatType,
+		Name:           name,
+		TargetUserMids: mids,
+	}
+	resp, err := c.callRPC("TalkService", "createChat", req)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int                 `json:"code"`
+		Message string              `json:"message"`
+		Data    CreateChatResponse2 `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse createChat response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("createChat failed: %s", wrapper.Message)
+	}
+	return &wrapper.Data.Chat, nil
+}
+
+// InviteIntoChat invites users into an existing LINE group chat.
+func (c *Client) InviteIntoChat(chatMid string, mids []string) error {
+	_, err := c.callRPC("TalkService", "inviteIntoChat", 1, chatMid, mids)
+	return err
+}
+
+// FindContactByUserid looks up a LINE user by their user ID (not MID).
+func (c *Client) FindContactByUserid(userid string) (*Contact, error) {
+	resp, err := c.callRPC("TalkService", "findContactByUserid", userid)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int     `json:"code"`
+		Message string  `json:"message"`
+		Data    Contact `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse findContactByUserid response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("findContactByUserid failed: %s", wrapper.Message)
+	}
+	return &wrapper.Data, nil
+}
+
+// GetAllContactIds returns the MIDs of all contacts.
+func (c *Client) GetAllContactIds() ([]string, error) {
+	resp, err := c.callRPC("TalkService", "getAllContactIds")
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int      `json:"code"`
+		Message string   `json:"message"`
+		Data    []string `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse getAllContactIds response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getAllContactIds failed: %s", wrapper.Message)
+	}
+	return wrapper.Data, nil
+}
+
 // DetermineMediaMessageFlow asks the server which upload path to use for media
 // in a given chat. Flow value 2 = E2EE encrypted upload, 1 = plain upload.
 func (c *Client) DetermineMediaMessageFlow(chatMid string) (*MediaMessageFlowResponse, error) {
