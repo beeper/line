@@ -161,9 +161,9 @@ func (lc *LineClient) clearGroupNoE2EE(chatMid string) {
 	delete(lc.noE2EEGroups, chatMid)
 }
 
-// getChatMemberMIDs fetches the member and invitee MIDs for a group chat via GetChats.
-// Invitees are included because group key registration must happen before they accept,
-// otherwise the key won't be available when they start sending messages.
+// getChatMemberMIDs fetches active member MIDs for a group chat via GetChats.
+// Pending invitees must not be included in registerE2EEGroupKey: LINE rejects
+// the payload unless it matches the current active member count.
 func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]string, error) {
 	client := line.NewClient(lc.AccessToken)
 	chats, err := client.GetChats([]string{chatMid}, true, true)
@@ -189,9 +189,6 @@ func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]
 	for mid := range chat.Extra.GroupExtra.MemberMids {
 		seen[mid] = struct{}{}
 	}
-	for mid := range chat.Extra.GroupExtra.InviteeMids {
-		seen[mid] = struct{}{}
-	}
 	// Always include the bridge user's own MID since we're definitely a member
 	if _, ok := seen[lc.Mid]; !ok {
 		seen[lc.Mid] = struct{}{}
@@ -201,7 +198,7 @@ func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]
 		mids = append(mids, mid)
 	}
 	if len(mids) == 0 {
-		return nil, fmt.Errorf("chat %s has no members or invitees", chatMid)
+		return nil, fmt.Errorf("chat %s has no active members", chatMid)
 	}
 
 	// Cache the successful result for fallback use.
@@ -223,9 +220,10 @@ func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) 
 		return fmt.Errorf("getChatMemberMIDs: %w", err)
 	}
 
-	// If getChatMemberMIDs returned only ourself, the server likely returned
-	// an empty MemberMids map (known LINE API issue). Fall back to cached
-	// member list from CreateGroup or a prior successful fetch.
+	// If getChatMemberMIDs returned only ourself, the server may have returned
+	// an empty MemberMids map (known LINE API issue). Fall back only to a cached
+	// active LINE member list. Matrix room members may include pending LINE
+	// invitees and will make registerE2EEGroupKey fail with member count mismatch.
 	if len(members) == 1 && members[0] == lc.Mid {
 		lc.cacheMu.Lock()
 		cached, ok := lc.groupMemberCache[chatMid]
@@ -234,20 +232,6 @@ func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) 
 			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", chatMid).
 				Msg("GetChats returned only self MID, falling back to cached member list")
 			members = cached
-		}
-	}
-
-	// Last resort: query Matrix room members via the bridge API.
-	if len(members) == 1 && members[0] == lc.Mid {
-		matrixMembers, err := lc.getGroupMemberMIDsViaMatrix(ctx, chatMid)
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
-				Msg("Matrix member fallback also failed")
-		} else if len(matrixMembers) > 1 {
-			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", chatMid).
-				Int("members", len(matrixMembers)).
-				Msg("GetChats returned only self MID, falling back to Matrix room members")
-			members = matrixMembers
 		}
 	}
 
