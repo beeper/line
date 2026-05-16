@@ -2,6 +2,7 @@ package line
 
 import (
 	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -57,6 +58,12 @@ var (
 	globalRunner *Runner
 	runnerOnce   sync.Once
 	runnerErr    error
+
+	// sharedSecretOffset caches the byte offset of the 32-byte ECDH shared secret
+	// inside the C++ E2EEChannel/Curve25519KeyChannel object in WASM linear memory.
+	// Discovered dynamically on first call to ChannelWrapGroupSharedKey.
+	sharedSecretOffset int = -1
+	sharedOffsetMu     sync.Mutex
 )
 
 func GetRunner() (*Runner, error) {
@@ -111,6 +118,16 @@ func (r *Runner) getKey(id int) (uint32, error) {
 		return 0, fmt.Errorf("unknown key: %d", id)
 	}
 	return ptr, nil
+}
+
+func (r *Runner) KeyGenerate() (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ptr, err := r.rt.Curve25519KeyGenerate()
+	if err != nil {
+		return 0, err
+	}
+	return r.putKey(ptr), nil
 }
 
 func (r *Runner) putChannel(ptr uint32) int {
@@ -322,6 +339,8 @@ func (r *Runner) LoginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64 string) 
 }
 
 // KeyLoad loads a base64 E2EE key and returns an internal key ID.
+// Also stores the decoded key bytes as a Go key entry so ChannelCreate can
+// create a pure Go Channel (required for group shared key wrapping).
 func (r *Runner) KeyLoad(b64Key string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -336,7 +355,14 @@ func (r *Runner) KeyLoad(b64Key string) (int, error) {
 		return 0, err
 	}
 
-	return r.putKey(keyPtr), nil
+	id := r.putKey(keyPtr)
+	// Store raw key bytes so ChannelCreate can derive a pure Go Channel.
+	// The exported key format from E2EEKeyExportKey is the raw 32-byte
+	// Curve25519 private key (same format stored by LINEJS clients).
+	if len(keyBytes) == 32 {
+		r.goKeys[id] = &goKeyEntry{privKey: keyBytes}
+	}
+	return id, nil
 }
 
 // KeyGetID returns the raw key ID for a loaded key.
@@ -400,7 +426,15 @@ func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (int, error) {
 		goChan, err := ltsm.NewChannel(goKey.privKey, peerPubBytes)
 		if err == nil {
 			r.goChannels[id] = goChan
+		} else {
+			fmt.Printf("DEBUG ChannelCreate: NewChannel failed: %v (keyID=%d len(privKey)=%d)\n", err, keyID, len(goKey.privKey))
 		}
+	} else {
+		fmt.Printf("DEBUG ChannelCreate: no goKey for keyID=%d (goKeys has keys: ", keyID)
+		for k := range r.goKeys {
+			fmt.Printf("%d ", k)
+		}
+		fmt.Printf(")\n")
 	}
 
 	return id, nil
@@ -629,6 +663,206 @@ func (r *Runner) GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 st
 	}
 
 	return base64.StdEncoding.EncodeToString(hashBytes), nil
+}
+
+// ReadChannelRaw returns 128 bytes of the channel C++ object's WASM linear memory.
+// Used for debugging the shared secret offset in the E2EEChannel/Curve25519KeyChannel object.
+func (r *Runner) ReadChannelRaw(channelID int) ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	chanPtr, err := r.getChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+
+	mem := r.rt.ModuleMem()
+	if int(chanPtr)+128 > len(mem) {
+		return nil, fmt.Errorf("channel ptr %d out of bounds (mem %d bytes)", chanPtr, len(mem))
+	}
+	buf := make([]byte, 128)
+	copy(buf, mem[chanPtr:chanPtr+128])
+	return buf, nil
+}
+
+// ChannelWrapGroupSharedKey wraps a group key using the channel's ECDH shared secret.
+// Uses the WASM module's wrapGroupSharedKey method directly (same approach as the LINE
+// Chrome Extension). The keyID must reference a WASM-generated E2EEKey object
+// (from KeyGenerate), not raw bytes.
+//
+// Returns base64-encoded ciphertext ready for registerE2EEGroupKey.
+func (r *Runner) ChannelWrapGroupSharedKey(channelID int, keyID int) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	chanPtr, err := r.getChannel(channelID)
+	if err != nil {
+		return "", err
+	}
+
+	keyPtr, err := r.getKey(keyID)
+	if err != nil {
+		return "", err
+	}
+
+	// Use the WASM module's wrapGroupSharedKey directly (same as LINE Extension).
+	// keyPtr is an emval handle wrapping the Curve25519Key C++ object.
+	// The C++ method expects an emscripten::val, which the emval handle represents.
+	wrapped, err := r.rt.E2EEChannelWrapGroupSharedKey(chanPtr, keyPtr)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(wrapped), nil
+}
+
+// getChannelSharedSecret reads the 32-byte ECDH shared secret from the WASM channel object.
+// Uses a cached offset once discovered.
+func (r *Runner) getChannelSharedSecret(chanPtr uint32) ([]byte, error) {
+	sharedOffsetMu.Lock()
+	off := sharedSecretOffset
+	sharedOffsetMu.Unlock()
+
+	if off >= 0 {
+		return r.readSharedSecretAt(chanPtr, off)
+	}
+	return r.discoverSharedSecret(chanPtr)
+}
+
+func (r *Runner) readSharedSecretAt(chanPtr uint32, offset int) ([]byte, error) {
+	mem := r.rt.ModuleMem()
+	start := int(chanPtr) + offset
+	if start+32 > len(mem) {
+		return nil, fmt.Errorf("shared secret offset %d out of bounds", offset)
+	}
+	secret := make([]byte, 32)
+	copy(secret, mem[start:start+32])
+	return secret, nil
+}
+
+// discoverSharedSecret scans candidate byte offsets in the channel C++ object to find
+// the 32-byte ECDH shared secret. It encrypts a test key with each candidate and verifies
+// by calling the WASM module's unwrapGroupSharedKey — if the shared secret matches, the
+// decrypted result passes E2EEKey.loadKey().
+func (r *Runner) discoverSharedSecret(chanPtr uint32) ([]byte, error) {
+	mem := r.rt.ModuleMem()
+
+	// Build candidate offsets: every 4 bytes from 0 to 256 (covers typical C++ object sizes).
+	candidates := make([]int, 0, 65)
+	for off := 0; off <= 256; off += 4 {
+		candidates = append(candidates, off)
+	}
+
+	testKey := make([]byte, 32)
+	if _, err := rand.Read(testKey); err != nil {
+		return nil, fmt.Errorf("failed to generate test key: %w", err)
+	}
+
+	for _, off := range candidates {
+		start := int(chanPtr) + off
+		if start+32 > len(mem) {
+			continue
+		}
+		shared := mem[start : start+32]
+		if isTrivialKey(shared) {
+			continue
+		}
+
+		wrappedB64, err := wrapGroupKeyAES(shared, testKey)
+		if err != nil {
+			continue
+		}
+		wrapped, err := base64.StdEncoding.DecodeString(wrappedB64)
+		if err != nil {
+			continue
+		}
+
+		// The LTSM WASM module may panic when given garbled wrapped data
+		// (e.g. encrypted with a wrong shared secret candidate). Recover
+		// and try the next offset.
+		func() {
+			defer func() {
+				if r2 := recover(); r2 != nil {
+					err = fmt.Errorf("panic: %v", r2)
+				}
+			}()
+			_, err = r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, wrapped)
+		}()
+		if err == nil {
+			sharedOffsetMu.Lock()
+			sharedSecretOffset = off
+			sharedOffsetMu.Unlock()
+
+			secret := make([]byte, 32)
+			copy(secret, shared)
+			return secret, nil
+		}
+	}
+
+	// Diagnostic: dump first 128 bytes so we can add more specific offsets
+	fmt.Printf("DEBUG discoverSharedSecret FAILED for chanPtr=%d. First 128 bytes (hex):\n", chanPtr)
+	bufLen := 128
+	if int(chanPtr)+bufLen > len(mem) {
+		bufLen = len(mem) - int(chanPtr)
+	}
+	if bufLen > 0 {
+		buf := mem[chanPtr : chanPtr+uint32(bufLen)]
+		for i := 0; i < bufLen; i += 16 {
+			end := i + 16
+			if end > bufLen {
+				end = bufLen
+			}
+			fmt.Printf("%04x: %x\n", i, buf[i:end])
+		}
+	}
+
+	return nil, fmt.Errorf("could not find shared secret in channel object (tried %d offsets from 0 to 256)", len(candidates))
+}
+
+func isTrivialKey(b []byte) bool {
+	if len(b) == 0 {
+		return true
+	}
+	first := b[0]
+	for _, v := range b {
+		if v != first {
+			return false
+		}
+	}
+	return true
+}
+
+// wrapGroupKeyAES implements LINEJS group key wrapping:
+// Key = SHA256(sharedSecret || "Key")
+// IV = XOR-fold(SHA256(sharedSecret || "IV"))
+// AES-256-CBC encrypt [groupKey(32) || Key[:16]] → 48 bytes → base64
+func wrapGroupKeyAES(sharedSecret, groupKey []byte) (string, error) {
+	h := sha256.New()
+	h.Write(sharedSecret)
+	h.Write([]byte("Key"))
+	aesKey := h.Sum(nil)
+
+	h.Reset()
+	h.Write(sharedSecret)
+	h.Write([]byte("IV"))
+	hash := h.Sum(nil)
+	iv := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		iv[i] = hash[i] ^ hash[i+16]
+	}
+
+	plaintext := make([]byte, 48)
+	copy(plaintext[:32], groupKey)
+	copy(plaintext[32:], aesKey[:16])
+
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return "", fmt.Errorf("aes.NewCipher: %w", err)
+	}
+	ciphertext := make([]byte, 48)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, plaintext)
+
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 // --- Pure Go helpers (no WASM dependency) ---

@@ -323,6 +323,19 @@ type MediaMessageFlowResponse struct {
 	CacheTTLMillis string         `json:"cacheTtlMillis"`
 }
 
+// E2EEPeerPublicKey represents a member's E2EE public key entry
+// returned by getLastE2EEPublicKeys.
+type E2EEPeerPublicKey struct {
+	KeyID   int    `json:"keyId"`
+	KeyData string `json:"keyData"`
+}
+
+// GetLastE2EEPublicKeysRequest is the request body for getLastE2EEPublicKeys.
+type GetLastE2EEPublicKeysRequest struct {
+	ChatMid string   `json:"chatMid"`
+	Members []string `json:"members"`
+}
+
 type CreateChatRequest struct {
 	ReqSeq         int      `json:"reqSeq"`
 	Type           int      `json:"type"`

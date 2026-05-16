@@ -233,41 +233,57 @@ func (lc *LineClient) chatToChatInfo(chat *line.Chat, excludeFromTimeline bool) 
 		},
 	}
 
-	if chat.Extra.GroupExtra != nil {
-		if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
-			members[0].PowerLevel = ptr.Ptr(100)
-		}
-		// If the bridge user is not a full member but is an invitee, mark as invite
-		_, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]
-		if !isMember {
-			_, isInvitee := chat.Extra.GroupExtra.InviteeMids[lc.Mid]
-			if isInvitee {
-				members[0].Membership = event.MembershipInvite
+		if chat.Extra.GroupExtra != nil {
+			if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
+				members[0].PowerLevel = ptr.Ptr(100)
 			}
-		}
-		for m := range chat.Extra.GroupExtra.MemberMids {
-			if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
-				continue
+			// If the bridge user is not a full member but is an invitee, mark as invite
+			_, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]
+			if !isMember {
+				_, isInvitee := chat.Extra.GroupExtra.InviteeMids[lc.Mid]
+				if isInvitee {
+					members[0].Membership = event.MembershipInvite
+				}
 			}
-			members = append(members, bridgev2.ChatMember{
-				EventSender: bridgev2.EventSender{
-					Sender: makeUserID(m),
-				},
-				Membership: event.MembershipJoin,
-			})
-		}
-		for m := range chat.Extra.GroupExtra.InviteeMids {
-			if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
-				continue
+
+			// Populate group member cache for fallback use when GetChats
+			// returns empty MemberMids (known LINE API issue).
+			allMemberMids := make([]string, 0, len(chat.Extra.GroupExtra.MemberMids))
+			for m := range chat.Extra.GroupExtra.MemberMids {
+				if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+					continue
+				}
+				allMemberMids = append(allMemberMids, m)
+				members = append(members, bridgev2.ChatMember{
+					EventSender: bridgev2.EventSender{
+						Sender: makeUserID(m),
+					},
+					Membership: event.MembershipJoin,
+				})
 			}
-			members = append(members, bridgev2.ChatMember{
-				EventSender: bridgev2.EventSender{
-					Sender: makeUserID(m),
-				},
-				Membership: event.MembershipInvite,
-			})
+			for m := range chat.Extra.GroupExtra.InviteeMids {
+				if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+					continue
+				}
+				allMemberMids = append(allMemberMids, m)
+				members = append(members, bridgev2.ChatMember{
+					EventSender: bridgev2.EventSender{
+						Sender: makeUserID(m),
+					},
+					Membership: event.MembershipInvite,
+				})
+			}
+
+			cachedMids := make([]string, 0, len(allMemberMids)+1)
+			cachedMids = append(cachedMids, lc.Mid)
+			cachedMids = append(cachedMids, allMemberMids...)
+			lc.cacheMu.Lock()
+			if lc.groupMemberCache == nil {
+				lc.groupMemberCache = make(map[string][]string)
+			}
+			lc.groupMemberCache[chat.ChatMid] = cachedMids
+			lc.cacheMu.Unlock()
 		}
-	}
 
 	name := chat.ChatName
 	if name == "" && chat.Extra.GroupExtra != nil {
