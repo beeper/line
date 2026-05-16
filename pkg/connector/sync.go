@@ -286,9 +286,6 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 			lc.generatedGroupNameCache = make(map[string]bool)
 		}
 		lc.groupMemberCache[chat.ChatMid] = groupMemberMids
-		if _, ok := lc.generatedGroupNameCache[chat.ChatMid]; !ok && chat.Type == 1 {
-			lc.generatedGroupNameCache[chat.ChatMid] = true
-		}
 		lc.cacheMu.Unlock()
 	}
 
@@ -297,7 +294,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		lc.cacheMu.Lock()
 		generateName := lc.generatedGroupNameCache[chat.ChatMid]
 		lc.cacheMu.Unlock()
-		if generateName {
+		if generateName && len(groupMemberMids) > 1 {
 			name = lc.generateNameFromMemberList(ctx, groupMemberMids)
 		}
 	}
@@ -329,9 +326,7 @@ func (lc *LineClient) generateNameFromMemberList(ctx context.Context, members []
 	seen := make(map[string]struct{}, len(members))
 	for _, mid := range members {
 		if mid == string(lc.UserLogin.ID) || mid == lc.Mid || strings.HasPrefix(mid, "c") || strings.HasPrefix(mid, "r") {
-			if mid != lc.Mid {
-				continue
-			}
+			continue
 		}
 		if _, ok := seen[mid]; ok {
 			continue
