@@ -30,7 +30,7 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	var chat *line.Chat
 	var err error
 	chatType := 1 // ROOM: members join automatically.
-	lineName := ""
+	lineName := name
 	chat, err = client.CreateChat(participantMids, lineName, chatType)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
@@ -104,9 +104,9 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	}
 
 	ct := database.RoomTypeGroupDM
-	chatName := chat.ChatName
+	chatName := name
 	if chatName == "" {
-		chatName = name
+		chatName = chat.ChatName
 	}
 
 	return &bridgev2.CreateChatResponse{
