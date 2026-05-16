@@ -140,6 +140,9 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 		// Reverse messages to process oldest first
 		for i := len(msgs) - 1; i >= 0; i-- {
 			msg := msgs[i]
+			if msg.ContentType == 18 {
+				lc.cacheGroupMembersFromSystemMessage(msg)
+			}
 
 			existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
 			if err == nil && existing != nil {
@@ -278,6 +281,21 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				Membership: membership,
 			})
 		}
+		if len(allMemberMids) == 0 {
+			lc.cacheGroupMembersFromRecentMessages(ctx, chat.ChatMid)
+			for _, m := range lc.getCachedGroupMembers(chat.ChatMid) {
+				if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+					continue
+				}
+				allMemberMids = append(allMemberMids, m)
+				members = append(members, bridgev2.ChatMember{
+					EventSender: bridgev2.EventSender{
+						Sender: makeUserID(m),
+					},
+					Membership: event.MembershipJoin,
+				})
+			}
+		}
 
 		groupMemberMids = make([]string, 0, len(allMemberMids)+1)
 		groupMemberMids = append(groupMemberMids, lc.Mid)
@@ -373,6 +391,105 @@ func (lc *LineClient) generateNameFromMemberList(ctx context.Context, members []
 		result += fmt.Sprintf(" and %d others", remaining)
 	}
 	return result
+}
+
+func (lc *LineClient) getCachedGroupMembers(chatMid string) []string {
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	members := lc.groupMemberCache[chatMid]
+	if len(members) == 0 {
+		return nil
+	}
+	return append([]string(nil), members...)
+}
+
+func (lc *LineClient) cacheGroupMembersFromSystemMessage(msg *line.Message) {
+	if msg == nil || msg.ContentMetadata == nil {
+		return
+	}
+	chatMid := msg.To
+	if !isChatMID(chatMid) {
+		return
+	}
+	locKey := msg.ContentMetadata["LOC_KEY"]
+	switch locKey {
+	case "C_GI", "C_MI", "A_MI", "A_MC":
+	default:
+		return
+	}
+
+	seen := map[string]struct{}{
+		lc.Mid: {},
+	}
+	for _, mid := range lc.getCachedGroupMembers(chatMid) {
+		seen[mid] = struct{}{}
+	}
+	for _, mid := range midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"]) {
+		seen[mid] = struct{}{}
+	}
+	if len(seen) <= 1 {
+		return
+	}
+
+	members := make([]string, 0, len(seen))
+	for mid := range seen {
+		members = append(members, mid)
+	}
+	lc.cacheMu.Lock()
+	if lc.groupMemberCache == nil {
+		lc.groupMemberCache = make(map[string][]string)
+	}
+	lc.groupMemberCache[chatMid] = members
+	lc.cacheMu.Unlock()
+}
+
+func (lc *LineClient) cacheGroupMembersFromRecentMessages(ctx context.Context, chatMid string) {
+	if len(lc.getCachedGroupMembers(chatMid)) > 1 {
+		return
+	}
+	client := line.NewClient(lc.AccessToken)
+	msgs, err := client.GetRecentMessagesV2(chatMid, 50)
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if errRecover := lc.recoverToken(ctx); errRecover == nil {
+			client = line.NewClient(lc.AccessToken)
+			msgs, err = client.GetRecentMessagesV2(chatMid, 50)
+		}
+	}
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Debug().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch recent messages for group member cache")
+		return
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := msgs[i]
+		if msg.ContentType == 18 {
+			lc.cacheGroupMembersFromSystemMessage(msg)
+		}
+	}
+}
+
+func midsFromSystemLocArgs(locArgs string) []string {
+	fields := strings.FieldsFunc(locArgs, func(r rune) bool {
+		return r == '\x1e' || r == '\x1f'
+	})
+	mids := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if isUserMID(field) {
+			mids = append(mids, field)
+		}
+	}
+	return mids
+}
+
+func isUserMID(mid string) bool {
+	return len(mid) > 1 && strings.HasPrefix(mid, "U")
+}
+
+func isChatMID(mid string) bool {
+	if mid == "" {
+		return false
+	}
+	lower := strings.ToLower(mid)
+	return strings.HasPrefix(lower, "c") || strings.HasPrefix(lower, "r")
 }
 
 func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
