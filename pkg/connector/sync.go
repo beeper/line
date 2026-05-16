@@ -267,11 +267,15 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				continue
 			}
 			allMemberMids = append(allMemberMids, m)
+			membership := event.MembershipInvite
+			if chat.Type == 1 {
+				membership = event.MembershipJoin
+			}
 			members = append(members, bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
-				Membership: event.MembershipInvite,
+				Membership: membership,
 			})
 		}
 
@@ -933,11 +937,15 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string) {
 	if !isBridgeUserInvitee {
 		// Someone else is being invited — emit MembershipInvite for each invitee
 		if chat.Extra.GroupExtra != nil {
+			membership := event.MembershipInvite
+			if chat.Type == 1 {
+				membership = event.MembershipJoin
+			}
 			for inviteeMid := range chat.Extra.GroupExtra.InviteeMids {
 				if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
 					continue
 				}
-				lc.emitMemberChange(chat.ChatMid, inviteeMid, event.MembershipInvite, time.Now())
+				lc.emitMemberChange(chat.ChatMid, inviteeMid, membership, time.Now())
 			}
 		}
 		return
