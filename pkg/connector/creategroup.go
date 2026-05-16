@@ -29,16 +29,13 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	client := line.NewClient(lc.AccessToken)
 	var chat *line.Chat
 	var err error
-	chatType := 0 // GROUP
-	switch params.Type {
-	case "room":
-		chatType = 1 // ROOM
-	}
-	chat, err = client.CreateChat(participantMids, name, chatType)
+	chatType := 1 // ROOM: members join automatically.
+	lineName := ""
+	chat, err = client.CreateChat(participantMids, lineName, chatType)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = line.NewClient(lc.AccessToken)
-			chat, err = client.CreateChat(participantMids, name, chatType)
+			chat, err = client.CreateChat(participantMids, lineName, chatType)
 		}
 	}
 	if err != nil {
