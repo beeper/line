@@ -41,6 +41,7 @@ type LineClient struct {
 	groupMemberCache        map[string][]string // chatMid -> list of member MIDs from CreateGroup or getChatMemberMIDs
 	generatedGroupNameCache map[string]bool     // chatMid -> true when Matrix name should be generated from member names
 	reactionIconMXC         map[int]string      // predefinedReactionType -> cached MXC URI
+	recentReactions         sync.Map            // "msgID\x00emoji" -> struct{} to dedup concurrent 139/140 events
 
 	wg sync.WaitGroup
 }

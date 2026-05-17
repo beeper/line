@@ -1,6 +1,9 @@
 package line
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // SticonOwnership represents a sticon ownership entry returned by
 // getSticonOwnershipByMid, mapping an ownership token to sticon details.
@@ -17,9 +20,38 @@ type ReactionPayload struct {
 	Curr    *ReactionDetail `json:"curr,omitempty"`
 }
 
+type FlexInt struct {
+	Val int
+	Set bool
+}
+
+func (f *FlexInt) UnmarshalJSON(data []byte) error {
+	f.Set = false
+	if string(data) == "null" || string(data) == `""` {
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(data, &n); err == nil {
+		f.Val = n
+		f.Set = true
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return nil
+		}
+		f.Val = n
+		f.Set = true
+		return nil
+	}
+	return nil
+}
+
 type ReactionDetail struct {
 	PaidReactionType       *PaidReactionType `json:"paidReactionType,omitempty"`
-	PredefinedReactionType *int              `json:"predefinedReactionType,omitempty"`
+	PredefinedReactionType *FlexInt          `json:"predefinedReactionType,omitempty"`
 }
 
 type PaidReactionType struct {
