@@ -762,7 +762,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.wg.Add(1)
 		go func() {
 			defer lc.wg.Done()
-			lc.handleInvite(context.Background(), op.Param1)
+			lc.handleInvite(context.Background(), op.Param1, OperationType(op.Type))
 		}()
 
 	case OpChatUpdate, OpChatUpdate2:
@@ -1041,7 +1041,7 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 				lc.handleSelfLeave(chatMid)
 			} else if isInvitee {
 				lc.UserLogin.Bridge.Log.Info().Str("chat_mid", chatMid).Msg("User is an invitee, handling invite")
-				lc.handleInvite(ctx, chatMid)
+				lc.handleInviteForSelf(ctx, chatMid)
 			}
 		}
 		return
@@ -1054,7 +1054,7 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 			lc.handleSelfLeave(chatMid)
 		} else if isInvitee {
 			lc.UserLogin.Bridge.Log.Info().Str("chat_mid", chatMid).Msg("User is an invitee (empty resp), handling invite")
-			lc.handleInvite(ctx, chatMid)
+			lc.handleInviteForSelf(ctx, chatMid)
 		}
 		return
 	}
@@ -1167,7 +1167,48 @@ func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
 	lc.emitMemberChange(chatMid, joinerMid, event.MembershipJoin, time.Now())
 }
 
-func (lc *LineClient) handleInvite(ctx context.Context, chatMid string) {
+func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType OperationType) {
+	// OpInviteIntoChat is only sent to the invitee, so the bridge user is guaranteed to be invited.
+	// For OpNotifiedInviteIntoChat, fetch the chat info and check InviteeMids.
+	if opType == OpInviteIntoChat {
+		// Bridge user is the invitee for group type 0 chats; we need GetChats for chat metadata.
+		lc.handleInviteForSelf(ctx, chatMid)
+		return
+	}
+
+	// OpNotifiedInviteIntoChat — someone else was invited into a chat we're in.
+	client := line.NewClient(lc.AccessToken)
+	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if errRecover := lc.recoverToken(ctx); errRecover == nil {
+			client = line.NewClient(lc.AccessToken)
+			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
+		}
+	}
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch chat info for notified invite")
+		return
+	}
+	if len(chatsResp.Chats) == 0 {
+		return
+	}
+	chat := chatsResp.Chats[0]
+
+	if chat.Extra.GroupExtra != nil {
+		membership := event.MembershipInvite
+		if chat.Type == 1 {
+			membership = event.MembershipJoin
+		}
+		for inviteeMid := range chat.Extra.GroupExtra.InviteeMids {
+			if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
+				continue
+			}
+			lc.emitMemberChange(chat.ChatMid, inviteeMid, membership, time.Now())
+		}
+	}
+}
+
+func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
 	client := line.NewClient(lc.AccessToken)
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
@@ -1185,27 +1226,17 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string) {
 	}
 	chat := chatsResp.Chats[0]
 
-	// Check if the bridge user is being invited vs. someone else
-	isBridgeUserInvitee := false
+	// OpInviteIntoChat is only sent to the invitee, so the bridge user is always the invitee.
+	// Even if GetChats didn't return the bridge user in InviteeMids (which happens when
+	// the LINE API doesn't include the caller in the invitee list), we add them here so that
+	// chatToChatInfo correctly sets MembershipInvite for GROUP (type 0) chats.
 	if chat.Extra.GroupExtra != nil {
-		_, isBridgeUserInvitee = chat.Extra.GroupExtra.InviteeMids[lc.Mid]
-	}
-
-	if !isBridgeUserInvitee {
-		// Someone else is being invited — emit MembershipInvite for each invitee
-		if chat.Extra.GroupExtra != nil {
-			membership := event.MembershipInvite
-			if chat.Type == 1 {
-				membership = event.MembershipJoin
-			}
-			for inviteeMid := range chat.Extra.GroupExtra.InviteeMids {
-				if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
-					continue
-				}
-				lc.emitMemberChange(chat.ChatMid, inviteeMid, membership, time.Now())
-			}
+		if chat.Extra.GroupExtra.InviteeMids == nil {
+			chat.Extra.GroupExtra.InviteeMids = make(line.FlexibleMidMap)
 		}
-		return
+		chat.Extra.GroupExtra.InviteeMids[lc.Mid] = true
+		// Remove from MemberMids just in case, so MembershipInvite takes precedence
+		delete(chat.Extra.GroupExtra.MemberMids, lc.Mid)
 	}
 
 	portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
