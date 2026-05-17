@@ -137,6 +137,7 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	if res.RefreshToken != "" {
 		lc.RefreshToken = res.RefreshToken
 	}
+	line.ClearEncryptedAccessTokenCache()
 
 	meta := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	meta.AccessToken = lc.AccessToken

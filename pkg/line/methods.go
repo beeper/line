@@ -19,6 +19,13 @@ var (
 
 const obsTokenBuffer = 30 * time.Second
 
+func ClearEncryptedAccessTokenCache() {
+	obsTokenMu.Lock()
+	defer obsTokenMu.Unlock()
+	obsTokenCache = ""
+	obsTokenExpiry = time.Time{}
+}
+
 // LoginV2 performs the loginV2 RPC call to authenticate a user
 func (c *Client) LoginV2(email, password, certificate, secret string) ([]byte, error) {
 	return c.LoginV2WithType(2, email, password, certificate, secret)
