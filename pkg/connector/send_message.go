@@ -40,7 +40,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	// Block sends to blocked contacts in DMs.
 	if !isGroup && lc.isUserBlocked(portalMid) {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("User is blocked on LINE. Unblock them on your phone to send messages.")).
+		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("user is blocked on LINE: unblock them on your phone to send messages")).
 			WithIsCertain(true).
 			WithSendNotice(true).
 			WithErrorReason(event.MessageStatusGenericError)
