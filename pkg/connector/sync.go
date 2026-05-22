@@ -53,6 +53,11 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
 			continue
 		}
+		// Skip DMs with blocked contacts so a fullSync doesn't recreate a portal
+		// we just deleted in response to OpBlockContact.
+		if lc.isUserBlocked(mid) {
+			continue
+		}
 
 		contact := lc.getContact(ctx, mid)
 		dmType := database.RoomTypeDM
@@ -642,13 +647,21 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.blockedUsers[mid] = true
 		lc.cacheMu.Unlock()
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact blocked")
+		// Block operations should only carry user MIDs; skip if it looks like a group/room
+		// to avoid blast-radius deleting a group portal on an unexpected payload.
+		lowerMid := strings.ToLower(mid)
+		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
+			lc.UserLogin.Bridge.Log.Warn().Str("mid", mid).Msg("OpBlockContact carried non-user MID, skipping portal delete")
+			return
+		}
 		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatDelete{
 			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
+				Type:      bridgev2.RemoteEventChatDelete,
 				PortalKey: portalKey,
 				Timestamp: time.Now(),
 			},
+			OnlyForMe: true,
 		})
 
 	case OpUnblockContact:
