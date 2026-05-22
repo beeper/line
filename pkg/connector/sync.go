@@ -609,6 +609,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 							StateEvent: status.StateBadCredentials,
 							Error:      "line-logged-out",
 							Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
+							UserAction: status.UserActionRelogin,
 						})
 						return
 					}
