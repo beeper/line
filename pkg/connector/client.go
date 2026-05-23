@@ -68,6 +68,18 @@ type cachedContact struct {
 
 const defaultMediaFlowTTL = 6 * time.Hour
 
+func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
+	if picturePath == "" {
+		return &bridgev2.Avatar{Remove: true}
+	}
+	return &bridgev2.Avatar{
+		ID: networkid.AvatarID(picturePath),
+		Get: func(ctx context.Context) ([]byte, error) {
+			return lc.GetAvatar(ctx, networkid.AvatarID(picturePath))
+		},
+	}
+}
+
 // shouldUseE2EEMediaFlow checks whether the server wants E2EE upload (flow 2)
 // for the given chat and content type. Returns true for E2EE, false for plain.
 // Falls back to true (E2EE) if the server call fails, to preserve existing behavior.
@@ -143,6 +155,10 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 		lc.RefreshToken = res.RefreshToken
 	}
 
+	// Rotating the main access token invalidates any OBS token derived from it,
+	// so drop the cached one — the next OBS call will mint a fresh one.
+	line.InvalidateOBSTokenCache()
+
 	meta := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	meta.AccessToken = lc.AccessToken
 	meta.RefreshToken = lc.RefreshToken
@@ -208,6 +224,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 				StateEvent: status.StateBadCredentials,
 				Error:      "line-login-failed",
 				Message:    err.Error(),
+				UserAction: status.UserActionRelogin,
 			})
 			return
 		}
@@ -219,6 +236,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 			StateEvent: status.StateBadCredentials,
 			Error:      "line-token-expired",
 			Message:    fmt.Sprintf("session expired and could not be restored: %v", err),
+			UserAction: status.UserActionRelogin,
 		})
 		return
 	}
@@ -303,6 +321,13 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		return fmt.Errorf("login failed: %w", err)
 	}
 	if res.AuthToken == "" {
+		// No usable verifier means LINE didn't engage the PIN-based flow.
+		// Bail out before emitting a misleading "PIN required" bridge state —
+		// the locally-generated PIN here was never sent to LINE and is useless.
+		if res.Verifier == "" {
+			return fmt.Errorf("login requires interaction but no verifier returned")
+		}
+
 		pin := res.Pin
 		if res.PinCode != "" {
 			pin = res.PinCode
@@ -314,10 +339,8 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 				StateEvent: status.StateConnecting,
 				Error:      "line-pin-required",
 				Message:    fmt.Sprintf("Enter this PIN on your LINE mobile app: %s", pin),
+				UserAction: status.UserActionRelogin,
 			})
-		}
-		if res.Verifier == "" {
-			return fmt.Errorf("login requires interaction but no verifier returned")
 		}
 
 		lc.UserLogin.Bridge.Log.Info().Msg("Waiting for PIN verification on mobile device...")
@@ -342,6 +365,11 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 			lc.RefreshToken = res.TokenV3IssueResult.RefreshToken
 		}
 	}
+
+	// Re-login replaces the main access token, which invalidates any cached
+	// OBS token derived from the previous one.
+	line.InvalidateOBSTokenCache()
+
 	if res.Mid != "" {
 		lc.Mid = res.Mid
 		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {

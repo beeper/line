@@ -53,57 +53,59 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
 			continue
 		}
-
-		contact := lc.getContact(ctx, mid)
-		var avatar *bridgev2.Avatar
-		if contact.PicturePath != "" {
-			picturePath := contact.PicturePath
-			avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(picturePath),
-				Get: func(ctx context.Context) ([]byte, error) {
-					return lc.GetAvatar(ctx, networkid.AvatarID(picturePath))
-				},
-			}
+		// Skip DMs with blocked contacts so a fullSync doesn't recreate a portal
+		// we just deleted in response to OpBlockContact.
+		if lc.isUserBlocked(mid) {
+			continue
 		}
 
-		dmType := database.RoomTypeDM
-		chatName := contact.EffectiveDisplayName()
-		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-			ChatInfo: &bridgev2.ChatInfo{
-				Type:   &dmType,
-				Name:   &chatName,
-				Avatar: avatar,
-				Members: &bridgev2.ChatMemberList{
-					IsFull:                     true,
-					ExcludeChangesFromTimeline: true,
-					Members: []bridgev2.ChatMember{
-						{
-							EventSender: bridgev2.EventSender{
-								IsFromMe: true,
-								Sender:   networkid.UserID(lc.UserLogin.ID),
-							},
-							Membership: event.MembershipJoin,
-							PowerLevel: ptr.Ptr(100),
+		lc.queueDMChatResync(ctx, mid, false)
+	}
+}
+
+// queueDMChatResync emits a ChatResync event with full DM ChatInfo.
+// If createPortal is true, the framework will create the portal when it
+// doesn't already exist (e.g. after the DM was deleted on block).
+func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createPortal bool) {
+	contact := lc.getContact(ctx, mid)
+	dmType := database.RoomTypeDM
+	chatName := contact.EffectiveDisplayName()
+	portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    portalKey,
+			Timestamp:    time.Now(),
+			CreatePortal: createPortal,
+		},
+		ChatInfo: &bridgev2.ChatInfo{
+			Type:   &dmType,
+			Name:   &chatName,
+			Avatar: lc.avatarFromPicturePath(contact.PicturePath),
+			Members: &bridgev2.ChatMemberList{
+				IsFull:                     true,
+				ExcludeChangesFromTimeline: true,
+				Members: []bridgev2.ChatMember{
+					{
+						EventSender: bridgev2.EventSender{
+							IsFromMe: true,
+							Sender:   networkid.UserID(lc.UserLogin.ID),
 						},
-						{
-							EventSender: bridgev2.EventSender{
-								Sender: makeUserID(mid),
-							},
-							Membership: event.MembershipJoin,
-							PowerLevel: ptr.Ptr(0),
+						Membership: event.MembershipJoin,
+						PowerLevel: ptr.Ptr(100),
+					},
+					{
+						EventSender: bridgev2.EventSender{
+							Sender: makeUserID(mid),
 						},
+						Membership: event.MembershipJoin,
+						PowerLevel: ptr.Ptr(0),
 					},
 				},
-				ExcludeChangesFromTimeline: true,
 			},
-		})
-	}
+			ExcludeChangesFromTimeline: true,
+		},
+	})
 }
 
 func (lc *LineClient) prefetchMessages(ctx context.Context) {
@@ -130,31 +132,38 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	}
 
 	for _, box := range res.MessageBoxes {
-		// Fetch recent messages for all active chats to ensure history is populated
-		msgs, err := client.GetRecentMessagesV2(box.ID, 50)
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", box.ID).Msg("Failed to fetch recent messages")
+		lc.backfillRecentMessages(ctx, box.ID, 50)
+	}
+}
+
+// backfillRecentMessages fetches up to limit recent messages for a single
+// chat and queues any not already in the local DB through the normal inbound
+// message path. Used by prefetchMessages on startup and by OpUnblockContact
+// to repopulate a portal that was deleted on block.
+func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
+	client := line.NewClient(lc.AccessToken)
+	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
+		return
+	}
+	// Reverse messages to process oldest first
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := msgs[i]
+		if msg.ContentType == 18 {
+			lc.cacheGroupMembersFromSystemMessage(msg)
+		}
+
+		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
+		if err == nil && existing != nil {
 			continue
 		}
 
-		// Reverse messages to process oldest first
-		for i := len(msgs) - 1; i >= 0; i-- {
-			msg := msgs[i]
-			if msg.ContentType == 18 {
-				lc.cacheGroupMembersFromSystemMessage(msg)
-			}
-
-			existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
-			if err == nil && existing != nil {
-				continue
-			}
-
-			opType := OpReceiveMessage
-			if msg.From == lc.Mid {
-				opType = OpSendMessage
-			}
-			lc.queueIncomingMessage(msg, int(opType))
+		opType := OpReceiveMessage
+		if msg.From == lc.Mid {
+			opType = OpSendMessage
 		}
+		lc.queueIncomingMessage(msg, int(opType))
 	}
 }
 
@@ -215,16 +224,6 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 }
 
 func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, excludeFromTimeline bool) *bridgev2.ChatInfo {
-	var avatar *bridgev2.Avatar
-	if chat.PicturePath != "" {
-		avatar = &bridgev2.Avatar{
-			ID: networkid.AvatarID(chat.PicturePath),
-			Get: func(ctx context.Context) ([]byte, error) {
-				return lc.GetAvatar(ctx, networkid.AvatarID(chat.PicturePath))
-			},
-		}
-	}
-
 	members := []bridgev2.ChatMember{
 		{
 			EventSender: bridgev2.EventSender{
@@ -332,7 +331,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	return &bridgev2.ChatInfo{
 		Type:   &ct,
 		Name:   &name,
-		Avatar: avatar,
+		Avatar: lc.avatarFromPicturePath(chat.PicturePath),
 		Members: &bridgev2.ChatMemberList{
 			IsFull:                     true,
 			Members:                    members,
@@ -630,6 +629,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 							StateEvent: status.StateBadCredentials,
 							Error:      "line-logged-out",
 							Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
+							UserAction: status.UserActionRelogin,
 						})
 						return
 					}
@@ -662,13 +662,21 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.blockedUsers[mid] = true
 		lc.cacheMu.Unlock()
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact blocked")
+		// Block operations should only carry user MIDs; skip if it looks like a group/room
+		// to avoid blast-radius deleting a group portal on an unexpected payload.
+		lowerMid := strings.ToLower(mid)
+		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
+			lc.UserLogin.Bridge.Log.Warn().Str("mid", mid).Msg("OpBlockContact carried non-user MID, skipping portal delete")
+			return
+		}
 		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatDelete{
 			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
+				Type:      bridgev2.RemoteEventChatDelete,
 				PortalKey: portalKey,
 				Timestamp: time.Now(),
 			},
+			OnlyForMe: true,
 		})
 
 	case OpUnblockContact:
@@ -677,14 +685,19 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		delete(lc.blockedUsers, mid)
 		lc.cacheMu.Unlock()
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact unblocked")
-		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-		})
+		// Reattach the DM portal: emit a ChatResync with CreatePortal so the
+		// framework recreates the portal that was deleted on block, then
+		// backfill recent messages so the room isn't empty.
+		lowerMid := strings.ToLower(mid)
+		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
+			return
+		}
+		lc.queueDMChatResync(ctx, mid, true)
+		lc.wg.Add(1)
+		go func() {
+			defer lc.wg.Done()
+			lc.backfillRecentMessages(context.Background(), mid, 50)
+		}()
 
 	case OpContactUpdate:
 		mid := op.Param1
@@ -699,17 +712,8 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{
 				Identifiers: []string{mid},
 				Name:        &name,
+				Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
 			})
-		}
-		var avatar *bridgev2.Avatar
-		if contact.PicturePath != "" {
-			picturePath := contact.PicturePath
-			avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(picturePath),
-				Get: func(ctx context.Context) ([]byte, error) {
-					return lc.GetAvatar(ctx, networkid.AvatarID(picturePath))
-				},
-			}
 		}
 		dmType := database.RoomTypeDM
 		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
@@ -722,7 +726,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			ChatInfo: &bridgev2.ChatInfo{
 				Type:   &dmType,
 				Name:   &name,
-				Avatar: avatar,
+				Avatar: lc.avatarFromPicturePath(contact.PicturePath),
 			},
 		})
 		lc.refreshGroupsForContact(ctx, mid)
@@ -816,13 +820,16 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to parse predefined reaction param2")
 				return
 			}
-			if param2.Curr == nil {
-				lc.UserLogin.Bridge.Log.Error().Msg("No current reaction in param2")
-				return
-			}
 
 			// Type 139 is the "self" event - sender is always the bridge user
 			op.Param3 = string(lc.UserLogin.ID)
+
+			// Curr == nil signals a reaction removal/clear from LINE.
+			if param2.Curr == nil {
+				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (self)")
+				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(string(lc.UserLogin.ID))})
+				return
+			}
 
 			if param2.Curr.PredefinedReactionType != nil {
 				lc.handlePredefinedReaction(ctx, op, param2.ChatMid, param2.Curr.PredefinedReactionType.Val)
@@ -843,8 +850,21 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to parse reaction param2")
 				return
 			}
+
+			// Curr == nil signals a reaction removal/clear from LINE. The
+			// payload does not carry the previous reaction type, so we don't
+			// know whether the original was predefined or paid. Existing
+			// predefined adds in this branch override op.Param3 = chatMid,
+			// while paid adds leave it as the observer MID — so we queue a
+			// removal for each candidate sender. The framework safely ignores
+			// any sender that doesn't have a matching reaction row.
 			if param2.Curr == nil {
-				lc.UserLogin.Bridge.Log.Error().Msg("No current reaction type found")
+				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (other)")
+				senders := []networkid.UserID{makeUserID(param2.ChatMid)}
+				if op.Param3 != "" && op.Param3 != param2.ChatMid {
+					senders = append(senders, makeUserID(op.Param3))
+				}
+				lc.handleReactionRemove(op, param2.ChatMid, senders)
 				return
 			}
 
@@ -949,6 +969,10 @@ func (lc *LineClient) handlePaidReaction(ctx context.Context, op line.Operation,
 		return
 	}
 
+	// A fresh add invalidates any prior remove-dedup entries for this
+	// message — otherwise a later removal would be silently skipped.
+	lc.clearReactionDedupEntries(op.Param1, true)
+
 	ts, _ := op.CreatedTime.Int64()
 	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
 		EventMeta: simplevent.EventMeta{
@@ -1007,6 +1031,11 @@ func (lc *LineClient) handlePredefinedReaction(ctx context.Context, op line.Oper
 		return
 	}
 
+	// A fresh add invalidates any prior remove-dedup entries for this
+	// message — otherwise a later removal of this (or a replacement)
+	// reaction would be silently skipped.
+	lc.clearReactionDedupEntries(op.Param1, true)
+
 	ts, _ := op.CreatedTime.Int64()
 	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
 		EventMeta: simplevent.EventMeta{
@@ -1017,6 +1046,65 @@ func (lc *LineClient) handlePredefinedReaction(ctx context.Context, op line.Oper
 		},
 		TargetMessage: networkid.MessageID(op.Param1),
 		Emoji:         mxc,
+	})
+}
+
+// handleReactionRemove queues a RemoteEventReactionRemove for each candidate
+// sender. Reactions are stored with EmojiID="" (see handlePaidReaction /
+// handlePredefinedReaction), so the framework's reaction lookup finds the
+// single row keyed by (target_message, sender) and redacts it. A miss is
+// silently ignored by bridgev2, which lets callers safely queue multiple
+// sender candidates when the previous reaction's actor is ambiguous.
+//
+// It also evicts stale add-dedup entries for the target message so that
+// re-adding the same emoji after a clear isn't silently dropped by the
+// recentReactions sync.Map.
+func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, senders []networkid.UserID) {
+	ts, _ := op.CreatedTime.Int64()
+	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
+
+	for _, sender := range senders {
+		dedupKey := op.Param1 + "\x00remove\x00" + string(sender)
+		if _, loaded := lc.recentReactions.LoadOrStore(dedupKey, struct{}{}); loaded {
+			lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("sender", string(sender)).Msg("Skipping duplicate reaction removal")
+			continue
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventReactionRemove,
+				PortalKey: portalKey,
+				Timestamp: time.UnixMilli(ts),
+				Sender:    bridgev2.EventSender{Sender: sender},
+			},
+			TargetMessage: networkid.MessageID(op.Param1),
+		})
+	}
+
+	lc.clearReactionDedupEntries(op.Param1, false)
+}
+
+// clearReactionDedupEntries evicts recentReactions entries for the given
+// message. The recentReactions sync.Map dedups concurrent 139/140 events
+// from LINE; without periodic cleanup, the keys accumulate and silently
+// block legitimate later events (e.g. add → remove → add of the same
+// emoji, or remove → add → remove sequences). We use the inverse-direction
+// event as the cleanup trigger: an add clears stale remove-dedup entries
+// (removeOnly=true), a remove clears stale add-dedup entries
+// (removeOnly=false).
+func (lc *LineClient) clearReactionDedupEntries(msgID string, removeOnly bool) {
+	prefix := msgID + "\x00"
+	lc.recentReactions.Range(func(k, _ any) bool {
+		ks, ok := k.(string)
+		if !ok {
+			return true
+		}
+		if !strings.HasPrefix(ks, prefix) {
+			return true
+		}
+		if strings.Contains(ks, "\x00remove\x00") == removeOnly {
+			lc.recentReactions.Delete(ks)
+		}
+		return true
 	})
 }
 
@@ -1062,16 +1150,6 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 
 	portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
 
-	var avatar *bridgev2.Avatar
-	if chat.PicturePath != "" {
-		avatar = &bridgev2.Avatar{
-			ID: networkid.AvatarID(chat.PicturePath),
-			Get: func(ctx context.Context) ([]byte, error) {
-				return lc.GetAvatar(ctx, networkid.AvatarID(chat.PicturePath))
-			},
-		}
-	}
-
 	// Use ChatInfoChange to only update avatar (and other non-name metadata).
 	// Name updates are handled by handleGroupRename from contentType=18 messages,
 	// which has the correct new name from LOC_ARGS.
@@ -1084,7 +1162,7 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 		},
 		ChatInfoChange: &bridgev2.ChatInfoChange{
 			ChatInfo: &bridgev2.ChatInfo{
-				Avatar: avatar,
+				Avatar: lc.avatarFromPicturePath(chat.PicturePath),
 			},
 		},
 	})
@@ -1243,9 +1321,10 @@ func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
 	info := lc.chatToChatInfo(ctx, &chat, false)
 	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventChatResync,
-			PortalKey: portalKey,
-			Timestamp: time.Now(),
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    portalKey,
+			CreatePortal: true,
+			Timestamp:    time.Now(),
 		},
 		ChatInfo: info,
 	})
