@@ -59,45 +59,53 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 			continue
 		}
 
-		contact := lc.getContact(ctx, mid)
-		dmType := database.RoomTypeDM
-		chatName := contact.EffectiveDisplayName()
-		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-			ChatInfo: &bridgev2.ChatInfo{
-				Type:   &dmType,
-				Name:   &chatName,
-				Avatar: lc.avatarFromPicturePath(contact.PicturePath),
-				Members: &bridgev2.ChatMemberList{
-					IsFull:                     true,
-					ExcludeChangesFromTimeline: true,
-					Members: []bridgev2.ChatMember{
-						{
-							EventSender: bridgev2.EventSender{
-								IsFromMe: true,
-								Sender:   networkid.UserID(lc.UserLogin.ID),
-							},
-							Membership: event.MembershipJoin,
-							PowerLevel: ptr.Ptr(100),
+		lc.queueDMChatResync(ctx, mid, false)
+	}
+}
+
+// queueDMChatResync emits a ChatResync event with full DM ChatInfo.
+// If createPortal is true, the framework will create the portal when it
+// doesn't already exist (e.g. after the DM was deleted on block).
+func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createPortal bool) {
+	contact := lc.getContact(ctx, mid)
+	dmType := database.RoomTypeDM
+	chatName := contact.EffectiveDisplayName()
+	portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    portalKey,
+			Timestamp:    time.Now(),
+			CreatePortal: createPortal,
+		},
+		ChatInfo: &bridgev2.ChatInfo{
+			Type:   &dmType,
+			Name:   &chatName,
+			Avatar: lc.avatarFromPicturePath(contact.PicturePath),
+			Members: &bridgev2.ChatMemberList{
+				IsFull:                     true,
+				ExcludeChangesFromTimeline: true,
+				Members: []bridgev2.ChatMember{
+					{
+						EventSender: bridgev2.EventSender{
+							IsFromMe: true,
+							Sender:   networkid.UserID(lc.UserLogin.ID),
 						},
-						{
-							EventSender: bridgev2.EventSender{
-								Sender: makeUserID(mid),
-							},
-							Membership: event.MembershipJoin,
-							PowerLevel: ptr.Ptr(0),
+						Membership: event.MembershipJoin,
+						PowerLevel: ptr.Ptr(100),
+					},
+					{
+						EventSender: bridgev2.EventSender{
+							Sender: makeUserID(mid),
 						},
+						Membership: event.MembershipJoin,
+						PowerLevel: ptr.Ptr(0),
 					},
 				},
-				ExcludeChangesFromTimeline: true,
 			},
-		})
-	}
+			ExcludeChangesFromTimeline: true,
+		},
+	})
 }
 
 func (lc *LineClient) prefetchMessages(ctx context.Context) {
@@ -124,31 +132,38 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	}
 
 	for _, box := range res.MessageBoxes {
-		// Fetch recent messages for all active chats to ensure history is populated
-		msgs, err := client.GetRecentMessagesV2(box.ID, 50)
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", box.ID).Msg("Failed to fetch recent messages")
+		lc.backfillRecentMessages(ctx, box.ID, 50)
+	}
+}
+
+// backfillRecentMessages fetches up to limit recent messages for a single
+// chat and queues any not already in the local DB through the normal inbound
+// message path. Used by prefetchMessages on startup and by OpUnblockContact
+// to repopulate a portal that was deleted on block.
+func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
+	client := line.NewClient(lc.AccessToken)
+	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
+		return
+	}
+	// Reverse messages to process oldest first
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := msgs[i]
+		if msg.ContentType == 18 {
+			lc.cacheGroupMembersFromSystemMessage(msg)
+		}
+
+		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
+		if err == nil && existing != nil {
 			continue
 		}
 
-		// Reverse messages to process oldest first
-		for i := len(msgs) - 1; i >= 0; i-- {
-			msg := msgs[i]
-			if msg.ContentType == 18 {
-				lc.cacheGroupMembersFromSystemMessage(msg)
-			}
-
-			existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
-			if err == nil && existing != nil {
-				continue
-			}
-
-			opType := OpReceiveMessage
-			if msg.From == lc.Mid {
-				opType = OpSendMessage
-			}
-			lc.queueIncomingMessage(msg, int(opType))
+		opType := OpReceiveMessage
+		if msg.From == lc.Mid {
+			opType = OpSendMessage
 		}
+		lc.queueIncomingMessage(msg, int(opType))
 	}
 }
 
@@ -670,14 +685,19 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		delete(lc.blockedUsers, mid)
 		lc.cacheMu.Unlock()
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact unblocked")
-		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-		})
+		// Reattach the DM portal: emit a ChatResync with CreatePortal so the
+		// framework recreates the portal that was deleted on block, then
+		// backfill recent messages so the room isn't empty.
+		lowerMid := strings.ToLower(mid)
+		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
+			return
+		}
+		lc.queueDMChatResync(ctx, mid, true)
+		lc.wg.Add(1)
+		go func() {
+			defer lc.wg.Done()
+			lc.backfillRecentMessages(context.Background(), mid, 50)
+		}()
 
 	case OpContactUpdate:
 		mid := op.Param1
