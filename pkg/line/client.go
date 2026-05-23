@@ -103,7 +103,14 @@ func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
 
 	res.NoE2EE = noE2EE
 
-	if res.AuthToken != "" {
+	// Prefer the V3 token if present, otherwise fall back to legacy authToken.
+	// LINE returns only the V3 token when re-authenticating with a stored
+	// certificate, so callers that key on AuthToken would otherwise fall into
+	// the PIN flow despite the login succeeding.
+	if res.TokenV3IssueResult != nil && res.TokenV3IssueResult.AccessToken != "" {
+		res.AuthToken = res.TokenV3IssueResult.AccessToken
+		c.AccessToken = res.TokenV3IssueResult.AccessToken
+	} else if res.AuthToken != "" {
 		c.AccessToken = res.AuthToken
 	}
 	return &res, nil
@@ -507,8 +514,15 @@ func (c *Client) RefreshAccessToken(refreshToken string) (*TokenV3IssueResult, e
 	if err := json.Unmarshal(respBytes, &res); err != nil {
 		return nil, fmt.Errorf("failed to parse refresh response: %w", err)
 	}
+
+	// Treat an empty access token as a refresh failure. LINE occasionally
+	// returns HTTP 200 with a non-token body (e.g. an error JSON that doesn't
+	// match TokenV3IssueResult), in which case the unmarshal silently yields a
+	// zeroed struct. Without this guard the caller would clear the in-memory
+	// access token and the bridge would silently go into a "not logged in"
+	// state on the next API call.
 	if res.AccessToken == "" {
-		return nil, fmt.Errorf("tokenRefresh returned empty access token")
+		return nil, fmt.Errorf("refresh response missing access token: %s", string(respBytes))
 	}
 
 	c.AccessToken = res.AccessToken

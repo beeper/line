@@ -19,11 +19,20 @@ var (
 
 const obsTokenBuffer = 30 * time.Second
 
-func ClearEncryptedAccessTokenCache() {
+// InvalidateOBSTokenCache clears the cached OBS access token. The OBS token is
+// derived from the main LINE access token; when the latter is rotated (refresh
+// or re-login) any previously-issued OBS token is invalidated server-side, but
+// the cache here would keep handing it out until its original TTL expires.
+// Callers must invoke this after any successful re-authentication.
+func InvalidateOBSTokenCache() {
 	obsTokenMu.Lock()
-	defer obsTokenMu.Unlock()
 	obsTokenCache = ""
 	obsTokenExpiry = time.Time{}
+	obsTokenMu.Unlock()
+}
+
+func ClearEncryptedAccessTokenCache() {
+	InvalidateOBSTokenCache()
 }
 
 // LoginV2 performs the loginV2 RPC call to authenticate a user
@@ -971,6 +980,26 @@ func (c *Client) GetAllContactIds() ([]string, error) {
 	}
 	if wrapper.Code != 0 {
 		return nil, fmt.Errorf("getAllContactIds failed: %s", wrapper.Message)
+	}
+	return wrapper.Data, nil
+}
+
+// GetBlockedContactIds returns the MIDs of all contacts blocked by the user.
+func (c *Client) GetBlockedContactIds() ([]string, error) {
+	resp, err := c.callRPC("TalkService", "getBlockedContactIds")
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int      `json:"code"`
+		Message string   `json:"message"`
+		Data    []string `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse getBlockedContactIds response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getBlockedContactIds failed: %s", wrapper.Message)
 	}
 	return wrapper.Data, nil
 }

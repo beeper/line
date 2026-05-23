@@ -31,15 +31,18 @@ type LineClient struct {
 	sentReqSeqs map[int]time.Time
 	tokenMu     sync.Mutex
 
-	// cacheMu protects peerKeys, contactCache, mediaFlowCache, noE2EEGroups,
-	// groupMemberCache, and generatedGroupNameCache.
+	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
+	// noE2EEGroups, groupMemberCache, and generatedGroupNameCache.
 	// Hold it only around map accesses; never across network calls.
 	cacheMu                 sync.Mutex
+	blockedUsers            map[string]bool      // mid -> true if the user has blocked this contact in LINE
 	noE2EEGroups            map[string]time.Time // chatMid -> when group E2EE failure was cached
 	contactCache            map[string]cachedContact
 	mediaFlowCache          map[string]cachedMediaFlow
 	groupMemberCache        map[string][]string // chatMid -> list of member MIDs from CreateGroup or getChatMemberMIDs
 	generatedGroupNameCache map[string]bool     // chatMid -> true when Matrix name should be generated from member names
+	reactionIconMXC         map[int]string      // predefinedReactionType -> cached MXC URI
+	recentReactions         sync.Map            // "msgID\x00emoji" -> struct{} to dedup concurrent 139/140 events
 
 	wg sync.WaitGroup
 }
@@ -65,6 +68,18 @@ type cachedContact struct {
 }
 
 const defaultMediaFlowTTL = 6 * time.Hour
+
+func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
+	if picturePath == "" {
+		return &bridgev2.Avatar{Remove: true}
+	}
+	return &bridgev2.Avatar{
+		ID: networkid.AvatarID(picturePath),
+		Get: func(ctx context.Context) ([]byte, error) {
+			return lc.GetAvatar(ctx, networkid.AvatarID(picturePath))
+		},
+	}
+}
 
 // shouldUseE2EEMediaFlow checks whether the server wants E2EE upload (flow 2)
 // for the given chat and content type. Returns true for E2EE, false for plain.
@@ -114,6 +129,12 @@ func (lc *LineClient) shouldUseE2EEMediaFlow(chatMid string, contentType int) bo
 	return true
 }
 
+func (lc *LineClient) isUserBlocked(mid string) bool {
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	return lc.blockedUsers[mid]
+}
+
 var _ bridgev2.NetworkAPI = (*LineClient)(nil)
 var _ bridgev2.NetworkAPIWithUserID = (*LineClient)(nil)
 var _ bridgev2.ReadReceiptHandlingNetworkAPI = (*LineClient)(nil)
@@ -137,7 +158,9 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	if res.RefreshToken != "" {
 		lc.RefreshToken = res.RefreshToken
 	}
-	line.ClearEncryptedAccessTokenCache()
+	// Rotating the main access token invalidates any OBS token derived from it,
+	// so drop the cached one — the next OBS call will mint a fresh one.
+	line.InvalidateOBSTokenCache()
 
 	meta := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	meta.AccessToken = lc.AccessToken
@@ -184,6 +207,9 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	if lc.peerKeys == nil {
 		lc.peerKeys = make(map[string]peerKeyInfo)
 	}
+	if lc.blockedUsers == nil {
+		lc.blockedUsers = make(map[string]bool)
+	}
 	if lc.contactCache == nil {
 		lc.contactCache = make(map[string]cachedContact)
 	}
@@ -208,6 +234,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 				StateEvent: status.StateBadCredentials,
 				Error:      "line-login-failed",
 				Message:    err.Error(),
+				UserAction: status.UserActionRelogin,
 			})
 			return
 		}
@@ -219,6 +246,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 			StateEvent: status.StateBadCredentials,
 			Error:      "line-token-expired",
 			Message:    fmt.Sprintf("session expired and could not be restored: %v", err),
+			UserAction: status.UserActionRelogin,
 		})
 		return
 	}
@@ -258,6 +286,22 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		}
 	}
 
+	// Fetch initial blocked contacts list before starting sync loops.
+	blockedMIDs, err := func() ([]string, error) {
+		client := line.NewClient(lc.AccessToken)
+		return client.GetBlockedContactIds()
+	}()
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch blocked contacts, continuing without block list")
+	} else {
+		lc.cacheMu.Lock()
+		for _, mid := range blockedMIDs {
+			lc.blockedUsers[mid] = true
+		}
+		lc.cacheMu.Unlock()
+		lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedMIDs)).Msg("Fetched blocked contacts")
+	}
+
 	lc.wg.Add(4)
 	go lc.syncChats(ctx)
 	go lc.syncDMChats(ctx)
@@ -287,6 +331,13 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		return fmt.Errorf("login failed: %w", err)
 	}
 	if res.AuthToken == "" {
+		// No usable verifier means LINE didn't engage the PIN-based flow.
+		// Bail out before emitting a misleading "PIN required" bridge state —
+		// the locally-generated PIN here was never sent to LINE and is useless.
+		if res.Verifier == "" {
+			return fmt.Errorf("login requires interaction but no verifier returned")
+		}
+
 		pin := res.Pin
 		if res.PinCode != "" {
 			pin = res.PinCode
@@ -298,10 +349,8 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 				StateEvent: status.StateConnecting,
 				Error:      "line-pin-required",
 				Message:    fmt.Sprintf("Enter this PIN on your LINE mobile app: %s", pin),
+				UserAction: status.UserActionRelogin,
 			})
-		}
-		if res.Verifier == "" {
-			return fmt.Errorf("login requires interaction but no verifier returned")
 		}
 
 		lc.UserLogin.Bridge.Log.Info().Msg("Waiting for PIN verification on mobile device...")
@@ -326,6 +375,11 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 			lc.RefreshToken = res.TokenV3IssueResult.RefreshToken
 		}
 	}
+
+	// Re-login replaces the main access token, which invalidates any cached
+	// OBS token derived from the previous one.
+	line.InvalidateOBSTokenCache()
+
 	if res.Mid != "" {
 		lc.Mid = res.Mid
 		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
