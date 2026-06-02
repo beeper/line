@@ -138,6 +138,53 @@ func (r *Runner) getChannel(id int) (uint32, error) {
 	return ptr, nil
 }
 
+func ltsmPanicError(operation string, recovered any) error {
+	if err, ok := recovered.(error); ok {
+		return fmt.Errorf("%s panicked: %w", operation, err)
+	}
+	return fmt.Errorf("%s panicked: %v", operation, recovered)
+}
+
+func (r *Runner) exportE2EEKeyPanicSafe(keyPtr uint32) (exported []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			exported = nil
+			err = ltsmPanicError("ltsm E2EEKey.exportKey", recovered)
+		}
+	}()
+	return r.rt.E2EEKeyExportKey(keyPtr)
+}
+
+func (r *Runner) unwrapGroupSharedKeyPanicSafe(chanPtr uint32, encKey []byte) (keyPtr uint32, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			keyPtr = 0
+			err = ltsmPanicError("ltsm E2EEChannel.unwrapGroupSharedKey", recovered)
+		}
+	}()
+	return r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, encKey)
+}
+
+func (r *Runner) decryptV1PanicSafe(chanPtr uint32, ciphertext []byte) (plaintext []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			plaintext = nil
+			err = ltsmPanicError("ltsm E2EEChannel.decryptV1", recovered)
+		}
+	}()
+	return r.rt.E2EEChannelDecryptV1(chanPtr, ciphertext)
+}
+
+func (r *Runner) decryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID, receiverKeyID, contentType int, ciphertext []byte) (plaintext []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			plaintext = nil
+			err = ltsmPanicError("ltsm E2EEChannel.decryptV2", recovered)
+		}
+	}()
+	return r.rt.E2EEChannelDecryptV2(chanPtr, to, from, senderKeyID, receiverKeyID, contentType, ciphertext)
+}
+
 func (r *Runner) GetSignature(reqPath, body, accessToken string) (string, error) {
 	if reqPath == "" {
 		reqPath = "/"
@@ -448,12 +495,16 @@ func (r *Runner) ChannelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB6
 		return 0, fmt.Errorf("invalid encrypted shared key: %w", err)
 	}
 
-	keyPtr, err := r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, encBytes)
+	keyPtr, err := r.unwrapGroupSharedKeyPanicSafe(chanPtr, encBytes)
 	if err != nil {
 		return 0, err
 	}
 
-	return r.putKey(keyPtr), nil
+	id := r.putKey(keyPtr)
+	if exported, err := r.exportE2EEKeyPanicSafe(keyPtr); err == nil && len(exported) == 32 {
+		r.goKeys[id] = &goKeyEntry{privKey: append([]byte(nil), exported...)}
+	}
+	return id, nil
 }
 
 // ChannelEncryptV1 encrypts plaintext with channel V1 (AES-256-CBC + MAC).
@@ -542,7 +593,7 @@ func (r *Runner) ChannelDecryptV1(channelID, senderKeyID, receiverKeyID int, cip
 		return "", "", err
 	}
 
-	ptBytes, err := r.rt.E2EEChannelDecryptV1(chanPtr, ctBytes)
+	ptBytes, err := r.decryptV1PanicSafe(chanPtr, ctBytes)
 	if err != nil {
 		return "", "", err
 	}
@@ -576,7 +627,7 @@ func (r *Runner) ChannelDecryptV2(channelID int, to, from string, senderKeyID, r
 		return "", "", err
 	}
 
-	ptBytes, err := r.rt.E2EEChannelDecryptV2(chanPtr,
+	ptBytes, err := r.decryptV2PanicSafe(chanPtr,
 		to, from, senderKeyID, receiverKeyID, contentType, ctBytes)
 	if err != nil {
 		return "", "", err
