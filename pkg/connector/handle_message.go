@@ -92,7 +92,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 	portalIDStr := portalMIDForMessage(msg, opType)
 	portalKey := networkid.PortalKey{ID: makePortalID(portalIDStr), Receiver: lc.UserLogin.ID}
 
-	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr)
+	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr, opType)
 	ts := lc.parseMessageTimestamp(msg)
 
 	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Message[line.Message]{
@@ -162,7 +162,7 @@ func (lc *LineClient) parseMessageTimestamp(msg *line.Message) time.Time {
 // decryptMessageBody runs E2EE decryption (when needed) for an inbound message
 // and returns the plaintext body plus the JSON-unwrapped text. Shared by the
 // live message path (queueIncomingMessage) and the backfill path (FetchMessages).
-func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string) (bodyText, unwrappedText string) {
+func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, opType int) (bodyText, unwrappedText string) {
 	// Handle Content
 	bodyText = msg.Text
 	if bodyText == "" && len(msg.Chunks) > 0 {
