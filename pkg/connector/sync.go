@@ -108,6 +108,103 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 	})
 }
 
+// queueDMBackfill asks the framework to backfill a DM portal's recent history.
+// It must run after the portal already exists (e.g. right after queueDMChatResync
+// recreated it on unblock), because the framework skips the backfill check on the
+// resync that creates a portal. CheckNeedsBackfillFunc forces a forward backfill,
+// which goes through FetchMessages and is batch-sent silently — no per-message
+// notifications.
+func (lc *LineClient) queueDMBackfill(mid string) {
+	portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventChatResync,
+			PortalKey: portalKey,
+			Timestamp: time.Now(),
+		},
+		CheckNeedsBackfillFunc: func(ctx context.Context, latestMessage *database.Message) (bool, error) {
+			return true, nil
+		},
+	})
+}
+
+// FetchMessages implements bridgev2.BackfillingNetworkAPI. It powers silent,
+// batch-sent history backfill. It is currently triggered when a DM portal is
+// recreated after the contact is unblocked (see queueDMBackfill), repopulating
+// the restored chat's recent history without notifying for every old message.
+// Only the newest params.Count messages are returned; there is no older-history
+// pagination, so backward fetches return an empty, final batch.
+func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+	// We only populate the most recent messages; we don't paginate further back.
+	if !params.Forward {
+		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
+	}
+
+	chatMID := string(params.Portal.PortalKey.ID)
+	limit := params.Count
+	if limit <= 0 {
+		limit = 50
+	}
+
+	client := line.NewClient(lc.AccessToken)
+	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if errRecover := lc.recoverToken(ctx); errRecover == nil {
+			client = line.NewClient(lc.AccessToken)
+			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch recent messages for backfill: %w", err)
+	}
+
+	// GetRecentMessagesV2 returns newest-first; backfill wants oldest-first.
+	backfillMsgs := make([]*bridgev2.BackfillMessage, 0, len(msgs))
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := msgs[i]
+		if msg.ContentType == 18 {
+			lc.cacheGroupMembersFromSystemMessage(msg)
+		}
+		if !isBridgeableContentType(msg) {
+			continue
+		}
+
+		sender := bridgev2.EventSender{
+			Sender:   makeUserID(msg.From),
+			IsFromMe: msg.From == lc.Mid,
+		}
+		intent, ok := params.Portal.GetIntentFor(ctx, sender, lc.UserLogin, bridgev2.RemoteEventMessage)
+		if !ok {
+			continue
+		}
+
+		bodyText, unwrappedText := lc.decryptMessageBody(msg, chatMID)
+		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText)
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
+			continue
+		}
+		if converted == nil {
+			continue
+		}
+
+		backfillMsgs = append(backfillMsgs, &bridgev2.BackfillMessage{
+			ConvertedMessage: converted,
+			Sender:           sender,
+			ID:               networkid.MessageID(msg.ID),
+			Timestamp:        lc.parseMessageTimestamp(msg),
+		})
+	}
+
+	return &bridgev2.FetchMessagesResponse{
+		Messages: backfillMsgs,
+		HasMore:  false,
+		// Mark the restored chat as read so the silent backfill doesn't leave a
+		// stale unread badge — and so the forward batch send never notifies.
+		MarkRead: true,
+	}, nil
+}
+
 func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	defer lc.wg.Done()
 
@@ -138,8 +235,9 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
-// message path. Used by prefetchMessages on startup and by OpUnblockContact
-// to repopulate a portal that was deleted on block.
+// (live) message path. Used by prefetchMessages on startup. Note that this
+// notifies for any not-yet-bridged messages; the silent backfill path used on
+// unblock goes through FetchMessages instead.
 func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
 	client := line.NewClient(lc.AccessToken)
 	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
@@ -211,11 +309,16 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 			portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
 
 			info := lc.chatToChatInfo(ctx, &chat, true)
+			// Member chats are created lazily on their first message; invited (not-yet-joined)
+			// chats have no incoming messages, so create their portal here so the pending
+			// invite surfaces as a Request even when it was outstanding before this sync.
+			createPortal := info.MessageRequest != nil && *info.MessageRequest
 			lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
 				EventMeta: simplevent.EventMeta{
-					Type:      bridgev2.RemoteEventChatResync,
-					PortalKey: portalKey,
-					Timestamp: time.Now(),
+					Type:         bridgev2.RemoteEventChatResync,
+					PortalKey:    portalKey,
+					CreatePortal: createPortal,
+					Timestamp:    time.Now(),
 				},
 				ChatInfo: info,
 			})
@@ -236,16 +339,21 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	}
 
 	var groupMemberMids []string
+	selfInvitePending := false
 	if chat.Extra.GroupExtra != nil {
 		if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
 			members[0].PowerLevel = ptr.Ptr(100)
 		}
-		// If the bridge user is not a full member but is an invitee, mark as invite
-		_, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]
-		if !isMember {
-			_, isInvitee := chat.Extra.GroupExtra.InviteeMids[lc.Mid]
-			if isInvitee {
-				members[0].Membership = event.MembershipInvite
+		// If the bridge user is invited but not yet a full member of a GROUP (type 0), surface the
+		// chat as a Beeper message request (Requests section) via info.MessageRequest below. The
+		// gate is GROUP-only on purpose: LINE ROOMs (type 1) have no accept step — invitees are
+		// auto-joined (see the invitee loop below, which also joins type-1 invitees) — so a room is
+		// created as a normal joined room rather than a request. Don't mark self as
+		// MembershipInvite: on Beeper an invite-membership self user is excluded from the room
+		// entirely (getInitialMemberList skips non-join members), so the room would never appear.
+		if _, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]; !isMember && chat.Type == 0 {
+			if _, isInvitee := chat.Extra.GroupExtra.InviteeMids[lc.Mid]; isInvitee {
+				selfInvitePending = true
 			}
 		}
 
@@ -328,7 +436,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		ct = database.RoomTypeDM
 	}
 
-	return &bridgev2.ChatInfo{
+	info := &bridgev2.ChatInfo{
 		Type:   &ct,
 		Name:   &name,
 		Avatar: lc.avatarFromPicturePath(chat.PicturePath),
@@ -339,6 +447,12 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
 	}
+	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
+	// out from under an accept that's already in flight.
+	if selfInvitePending {
+		info.MessageRequest = ptr.Ptr(true)
+	}
+	return info
 }
 
 func (lc *LineClient) generateNameFromMemberList(ctx context.Context, members []string) string {
@@ -686,18 +800,17 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Unlock()
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact unblocked")
 		// Reattach the DM portal: emit a ChatResync with CreatePortal so the
-		// framework recreates the portal that was deleted on block, then
-		// backfill recent messages so the room isn't empty.
+		// framework recreates the portal that was deleted on block, then ask it
+		// to backfill recent history. The backfill is batch-sent silently (see
+		// FetchMessages), so the restored chat repopulates without firing a
+		// notification for every old message — a blocked contact can't have sent
+		// anything new, so notifying on unblock is never useful.
 		lowerMid := strings.ToLower(mid)
 		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
 			return
 		}
 		lc.queueDMChatResync(ctx, mid, true)
-		lc.wg.Add(1)
-		go func() {
-			defer lc.wg.Done()
-			lc.backfillRecentMessages(context.Background(), mid, 50)
-		}()
+		lc.queueDMBackfill(mid)
 
 	case OpContactUpdate:
 		mid := op.Param1
@@ -1246,15 +1359,6 @@ func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
 }
 
 func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType OperationType) {
-	// OpInviteIntoChat is only sent to the invitee, so the bridge user is guaranteed to be invited.
-	// For OpNotifiedInviteIntoChat, fetch the chat info and check InviteeMids.
-	if opType == OpInviteIntoChat {
-		// Bridge user is the invitee for group type 0 chats; we need GetChats for chat metadata.
-		lc.handleInviteForSelf(ctx, chatMid)
-		return
-	}
-
-	// OpNotifiedInviteIntoChat — someone else was invited into a chat we're in.
 	client := line.NewClient(lc.AccessToken)
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
@@ -1264,25 +1368,41 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType O
 		}
 	}
 	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch chat info for notified invite")
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch chat info for invite")
 		return
 	}
-	if len(chatsResp.Chats) == 0 {
+	if len(chatsResp.Chats) == 0 || chatsResp.Chats[0].Extra.GroupExtra == nil {
 		return
 	}
 	chat := chatsResp.Chats[0]
 
-	if chat.Extra.GroupExtra != nil {
-		membership := event.MembershipInvite
-		if chat.Type == 1 {
-			membership = event.MembershipJoin
+	// Both OpInviteIntoChat (123) and OpNotifiedInviteIntoChat (124) dispatch here. We deliberately
+	// don't branch on the op number: the op→party mapping is ambiguous and GetChats sometimes omits
+	// the caller from the member/invitee lists. Instead, treat the bridge user as the invitee unless
+	// they're a confirmed member — a member receiving this op is the inviter or an existing member,
+	// whose chat must NOT be flipped into a request. The !member check also covers the LINE quirk
+	// where GetChats omits the caller entirely when they are the one being invited.
+	_, selfIsMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]
+	lc.UserLogin.Bridge.Log.Debug().
+		Int("op_type", int(opType)).
+		Str("chat_mid", chatMid).
+		Bool("self_is_member", selfIsMember).
+		Msg("Handling chat invite")
+	if !selfIsMember {
+		// Bridge user was invited: create the portal as a Beeper message request.
+		lc.handleInviteForSelfFromChat(ctx, &chat)
+	}
+
+	// Reflect any other pending invitees as invited members of the (now existing) portal.
+	membership := event.MembershipInvite
+	if chat.Type == 1 {
+		membership = event.MembershipJoin
+	}
+	for inviteeMid := range chat.Extra.GroupExtra.InviteeMids {
+		if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
+			continue
 		}
-		for inviteeMid := range chat.Extra.GroupExtra.InviteeMids {
-			if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
-				continue
-			}
-			lc.emitMemberChange(chat.ChatMid, inviteeMid, membership, time.Now())
-		}
+		lc.emitMemberChange(chat.ChatMid, inviteeMid, membership, time.Now())
 	}
 }
 
@@ -1302,23 +1422,26 @@ func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
 	if len(chatsResp.Chats) == 0 {
 		return
 	}
-	chat := chatsResp.Chats[0]
+	lc.handleInviteForSelfFromChat(ctx, &chatsResp.Chats[0])
+}
 
-	// OpInviteIntoChat is only sent to the invitee, so the bridge user is always the invitee.
-	// Even if GetChats didn't return the bridge user in InviteeMids (which happens when
-	// the LINE API doesn't include the caller in the invitee list), we add them here so that
-	// chatToChatInfo correctly sets MembershipInvite for GROUP (type 0) chats.
+// handleInviteForSelfFromChat creates (or resyncs) the portal for a chat the bridge user has
+// been invited to, flagged as a Beeper message request via chatToChatInfo.
+func (lc *LineClient) handleInviteForSelfFromChat(ctx context.Context, chat *line.Chat) {
+	// The bridge user is always the invitee here. Even if GetChats didn't return the bridge
+	// user in InviteeMids (which happens when the LINE API doesn't include the caller in the
+	// invitee list), we add them so chatToChatInfo flags the chat as a message request.
 	if chat.Extra.GroupExtra != nil {
 		if chat.Extra.GroupExtra.InviteeMids == nil {
 			chat.Extra.GroupExtra.InviteeMids = make(line.FlexibleMidMap)
 		}
 		chat.Extra.GroupExtra.InviteeMids[lc.Mid] = true
-		// Remove from MemberMids just in case, so MembershipInvite takes precedence
+		// Remove from MemberMids just in case, so the message-request flag takes precedence.
 		delete(chat.Extra.GroupExtra.MemberMids, lc.Mid)
 	}
 
 	portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
-	info := lc.chatToChatInfo(ctx, &chat, false)
+	info := lc.chatToChatInfo(ctx, chat, false)
 	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
@@ -1356,7 +1479,25 @@ func (lc *LineClient) handleSystemMessage(op line.Operation) {
 		parts := strings.SplitN(locArgs, "\x1e", 2)
 		if len(parts) == 2 {
 			inviteeMid := parts[1]
-			lc.emitMemberChange(msg.To, inviteeMid, event.MembershipInvite, tsTime)
+			if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
+				// The bridge user is the invitee: create the portal as a message request.
+				// Defense-in-depth in case no OpInviteIntoChat/OpNotifiedInviteIntoChat SSE op
+				// arrives — an emitMemberChange here would be dropped because the portal doesn't
+				// exist yet. The SSE handler usually wins the race, so only act as a fallback when
+				// the portal doesn't exist yet, to avoid a duplicate GetChats + ChatResync.
+				chatMid := msg.To
+				lc.wg.Add(1)
+				go func() {
+					defer lc.wg.Done()
+					portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
+					if portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(context.Background(), portalKey); err == nil && portal != nil && portal.MXID != "" {
+						return
+					}
+					lc.handleInviteForSelf(context.Background(), chatMid)
+				}()
+			} else {
+				lc.emitMemberChange(msg.To, inviteeMid, event.MembershipInvite, tsTime)
+			}
 		}
 	case "C_IC":
 		// Invitation cancelled — emit leave for the invitee
