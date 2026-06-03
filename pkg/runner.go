@@ -165,6 +165,26 @@ func (r *Runner) unwrapGroupSharedKeyPanicSafe(chanPtr uint32, encKey []byte) (k
 	return r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, encKey)
 }
 
+func (r *Runner) encryptV1PanicSafe(chanPtr uint32, plaintext []byte) (ciphertext []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			ciphertext = nil
+			err = ltsmPanicError("ltsm E2EEChannel.encryptV1", recovered)
+		}
+	}()
+	return r.rt.E2EEChannelEncryptV1(chanPtr, plaintext)
+}
+
+func (r *Runner) encryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID, receiverKeyID, contentType int, seq int64, plaintext []byte) (ciphertext []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			ciphertext = nil
+			err = ltsmPanicError("ltsm E2EEChannel.encryptV2", recovered)
+		}
+	}()
+	return r.rt.E2EEChannelEncryptV2(chanPtr, to, from, senderKeyID, receiverKeyID, contentType, seq, plaintext)
+}
+
 func (r *Runner) decryptV1PanicSafe(chanPtr uint32, ciphertext []byte) (plaintext []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -352,7 +372,7 @@ func (r *Runner) LoginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64 string) 
 
 		id := r.putKey(keyPtr)
 
-		exported, err := r.rt.E2EEKeyExportKey(keyPtr)
+		exported, err := r.exportE2EEKeyPanicSafe(keyPtr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to export key %d: %w", i, err)
 		}
@@ -500,11 +520,7 @@ func (r *Runner) ChannelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB6
 		return 0, err
 	}
 
-	id := r.putKey(keyPtr)
-	if exported, err := r.exportE2EEKeyPanicSafe(keyPtr); err == nil && len(exported) == 32 {
-		r.goKeys[id] = &goKeyEntry{privKey: append([]byte(nil), exported...)}
-	}
-	return id, nil
+	return r.putKey(keyPtr), nil
 }
 
 // ChannelEncryptV1 encrypts plaintext with channel V1 (AES-256-CBC + MAC).
@@ -528,7 +544,7 @@ func (r *Runner) ChannelEncryptV1(channelID int, plaintext string) (string, erro
 		return "", err
 	}
 
-	ctBytes, err := r.rt.E2EEChannelEncryptV1(chanPtr, []byte(plaintext))
+	ctBytes, err := r.encryptV1PanicSafe(chanPtr, []byte(plaintext))
 	if err != nil {
 		return "", err
 	}
@@ -558,7 +574,7 @@ func (r *Runner) ChannelEncryptV2(channelID int, to, from string, senderKeyID, r
 		return "", err
 	}
 
-	ctBytes, err := r.rt.E2EEChannelEncryptV2(chanPtr,
+	ctBytes, err := r.encryptV2PanicSafe(chanPtr,
 		to, from, senderKeyID, receiverKeyID, contentType, int64(seq), []byte(plaintext))
 	if err != nil {
 		return "", err

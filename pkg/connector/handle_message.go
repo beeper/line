@@ -131,7 +131,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 				if len(msg.Chunks) >= 5 {
 					if gkID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil && gkID != 0 {
 						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, gkID); errFetch != nil {
-							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Int("key_id", gkID), msg, portalIDStr, opType).
+							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Prefetch group key before decrypt failed")
 						}
 					}
@@ -141,16 +141,16 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 				if err == nil {
 					bodyText = pt
 				} else {
-					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err).Int("key_id", keyID), msg, portalIDStr, opType).
+					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
 						Msg("DecryptGroupMessage failed, trying to fetch key")
 					if keyID != 0 {
 						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
-							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch).Int("key_id", keyID), msg, portalIDStr, opType).
+							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Failed to fetch/unwrap group key")
 						} else if ptRetry, _, errRetry := lc.E2EE.DecryptGroupMessage(msg, portalIDStr); errRetry == nil {
 							bodyText = ptRetry
 						} else {
-							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry).Int("key_id", keyID), msg, portalIDStr, opType).
+							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
 								Msg("DecryptGroupMessage failed after group key refresh")
 						}
 					}
