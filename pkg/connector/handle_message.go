@@ -35,6 +35,45 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 	}
 }
 
+func e2eeChunkLengths(chunks []string) []int {
+	lengths := make([]int, len(chunks))
+	for i, chunk := range chunks {
+		lengths[i] = len(chunk)
+	}
+	return lengths
+}
+
+func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+	evt = evt.
+		Str("msg_id", msg.ID).
+		Str("chat_mid", chatMID).
+		Str("from", msg.From).
+		Str("to", msg.To).
+		Int("to_type", msg.ToType).
+		Int("op_type", opType).
+		Int("content_type", msg.ContentType).
+		Int("chunk_count", len(msg.Chunks)).
+		Ints("chunk_lengths", e2eeChunkLengths(msg.Chunks))
+
+	if version := msg.ContentMetadata["e2eeVersion"]; version != "" {
+		evt = evt.Str("e2ee_version", version)
+	}
+	if len(msg.Chunks) >= 5 {
+		if senderKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-2]); err == nil {
+			evt = evt.Int("sender_key_id", senderKeyID)
+		} else {
+			evt = evt.Str("sender_key_id_error", err.Error())
+		}
+		if groupKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
+			evt = evt.Int("group_key_id", groupKeyID)
+		} else {
+			evt = evt.Str("group_key_id_error", err.Error())
+		}
+	}
+
+	return evt
+}
+
 func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 	// Only process known content types; skip system messages (group created, member invited, etc.)
 	if !isBridgeableContentType(msg) {
@@ -53,7 +92,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 	portalIDStr := portalMIDForMessage(msg, opType)
 	portalKey := networkid.PortalKey{ID: makePortalID(portalIDStr), Receiver: lc.UserLogin.ID}
 
-	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr)
+	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr, opType)
 	ts := lc.parseMessageTimestamp(msg)
 
 	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Message[line.Message]{
@@ -123,7 +162,7 @@ func (lc *LineClient) parseMessageTimestamp(msg *line.Message) time.Time {
 // decryptMessageBody runs E2EE decryption (when needed) for an inbound message
 // and returns the plaintext body plus the JSON-unwrapped text. Shared by the
 // live message path (queueIncomingMessage) and the backfill path (FetchMessages).
-func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string) (bodyText, unwrappedText string) {
+func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, opType int) (bodyText, unwrappedText string) {
 	// Handle Content
 	bodyText = msg.Text
 	if bodyText == "" && len(msg.Chunks) > 0 {
@@ -144,7 +183,8 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string) 
 				if len(msg.Chunks) >= 5 {
 					if gkID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil && gkID != 0 {
 						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, gkID); errFetch != nil {
-							lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Int("key_id", gkID).Str("chat_mid", portalIDStr).Msg("Prefetch group key before decrypt failed")
+							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(errFetch), msg, portalIDStr, opType).
+								Msg("Prefetch group key before decrypt failed")
 						}
 					}
 				}
@@ -153,12 +193,17 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string) 
 				if err == nil {
 					bodyText = pt
 				} else {
-					lc.UserLogin.Bridge.Log.Debug().Err(err).Int("key_id", keyID).Str("chat_mid", portalIDStr).Msg("DecryptGroupMessage failed, trying to fetch key")
+					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
+						Msg("DecryptGroupMessage failed, trying to fetch key")
 					if keyID != 0 {
 						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
-							lc.UserLogin.Bridge.Log.Warn().Err(errFetch).Int("key_id", keyID).Str("chat_mid", portalIDStr).Msg("Failed to fetch/unwrap group key")
+							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch), msg, portalIDStr, opType).
+								Msg("Failed to fetch/unwrap group key")
 						} else if ptRetry, _, errRetry := lc.E2EE.DecryptGroupMessage(msg, portalIDStr); errRetry == nil {
 							bodyText = ptRetry
+						} else {
+							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
+								Msg("DecryptGroupMessage failed after group key refresh")
 						}
 					}
 				}
