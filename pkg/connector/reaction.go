@@ -20,6 +20,8 @@ import (
 const (
 	lineOriginalEmojiProductID = "670e0cce840a8236ddd4ee4c"
 	lineTrialEmojiProductID    = "5ac1bfd5040ab15980c9b435"
+	maxLineReqSeq              = 1_000_000_000
+	sentReqSeqTTL              = 5 * time.Minute
 )
 
 type linePaidReactionRef struct {
@@ -271,28 +273,65 @@ func parseReactionTargetMessageID(messageID networkid.MessageID) (string, error)
 }
 
 func (lc *LineClient) nextReqSeq() int {
-	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-	lc.trackReqSeq(reqSeq)
-	return reqSeq
+	now := time.Now()
+
+	lc.reqSeqMu.Lock()
+	defer lc.reqSeqMu.Unlock()
+
+	lc.cleanupSentReqSeqsLocked(now)
+	if lc.sentReqSeqs == nil {
+		lc.sentReqSeqs = make(map[int]time.Time)
+	}
+	if lc.lastReqSeq <= 0 {
+		lc.lastReqSeq = int(now.UnixMilli() % maxLineReqSeq)
+	}
+
+	for {
+		lc.lastReqSeq++
+		if lc.lastReqSeq <= 0 || lc.lastReqSeq >= maxLineReqSeq {
+			lc.lastReqSeq = 1
+		}
+		if _, exists := lc.sentReqSeqs[lc.lastReqSeq]; !exists {
+			lc.sentReqSeqs[lc.lastReqSeq] = now
+			return lc.lastReqSeq
+		}
+	}
+}
+
+func (lc *LineClient) cleanupSentReqSeqsLocked(now time.Time) {
+	for reqSeq, sentAt := range lc.sentReqSeqs {
+		if now.Sub(sentAt) > sentReqSeqTTL {
+			delete(lc.sentReqSeqs, reqSeq)
+		}
+	}
 }
 
 func (lc *LineClient) trackReqSeq(reqSeq int) {
-	if reqSeq == 0 {
+	if reqSeq <= 0 {
 		return
 	}
+	now := time.Now()
+
 	lc.reqSeqMu.Lock()
 	if lc.sentReqSeqs == nil {
 		lc.sentReqSeqs = make(map[int]time.Time)
 	}
-	lc.sentReqSeqs[reqSeq] = time.Now()
+	lc.cleanupSentReqSeqsLocked(now)
+	lc.sentReqSeqs[reqSeq] = now
+	if reqSeq > lc.lastReqSeq {
+		lc.lastReqSeq = reqSeq
+	}
 	lc.reqSeqMu.Unlock()
 }
 
 func (lc *LineClient) consumeSentReqSeq(reqSeq int) bool {
-	if reqSeq == 0 {
+	if reqSeq <= 0 {
 		return false
 	}
+	now := time.Now()
+
 	lc.reqSeqMu.Lock()
+	lc.cleanupSentReqSeqsLocked(now)
 	_, ok := lc.sentReqSeqs[reqSeq]
 	if ok {
 		delete(lc.sentReqSeqs, reqSeq)

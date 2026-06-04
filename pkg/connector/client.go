@@ -28,6 +28,7 @@ type LineClient struct {
 
 	reqSeqMu    sync.Mutex
 	sentReqSeqs map[int]time.Time
+	lastReqSeq  int
 
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
 	// noE2EEGroups, groupMemberCache, and generatedGroupNameCache.

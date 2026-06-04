@@ -400,14 +400,15 @@ func (c *Client) React(reqSeq int64, messageID string, reactionType ReactionType
 		return err
 	}
 	var wrapper struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(resp, &wrapper); err != nil {
 		return err
 	}
 	if wrapper.Code != 0 {
-		return fmt.Errorf("react failed: %s", wrapper.Message)
+		return fmt.Errorf("react failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
 	}
 	return nil
 }
@@ -422,14 +423,15 @@ func (c *Client) CancelReaction(reqSeq int64, messageID string) error {
 		return err
 	}
 	var wrapper struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(resp, &wrapper); err != nil {
 		return err
 	}
 	if wrapper.Code != 0 {
-		return fmt.Errorf("cancelReaction failed: %s", wrapper.Message)
+		return fmt.Errorf("cancelReaction failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
 	}
 	return nil
 }
