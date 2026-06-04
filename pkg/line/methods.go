@@ -389,6 +389,51 @@ func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
 	return wrapper.Data, nil
 }
 
+func (c *Client) React(reqSeq int64, messageID string, reactionType ReactionType) error {
+	req := ReactRequest{
+		ReqSeq:       int(reqSeq),
+		MessageID:    messageID,
+		ReactionType: reactionType,
+	}
+	resp, err := c.callRPC("TalkService", "react", req)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return err
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("react failed: %s", wrapper.Message)
+	}
+	return nil
+}
+
+func (c *Client) CancelReaction(reqSeq int64, messageID string) error {
+	req := CancelReactionRequest{
+		ReqSeq:    int(reqSeq),
+		MessageID: messageID,
+	}
+	resp, err := c.callRPC("TalkService", "cancelReaction", req)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return err
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("cancelReaction failed: %s", wrapper.Message)
+	}
+	return nil
+}
+
 // SendChatChecked sends a read receipt for a message in a chat
 func (c *Client) SendChatChecked(chatMid, messageID string) error {
 	_, err := c.callRPC("TalkService", "sendChatChecked", 0, chatMid, messageID)
