@@ -44,11 +44,12 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 	if isPlainMedia {
 		sid = "m"
 	}
-	audioData, err := client.DownloadOBSWithSID(ctx, oid, data.ID, sid)
+	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
+	audioData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
 
 	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
 		client = newClient
-		audioData, err = client.DownloadOBSWithSID(ctx, oid, data.ID, sid)
+		audioData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
 	}
 	_ = client
 
