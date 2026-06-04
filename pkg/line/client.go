@@ -26,7 +26,6 @@ const (
 	ExtensionVersion = "3.7.2"
 	UserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 	rpcClientTimeout = 30 * time.Second
-	obsClientTimeout = 5 * time.Minute
 	obsRetryDelay    = 2 * time.Second
 	obsMaxRetries    = 5
 )
@@ -45,7 +44,7 @@ type OBSDownloadOptions struct {
 func NewClient(token string) *Client {
 	return &Client{
 		HTTPClient:  &http.Client{Timeout: rpcClientTimeout},
-		OBSClient:   &http.Client{Timeout: obsClientTimeout},
+		OBSClient:   &http.Client{},
 		AccessToken: token,
 	}
 }
@@ -57,7 +56,7 @@ func (c *Client) obsHTTPClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return &http.Client{Timeout: obsClientTimeout}
+	return &http.Client{}
 }
 
 func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
@@ -724,8 +723,11 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 			return nil, fmt.Errorf("OBS download request failed: %w", err)
 		}
 
-		if (resp.StatusCode == 202 || resp.StatusCode == 404) && attempt < obsMaxRetries {
+		if resp.StatusCode == 202 || resp.StatusCode == 404 {
 			resp.Body.Close()
+			if attempt >= obsMaxRetries {
+				return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", obsMaxRetries)
+			}
 			select {
 			case <-time.After(obsRetryDelay):
 			case <-ctx.Done():

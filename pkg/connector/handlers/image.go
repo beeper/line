@@ -28,12 +28,8 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return nil, nil
 	}
 
-	downloadOptions := line.OBSDownloadOptions{
-		OBSPop: data.ContentMetadata["OBS_POP"],
-	}
-	if isPlainMedia && lineMediaCategory(data.ContentMetadata) == "original" {
-		downloadOptions.TID = "original"
-	}
+	mediaCategory := lineMediaCategory(data.ContentMetadata)
+	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 
 	var imgData []byte
 	var err error
@@ -42,9 +38,9 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		Str("oid", oid).
 		Str("msg_id", data.ID).
 		Str("tid", downloadOptions.TID).
+		Str("media_category", mediaCategory).
 		Bool("has_obs_pop", downloadOptions.OBSPop != "").
 		Bool("plain_media", isPlainMedia).
-		Interface("content_metadata", data.ContentMetadata).
 		Msg("Downloading image from LINE OBS")
 	if isPlainMedia {
 		imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, "m", downloadOptions)
@@ -123,8 +119,13 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return nil, fmt.Errorf("failed to upload image to matrix: %w", err)
 	}
 
+	matrixMediaURL := string(mxc)
+	if file != nil && file.URL != "" {
+		matrixMediaURL = string(file.URL)
+	}
+
 	h.Log.Info().
-		Str("mxc", mxc.ParseOrIgnore().String()).
+		Str("matrix_media_url", matrixMediaURL).
 		Int("size", len(imgData)).
 		Dur("download_duration", downloadDuration).
 		Dur("decrypt_duration", decryptDuration).
@@ -160,4 +161,14 @@ func lineMediaCategory(metadata map[string]string) string {
 	}
 
 	return info.Category
+}
+
+func lineOBSDownloadOptions(metadata map[string]string, isPlainMedia bool) line.OBSDownloadOptions {
+	opts := line.OBSDownloadOptions{
+		OBSPop: metadata["OBS_POP"],
+	}
+	if isPlainMedia && lineMediaCategory(metadata) == "original" {
+		opts.TID = "original"
+	}
+	return opts
 }

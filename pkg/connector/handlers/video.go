@@ -45,12 +45,13 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 	if isPlainMedia {
 		sid = "m"
 	}
+	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 	dlStart := time.Now()
-	videoData, err := client.DownloadOBSWithSID(ctx, oid, data.ID, sid)
+	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
 
 	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
 		client = newClient
-		videoData, err = client.DownloadOBSWithSID(ctx, oid, data.ID, sid)
+		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
 	}
 	_ = client
 
