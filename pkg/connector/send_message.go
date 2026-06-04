@@ -620,12 +620,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	reqSeq := int(now % 1_000_000_000)
-	lc.reqSeqMu.Lock()
-	if lc.sentReqSeqs == nil {
-		lc.sentReqSeqs = make(map[int]time.Time)
-	}
-	lc.sentReqSeqs[reqSeq] = time.Now()
-	lc.reqSeqMu.Unlock()
+	lc.trackReqSeq(reqSeq)
 
 	sentMsg, err := client.SendMessage(int64(reqSeq), lineMsg)
 
@@ -685,9 +680,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-		lc.reqSeqMu.Lock()
-		lc.sentReqSeqs[retryReqSeq] = time.Now()
-		lc.reqSeqMu.Unlock()
+		lc.trackReqSeq(retryReqSeq)
 
 		sentMsg, err = client.SendMessage(int64(retryReqSeq), lineMsg)
 	}
@@ -715,9 +708,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			}
 			if err == nil {
 				retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-				lc.reqSeqMu.Lock()
-				lc.sentReqSeqs[retryReqSeq] = time.Now()
-				lc.reqSeqMu.Unlock()
+				lc.trackReqSeq(retryReqSeq)
 				sentMsg, err = client.SendMessage(int64(retryReqSeq), lineMsg)
 			}
 		} else {
@@ -805,12 +796,7 @@ func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridge
 	client := line.NewClient(lc.AccessToken)
 
 	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-	lc.reqSeqMu.Lock()
-	if lc.sentReqSeqs == nil {
-		lc.sentReqSeqs = make(map[int]time.Time)
-	}
-	lc.sentReqSeqs[reqSeq] = time.Now()
-	lc.reqSeqMu.Unlock()
+	lc.trackReqSeq(reqSeq)
 
 	err := client.UnsendMessage(int64(reqSeq), string(msg.TargetMessage.ID))
 	if err != nil && strings.Contains(err.Error(), "message too old") {
@@ -836,12 +822,7 @@ func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev
 		return client.RejectChatInvitation(int64(reqSeq), string(portal.ID))
 	}
 
-	lc.reqSeqMu.Lock()
-	if lc.sentReqSeqs == nil {
-		lc.sentReqSeqs = make(map[int]time.Time)
-	}
-	lc.sentReqSeqs[reqSeq] = time.Now()
-	lc.reqSeqMu.Unlock()
+	lc.trackReqSeq(reqSeq)
 
 	return client.SendChatRemoved(int64(reqSeq), string(portal.ID), "0", 0)
 }
