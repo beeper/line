@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
 
@@ -29,6 +28,7 @@ type LineClient struct {
 
 	reqSeqMu    sync.Mutex
 	sentReqSeqs map[int]time.Time
+	lastReqSeq  int
 
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
 	// noE2EEGroups, groupMemberCache, and generatedGroupNameCache.
@@ -434,18 +434,6 @@ func (lc *LineClient) GetUserID() networkid.UserID {
 }
 
 func (lc *LineClient) LogoutRemote(ctx context.Context) {}
-
-func (lc *LineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
-	return bridgev2.MatrixReactionPreResponse{}, bridgev2.ErrReactionsNotSupported
-}
-
-func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
-	return nil, bridgev2.ErrReactionsNotSupported
-}
-
-func (lc *LineClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2.MatrixReactionRemove) error {
-	return nil
-}
 
 func (lc *LineClient) midOrFallback() string {
 	if lc.Mid != "" {

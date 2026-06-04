@@ -101,10 +101,23 @@ func IsNotAMemberError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "\"code\":10051") &&
+	return hasResponseErrorCode(msg) &&
 		strings.Contains(msg, "talkexception") &&
 		strings.Contains(msg, "\"code\":10,") &&
-		strings.Contains(msg, "\"not a member\"")
+		strings.Contains(msg, "not a member")
+}
+
+func IsInvalidPaidReactionType(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return hasResponseErrorCode(msg) &&
+		strings.Contains(msg, "invalid paidreactiontype in reactiontype")
+}
+
+func hasResponseErrorCode(msg string) bool {
+	return strings.Contains(msg, "\"code\":10051") || strings.Contains(msg, "code 10051")
 }
 
 func isNoUsableE2EEGroupKeyTalkException(message string, data talkExceptionData) bool {

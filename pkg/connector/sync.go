@@ -762,6 +762,12 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	opType := OperationType(op.Type)
 
+	if opType == OpPredefinedReaction || opType == OpReaction {
+		if lc.consumeSentReqSeq(op.ReqSeq) {
+			return
+		}
+	}
+
 	if opType == OpSendMessage {
 		lc.reqSeqMu.Lock()
 		_, ok := lc.sentReqSeqs[op.ReqSeq]
