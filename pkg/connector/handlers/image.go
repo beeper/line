@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
@@ -27,23 +28,40 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return nil, nil
 	}
 
+	downloadOptions := line.OBSDownloadOptions{
+		OBSPop: data.ContentMetadata["OBS_POP"],
+	}
+	if isPlainMedia && lineMediaCategory(data.ContentMetadata) == "original" {
+		downloadOptions.TID = "original"
+	}
+
 	var imgData []byte
 	var err error
+	dlStart := time.Now()
+	h.Log.Debug().
+		Str("oid", oid).
+		Str("msg_id", data.ID).
+		Str("tid", downloadOptions.TID).
+		Bool("has_obs_pop", downloadOptions.OBSPop != "").
+		Bool("plain_media", isPlainMedia).
+		Interface("content_metadata", data.ContentMetadata).
+		Msg("Downloading image from LINE OBS")
 	if isPlainMedia {
-		imgData, err = client.DownloadOBSWithSID(ctx, oid, data.ID, "m")
+		imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, "m", downloadOptions)
 	} else {
-		imgData, err = client.DownloadOBS(ctx, oid, data.ID)
+		imgData, err = client.DownloadOBSWithOptions(ctx, oid, data.ID, downloadOptions)
 	}
 
 	// Refresh token if we get a 401
 	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
 		client = newClient
 		if isPlainMedia {
-			imgData, err = client.DownloadOBSWithSID(ctx, oid, data.ID, "m")
+			imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, "m", downloadOptions)
 		} else {
-			imgData, err = client.DownloadOBS(ctx, oid, data.ID)
+			imgData, err = client.DownloadOBSWithOptions(ctx, oid, data.ID, downloadOptions)
 		}
 	}
+	downloadDuration := time.Since(dlStart)
 
 	if err != nil {
 		h.Log.Warn().
@@ -51,6 +69,7 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			Str("oid", oid).
 			Str("msg_id", data.ID).
 			Bool("plain_media", isPlainMedia).
+			Dur("download_duration", downloadDuration).
 			Msg("Failed to download image from OBS, sending placeholder")
 		return &bridgev2.ConvertedMessage{
 			Parts: []*bridgev2.ConvertedMessagePart{
@@ -67,15 +86,22 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	// Decrypt image if it has keyMaterial (E2EE)
+	var decryptDuration time.Duration
 	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
 		var decryptInfo struct {
 			KeyMaterial string `json:"keyMaterial"`
 			FileName    string `json:"fileName"`
 		}
 		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.KeyMaterial != "" {
+			decryptStart := time.Now()
 			decryptedImg, err := h.DecryptMedia(imgData, decryptInfo.KeyMaterial)
+			decryptDuration = time.Since(decryptStart)
 			if err != nil {
-				h.Log.Error().Err(err).Msg("Failed to decrypt image data")
+				h.Log.Error().
+					Err(err).
+					Dur("download_duration", downloadDuration).
+					Dur("decrypt_duration", decryptDuration).
+					Msg("Failed to decrypt image data")
 				return nil, fmt.Errorf("failed to decrypt image data: %w", err)
 			}
 			imgData = decryptedImg
@@ -83,11 +109,27 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	// Upload to Matrix
+	uploadStart := time.Now()
 	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, "image.jpg", "image/jpeg")
+	uploadDuration := time.Since(uploadStart)
 	if err != nil {
-		h.Log.Error().Err(err).Int("size_bytes", len(imgData)).Msg("Failed to upload image to Matrix")
+		h.Log.Error().
+			Err(err).
+			Int("size_bytes", len(imgData)).
+			Dur("download_duration", downloadDuration).
+			Dur("decrypt_duration", decryptDuration).
+			Dur("upload_duration", uploadDuration).
+			Msg("Failed to upload image to Matrix")
 		return nil, fmt.Errorf("failed to upload image to matrix: %w", err)
 	}
+
+	h.Log.Info().
+		Str("mxc", mxc.ParseOrIgnore().String()).
+		Int("size", len(imgData)).
+		Dur("download_duration", downloadDuration).
+		Dur("decrypt_duration", decryptDuration).
+		Dur("upload_duration", uploadDuration).
+		Msg("Successfully uploaded image to Matrix")
 
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{
@@ -103,4 +145,19 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			},
 		},
 	}, nil
+}
+
+func lineMediaCategory(metadata map[string]string) string {
+	if metadata == nil || metadata["MEDIA_CONTENT_INFO"] == "" {
+		return ""
+	}
+
+	var info struct {
+		Category string `json:"category"`
+	}
+	if err := json.Unmarshal([]byte(metadata["MEDIA_CONTENT_INFO"]), &info); err != nil {
+		return ""
+	}
+
+	return info.Category
 }
