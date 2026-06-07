@@ -47,7 +47,7 @@ Based on the [mautrix-twilio](https://github.com/mautrix/twilio) bridge
     - [x] Device contact (vCard)
   - [x] Mentions
 - [x] Read receipts
-- [x] Reaction support (Receive ONLY)
+- [x] Reactions (receive: fully supported; send: limited to ~120 emojis — see [reaction.go](https://github.com/beeper/matrix-line-messenger/blob/main/pkg/connector/reaction.go))
 - [x] Replies
 - [x] Prefetch missed chats upon starting the bridge
 - [x] Group chats

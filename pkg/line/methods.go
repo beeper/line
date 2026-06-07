@@ -392,6 +392,53 @@ func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
 	return wrapper.Data, nil
 }
 
+func (c *Client) React(reqSeq int64, messageID string, reactionType ReactionType) error {
+	req := ReactRequest{
+		ReqSeq:       int(reqSeq),
+		MessageID:    messageID,
+		ReactionType: reactionType,
+	}
+	resp, err := c.callRPC("TalkService", "react", req)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return err
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("react failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
+	}
+	return nil
+}
+
+func (c *Client) CancelReaction(reqSeq int64, messageID string) error {
+	req := CancelReactionRequest{
+		ReqSeq:    int(reqSeq),
+		MessageID: messageID,
+	}
+	resp, err := c.callRPC("TalkService", "cancelReaction", req)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return err
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("cancelReaction failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
+	}
+	return nil
+}
+
 // SendChatChecked sends a read receipt for a message in a chat
 func (c *Client) SendChatChecked(chatMid, messageID string) error {
 	_, err := c.callRPC("TalkService", "sendChatChecked", 0, chatMid, messageID)
@@ -760,6 +807,27 @@ func (c *Client) RegisterE2EEGroupKey(keyVersion int, chatMid string, members []
 // InviteIntoChat invites users into an existing LINE group chat.
 func (c *Client) InviteIntoChat(chatMid string, mids []string) error {
 	_, err := c.callRPC("TalkService", "inviteIntoChat", 1, chatMid, mids)
+	return err
+}
+
+// ChatInvitationRequest is the single struct argument taken by acceptChatInvitation and
+// rejectChatInvitation. The Chrome extension calls them as `mutate([{reqSeq, chatMid}])`, i.e. a
+// single request struct (unlike inviteIntoRoom, which uses positional scalar args).
+type ChatInvitationRequest struct {
+	ReqSeq  int64  `json:"reqSeq"`
+	ChatMid string `json:"chatMid"`
+}
+
+// AcceptChatInvitation accepts a pending invitation into a LINE group chat (the bridge user
+// joins the chat).
+func (c *Client) AcceptChatInvitation(reqSeq int64, chatMid string) error {
+	_, err := c.callRPC("TalkService", "acceptChatInvitation", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
+	return err
+}
+
+// RejectChatInvitation declines a pending invitation into a LINE group chat.
+func (c *Client) RejectChatInvitation(reqSeq int64, chatMid string) error {
+	_, err := c.callRPC("TalkService", "rejectChatInvitation", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
 	return err
 }
 

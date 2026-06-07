@@ -57,8 +57,24 @@ type ReactionDetail struct {
 type PaidReactionType struct {
 	ProductID    string `json:"productId"`
 	EmojiID      string `json:"emojiId"`
-	ResourceType int    `json:"resourceType"`
-	Version      int    `json:"version"`
+	ResourceType int    `json:"resourceType,omitempty"`
+	Version      int    `json:"version,omitempty"`
+}
+
+type ReactionType struct {
+	PredefinedReactionType int               `json:"predefinedReactionType,omitempty"`
+	PaidReactionType       *PaidReactionType `json:"paidReactionType,omitempty"`
+}
+
+type ReactRequest struct {
+	ReqSeq       int          `json:"reqSeq"`
+	MessageID    string       `json:"messageId"`
+	ReactionType ReactionType `json:"reactionType"`
+}
+
+type CancelReactionRequest struct {
+	ReqSeq    int    `json:"reqSeq"`
+	MessageID string `json:"messageId"`
 }
 
 // PredefinedReactionEmoji maps LINE predefinedReactionType values to Unicode emoji.
