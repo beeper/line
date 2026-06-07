@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,9 @@ const (
 	ShopBaseURL      = "https://line-chrome-gw.line-apps.com/api/shop/thrift/ShopService"
 	ExtensionVersion = "3.7.2"
 	UserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+	rpcClientTimeout = 30 * time.Second
+	obsRetryDelay    = 2 * time.Second
+	obsMaxRetries    = 5
 )
 
 type Client struct {
@@ -34,12 +38,27 @@ type Client struct {
 	AccessToken string
 }
 
+type OBSDownloadOptions struct {
+	TID    string
+	OBSPop string
+}
+
 func NewClient(token string) *Client {
 	return &Client{
-		HTTPClient:  &http.Client{Timeout: 30 * time.Second},
+		HTTPClient:  &http.Client{Timeout: rpcClientTimeout},
 		OBSClient:   &http.Client{},
 		AccessToken: token,
 	}
+}
+
+func (c *Client) obsHTTPClient() *http.Client {
+	if c.OBSClient != nil {
+		return c.OBSClient
+	}
+	if c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return &http.Client{}
 }
 
 func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
@@ -572,7 +591,7 @@ func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
 	req.Header.Set("X-Obs-Params", obsParamsB64)
 	req.Header.Set("x-line-access", obsToken)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.obsHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("OBS upload request failed: %w", err)
 	}
@@ -634,7 +653,7 @@ func (c *Client) UploadOBSWithSID(data []byte, sid string) (string, error) {
 	// Use the OBS-specific access token
 	req.Header.Set("x-line-access", obsToken)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.obsHTTPClient().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("OBS upload request failed: %w", err)
 	}
@@ -692,7 +711,7 @@ func (c *Client) UploadOBSWithOIDAndSID(data []byte, oid string, sid string) err
 	req.Header.Set("X-Obs-Params", obsParamsB64)
 	req.Header.Set("x-line-access", obsToken)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.obsHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("OBS upload request failed: %w", err)
 	}
@@ -712,20 +731,33 @@ func (c *Client) DownloadOBS(ctx context.Context, oid string, messageID string) 
 	return c.DownloadOBSWithSID(ctx, oid, messageID, "emi")
 }
 
+func (c *Client) DownloadOBSWithOptions(ctx context.Context, oid string, messageID string, opts OBSDownloadOptions) ([]byte, error) {
+	return c.DownloadOBSWithSIDOptions(ctx, oid, messageID, "emi", opts)
+}
+
 func (c *Client) DownloadOBSWithSID(ctx context.Context, oid string, messageID string, sid string) ([]byte, error) {
+	return c.DownloadOBSWithSIDOptions(ctx, oid, messageID, sid, OBSDownloadOptions{})
+}
+
+func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, messageID string, sid string, opts OBSDownloadOptions) ([]byte, error) {
 	// URL structure: https://obs.line-apps.com/r/talk/{SID}/{OID}
 	// SID: emi (images), emv (videos), ema (audio), emf (files)
-	url := fmt.Sprintf("%s/r/talk/%s/%s", OBSBaseURL, sid, oid)
+	obsURL := fmt.Sprintf("%s/r/talk/%s/%s", OBSBaseURL, sid, oid)
+	if opts.TID != "" {
+		obsURL += "/" + url.PathEscape(opts.TID)
+	}
+	if opts.OBSPop != "" {
+		obsURL += "?p=" + url.QueryEscape(opts.OBSPop)
+	}
 
 	obsToken, err := c.AcquireEncryptedAccessToken()
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire encrypted access token: %w", err)
 	}
 
-	// Retry loop for 202 (media still processing, e.g. video transcoding)
-	maxRetries := 5
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	// Retry loop for 202/404 (media still processing, e.g. video transcoding).
+	for attempt := 0; attempt <= obsMaxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "GET", obsURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create OBS download request: %w", err)
 		}
@@ -741,14 +773,21 @@ func (c *Client) DownloadOBSWithSID(ctx context.Context, oid string, messageID s
 			req.Header.Set("x-talk-meta", talkMeta)
 		}
 
-		resp, err := c.OBSClient.Do(req)
+		resp, err := c.obsHTTPClient().Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("OBS download request failed: %w", err)
 		}
 
-		if (resp.StatusCode == 202 || resp.StatusCode == 404) && attempt < maxRetries {
+		if resp.StatusCode == 202 || resp.StatusCode == 404 {
 			resp.Body.Close()
-			time.Sleep(2 * time.Second)
+			if attempt >= obsMaxRetries {
+				return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", obsMaxRetries)
+			}
+			select {
+			case <-time.After(obsRetryDelay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
@@ -767,7 +806,7 @@ func (c *Client) DownloadOBSWithSID(ctx context.Context, oid string, messageID s
 		return data, nil
 	}
 
-	return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", maxRetries)
+	return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", obsMaxRetries)
 }
 
 // this builds x-talk-meta
