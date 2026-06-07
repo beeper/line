@@ -99,7 +99,7 @@ func (lc *LineClient) shouldUseE2EEMediaFlow(chatMid string, contentType int) bo
 	}
 	lc.cacheMu.Unlock()
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	resp, err := client.DetermineMediaMessageFlow(chatMid)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
@@ -140,6 +140,27 @@ var _ bridgev2.NetworkAPIWithUserID = (*LineClient)(nil)
 var _ bridgev2.ReadReceiptHandlingNetworkAPI = (*LineClient)(nil)
 var _ bridgev2.BackfillingNetworkAPI = (*LineClient)(nil)
 var _ bridgev2.ReactionHandlingNetworkAPI = (*LineClient)(nil)
+
+func (lc *LineClient) accessToken() string {
+	lc.tokenMu.Lock()
+	defer lc.tokenMu.Unlock()
+	return lc.AccessToken
+}
+
+func (lc *LineClient) setTokens(accessToken, refreshToken string, updateRefreshToken bool) (string, string) {
+	lc.tokenMu.Lock()
+	defer lc.tokenMu.Unlock()
+
+	lc.AccessToken = accessToken
+	if updateRefreshToken {
+		lc.RefreshToken = refreshToken
+	}
+	return lc.AccessToken, lc.RefreshToken
+}
+
+func (lc *LineClient) newLineClient() *line.Client {
+	return line.NewClient(lc.accessToken())
+}
 
 func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	lc.tokenMu.Lock()
@@ -229,7 +250,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 			lc.Mid = meta.Mid
 		}
 	}
-	if lc.AccessToken == "" {
+	if lc.accessToken() == "" {
 		if err := lc.recoverToken(ctx); err != nil {
 			lc.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
@@ -252,7 +273,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		return
 	}
 
-	lc.UserLogin.Bridge.Log.Info().Int("token_len", len(lc.AccessToken)).Msg("LINE client connected; notifying bridge")
+	lc.UserLogin.Bridge.Log.Info().Int("token_len", len(lc.accessToken())).Msg("LINE client connected; notifying bridge")
 	lc.UserLogin.BridgeState.Send(status.BridgeState{
 		StateEvent: status.StateConnected,
 	})
@@ -272,7 +293,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		}
 
 		// Storage key is optional for runtime decrypt/encrypt; try it for file support
-		client := line.NewClient(lc.AccessToken)
+		client := lc.newLineClient()
 		ei3, err := client.GetEncryptedIdentityV3()
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch EncryptedIdentityV3")
@@ -289,7 +310,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 
 	// Fetch initial blocked contacts list before starting sync loops.
 	blockedMIDs, err := func() ([]string, error) {
-		client := line.NewClient(lc.AccessToken)
+		client := lc.newLineClient()
 		return client.GetBlockedContactIds()
 	}()
 	if err != nil {
@@ -356,7 +377,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 
 		lc.UserLogin.Bridge.Log.Info().Msg("Waiting for PIN verification on mobile device...")
 		waitClient := line.NewClient("")
-		waitRes, err := waitClient.WaitForLogin(res.Verifier, res.NoE2EE)
+		waitRes, err := waitClient.WaitForLogin(res.Verifier, res.NoE2EE, res.LoginKeyID)
 		if err != nil {
 			return fmt.Errorf("PIN verification failed: %w", err)
 		}
@@ -367,15 +388,22 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		res = waitRes
 		client = waitClient
 	}
-	lc.AccessToken = client.AccessToken
+	accessToken := client.AccessToken
+	if accessToken == "" {
+		accessToken = res.AuthToken
+	}
+	refreshToken := ""
+	updateRefreshToken := false
 	if res.TokenV3IssueResult != nil {
 		if res.TokenV3IssueResult.AccessToken != "" {
-			lc.AccessToken = res.TokenV3IssueResult.AccessToken
+			accessToken = res.TokenV3IssueResult.AccessToken
 		}
 		if res.TokenV3IssueResult.RefreshToken != "" {
-			lc.RefreshToken = res.TokenV3IssueResult.RefreshToken
+			refreshToken = res.TokenV3IssueResult.RefreshToken
+			updateRefreshToken = true
 		}
 	}
+	accessToken, refreshToken = lc.setTokens(accessToken, refreshToken, updateRefreshToken)
 
 	// Re-login replaces the main access token, which invalidates any cached
 	// OBS token derived from the previous one.
@@ -390,8 +418,8 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 
 	// Save the new tokens and updated certificate to metadata
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
-		meta.AccessToken = lc.AccessToken
-		meta.RefreshToken = lc.RefreshToken
+		meta.AccessToken = accessToken
+		meta.RefreshToken = refreshToken
 		if res.Certificate != "" {
 			meta.Certificate = res.Certificate
 		}
@@ -405,7 +433,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 }
 
 func (lc *LineClient) ensureValidToken(ctx context.Context) error {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	_, err := client.GetProfile()
 	if err == nil {
 		return nil
@@ -437,7 +465,7 @@ func (lc *LineClient) Disconnect() {
 	lc.wg.Wait()
 }
 
-func (lc *LineClient) IsLoggedIn() bool { return lc.AccessToken != "" }
+func (lc *LineClient) IsLoggedIn() bool { return lc.accessToken() != "" }
 
 func (lc *LineClient) GetUserID() networkid.UserID {
 	return makeUserID(lc.Mid)

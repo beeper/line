@@ -31,7 +31,7 @@ type mentionEntry struct {
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	portalMid := string(msg.Portal.ID)
 	fromMid := lc.midOrFallback()
 
@@ -793,7 +793,7 @@ func contentTypeForMsgType(msgType event.MessageType) int {
 }
 
 func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 
 	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
 	lc.trackReqSeq(reqSeq)
@@ -810,7 +810,7 @@ func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridge
 }
 
 func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev2.Portal) error {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 
 	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
 
@@ -833,7 +833,7 @@ var _ bridgev2.MessageRequestAcceptingNetworkAPI = (*LineClient)(nil)
 // HandleMatrixAcceptMessageRequest is called when the user accepts a Request in Beeper (a
 // pending LINE group invitation). It accepts the invitation on the LINE side, joining the chat.
 func (lc *LineClient) HandleMatrixAcceptMessageRequest(ctx context.Context, msg *bridgev2.MatrixAcceptMessageRequest) error {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	reqSeq := int64(time.Now().UnixMilli() % 1_000_000_000)
 	return client.AcceptChatInvitation(reqSeq, string(msg.Portal.ID))
 }

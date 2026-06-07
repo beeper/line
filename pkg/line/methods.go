@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -18,6 +19,28 @@ var (
 )
 
 const obsTokenBuffer = 30 * time.Second
+
+var ErrQRLoginCertificateRejected = errors.New("qr login certificate rejected")
+
+type QRLoginCertificateRejectedError struct {
+	Code    int
+	Message string
+}
+
+func (e *QRLoginCertificateRejectedError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("%v: code %d", ErrQRLoginCertificateRejected, e.Code)
+	}
+	return fmt.Sprintf("%v: %s (code %d)", ErrQRLoginCertificateRejected, e.Message, e.Code)
+}
+
+func (e *QRLoginCertificateRejectedError) Unwrap() error {
+	return ErrQRLoginCertificateRejected
+}
+
+func IsQRLoginCertificateRejected(err error) bool {
+	return errors.Is(err, ErrQRLoginCertificateRejected)
+}
 
 // InvalidateOBSTokenCache clears the cached OBS access token. The OBS token is
 // derived from the main LINE access token; when the latter is rotated (refresh
@@ -159,7 +182,7 @@ func (c *Client) VerifyCertificate(authSessionID, certificate string) error {
 		return err
 	}
 	if wrapper.Code != 0 {
-		return fmt.Errorf("verifyCertificate failed: %s", wrapper.Message)
+		return &QRLoginCertificateRejectedError{Code: wrapper.Code, Message: wrapper.Message}
 	}
 	return nil
 }

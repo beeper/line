@@ -21,7 +21,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 		return fmt.Errorf("E2EE manager not initialized")
 	}
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	fetch := func() (*line.E2EEGroupSharedKey, error) {
 		if groupKeyID > 0 {
 			return client.GetE2EEGroupSharedKey(chatMid, groupKeyID)
@@ -44,7 +44,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 	// Token recovery for other error types
 	if err != nil && !line.IsNoUsableE2EEGroupKey(err) && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newLineClient()
 			sharedKey, err = fetch()
 		} else {
 			return fmt.Errorf("failed to recover token before fetching group key: %w", errRecover)
@@ -107,11 +107,11 @@ func (lc *LineClient) ensurePeerKey(ctx context.Context, mid string) (int, strin
 			return cached.raw, cached.pub, nil
 		}
 	}
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	res, err := client.NegotiateE2EEPublicKey(mid)
-	if err != nil && lc.isRefreshRequired(err) {
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newLineClient()
 			res, err = client.NegotiateE2EEPublicKey(mid)
 		}
 	}
@@ -171,12 +171,12 @@ func (lc *LineClient) clearGroupNoE2EE(chatMid string) {
 // Invitees are included because group key registration must happen before they accept,
 // otherwise the key won't be available when they start sending messages.
 func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]string, error) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	chats, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil {
 		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newLineClient()
 				chats, err = client.GetChats([]string{chatMid}, true, true)
 			}
 		}
@@ -325,12 +325,12 @@ func (lc *LineClient) ensurePeerKeyByID(ctx context.Context, mid string, keyID i
 		return cached.raw, cached.pub, nil
 	}
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	// keyVersion 1
 	res, err := client.GetE2EEPublicKey(mid, 1, keyID)
-	if err != nil && lc.isRefreshRequired(err) {
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newLineClient()
 			res, err = client.GetE2EEPublicKey(mid, 1, keyID)
 		}
 	}

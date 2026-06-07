@@ -141,6 +141,21 @@ func (r *Runner) putLoginKey(ptr uint32) int {
 	return id
 }
 
+func (r *Runner) getLoginKeyLocked(loginKeyID int) (uint32, error) {
+	loginCurveKey := r.loginCurveKey
+	if loginKeyID != 0 {
+		var ok bool
+		loginCurveKey, ok = r.loginKeyStore[loginKeyID]
+		if !ok {
+			return 0, fmt.Errorf("unknown login key: %d", loginKeyID)
+		}
+	}
+	if loginCurveKey == 0 {
+		return 0, fmt.Errorf("login key not initialized")
+	}
+	return loginCurveKey, nil
+}
+
 func (r *Runner) getChannel(id int) (uint32, error) {
 	ptr, ok := r.channelStore[id]
 	if !ok {
@@ -351,16 +366,9 @@ func (r *Runner) LoginUnwrapKeyChainWithKey(loginKeyID int, serverPubB64, encryp
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	loginCurveKey := r.loginCurveKey
-	if loginKeyID != 0 {
-		var ok bool
-		loginCurveKey, ok = r.loginKeyStore[loginKeyID]
-		if !ok {
-			return nil, fmt.Errorf("unknown login key: %d", loginKeyID)
-		}
-	}
-	if loginCurveKey == 0 {
-		return nil, fmt.Errorf("login key not initialized")
+	loginCurveKey, err := r.getLoginKeyLocked(loginKeyID)
+	if err != nil {
+		return nil, err
 	}
 
 	serverPubBytes, err := base64.StdEncoding.DecodeString(normalizedServerPub)
@@ -715,9 +723,15 @@ func (r *Runner) GenerateE2EESecret() (*SecretResult, error) {
 	}, nil
 }
 
-// GenerateConfirmHash derives the hash key chain for confirmE2EELogin.
-// Must be called after GenerateE2EESecret.
+// GenerateConfirmHash derives the hash key chain for confirmE2EELogin using
+// the latest login key.
 func (r *Runner) GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 string) (string, error) {
+	return r.GenerateConfirmHashWithKey(0, serverPublicKeyB64, encryptedKeyChainB64)
+}
+
+// GenerateConfirmHashWithKey derives the hash key chain for confirmE2EELogin
+// using the same login key that generated the login secret.
+func (r *Runner) GenerateConfirmHashWithKey(loginKeyID int, serverPublicKeyB64, encryptedKeyChainB64 string) (string, error) {
 	normalizedServerPub, err := normalizeServerPublicKeyB64(serverPublicKeyB64)
 	if err != nil {
 		return "", err
@@ -726,8 +740,9 @@ func (r *Runner) GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 st
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.loginCurveKey == 0 {
-		return "", fmt.Errorf("login key not initialized")
+	loginCurveKey, err := r.getLoginKeyLocked(loginKeyID)
+	if err != nil {
+		return "", err
 	}
 
 	serverPubBytes, err := base64.StdEncoding.DecodeString(normalizedServerPub)
@@ -735,7 +750,7 @@ func (r *Runner) GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 st
 		return "", fmt.Errorf("invalid server public key: %w", err)
 	}
 
-	chanPtr, err := r.rt.Curve25519KeyCreateChannel(r.loginCurveKey, serverPubBytes)
+	chanPtr, err := r.rt.Curve25519KeyCreateChannel(loginCurveKey, serverPubBytes)
 	if err != nil {
 		return "", err
 	}

@@ -121,6 +121,7 @@ func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
 	}
 
 	res.NoE2EE = noE2EE
+	res.LoginKeyID = secretRes.LoginKeyID
 
 	// Prefer the V3 token if present, otherwise fall back to legacy authToken.
 	// LINE returns only the V3 token when re-authenticating with a stored
@@ -143,11 +144,11 @@ func isLoginNotSupported(err error) bool {
 	return strings.Contains(msg, "\"code\":89") || strings.Contains(msg, "not supported")
 }
 
-func (c *Client) WaitForLogin(verifier string, noE2EE bool) (*LoginResult, error) {
+func (c *Client) WaitForLogin(verifier string, noE2EE bool, loginKeyID int) (*LoginResult, error) {
 	if noE2EE {
 		return c.waitForLoginJQ(verifier)
 	}
-	return c.waitForLoginLF1(verifier)
+	return c.waitForLoginLF1(verifier, loginKeyID)
 }
 
 // waitForLoginJQ polls the JQ endpoint for LSOFF accounts (no E2EE).
@@ -215,7 +216,7 @@ func (c *Client) waitForLoginJQ(verifier string) (*LoginResult, error) {
 }
 
 // waitForLoginLF1 polls the LF1 endpoint for LSON accounts (E2EE).
-func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
+func (c *Client) waitForLoginLF1(verifier string, loginKeyID int) (*LoginResult, error) {
 	url := "https://line-chrome-gw.line-apps.com/api/talk/long-polling/LF1"
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -263,7 +264,7 @@ func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
 
 	// LSON path: confirm E2EE handshake first, then finalize with verifier
 	if meta.EncryptedKeyChain != "" && meta.PublicKey != "" {
-		if err := c.ConfirmE2EELogin(verifier, meta.PublicKey, meta.EncryptedKeyChain); err != nil {
+		if err := c.ConfirmE2EELoginWithKey(loginKeyID, verifier, meta.PublicKey, meta.EncryptedKeyChain); err != nil {
 			log.Printf("[LINE] ConfirmE2EELogin failed: %v", err)
 		} else {
 			if res, err := c.LoginV2WithVerifier(verifier); err != nil {
@@ -273,6 +274,7 @@ func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
 				res.E2EEPublicKey = meta.PublicKey
 				res.E2EEVersion = meta.E2EEVersion
 				res.E2EEKeyID = meta.KeyID
+				res.LoginKeyID = loginKeyID
 				return res, nil
 			}
 		}
@@ -283,6 +285,7 @@ func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
 		return &LoginResult{
 			AuthToken:   meta.AuthToken,
 			Certificate: meta.Certificate,
+			LoginKeyID:  loginKeyID,
 		}, nil
 	}
 
@@ -291,6 +294,7 @@ func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
 	if res, err := c.LoginV2WithVerifier(verifier); err != nil {
 		return nil, fmt.Errorf("login finalization failed: %w", err)
 	} else {
+		res.LoginKeyID = loginKeyID
 		return res, nil
 	}
 }
@@ -378,12 +382,18 @@ func (c *Client) callRPCWithBaseURL(baseURL, service, method string, args ...int
 // ConfirmE2EELogin completes the E2EE handshake after LF1 by hashing the encrypted key
 // chain and posting it alongside the verifier.
 func (c *Client) ConfirmE2EELogin(verifier, serverPublicKeyB64, encryptedKeyChainB64 string) error {
+	return c.ConfirmE2EELoginWithKey(0, verifier, serverPublicKeyB64, encryptedKeyChainB64)
+}
+
+// ConfirmE2EELoginWithKey completes the E2EE handshake using a specific login
+// key generated for this login attempt.
+func (c *Client) ConfirmE2EELoginWithKey(loginKeyID int, verifier, serverPublicKeyB64, encryptedKeyChainB64 string) error {
 	runner, err := gen.GetRunner()
 	if err != nil {
 		return fmt.Errorf("failed to init runner: %w", err)
 	}
 
-	hash, err := runner.GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64)
+	hash, err := runner.GenerateConfirmHashWithKey(loginKeyID, serverPublicKeyB64, encryptedKeyChainB64)
 	if err != nil {
 		return fmt.Errorf("failed to derive confirm hash: %w", err)
 	}

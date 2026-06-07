@@ -126,6 +126,7 @@ type LoginResult struct {
 	E2EEPublicKey       string              `json:"publicKey,omitempty"`
 	E2EEVersion         string              `json:"e2eeVersion,omitempty"`
 	E2EEKeyID           string              `json:"keyId,omitempty"`
+	LoginKeyID          int                 `json:"-"`
 	NoE2EE              bool                `json:"-"` // True when login fell back to non-E2EE (LSOFF)
 }
 

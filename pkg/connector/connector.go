@@ -171,13 +171,15 @@ func storedCertificateForUser(user *bridgev2.User) string {
 }
 
 type LineQRLogin struct {
-	User          *bridgev2.User
-	client        *line.Client
-	AuthSessionID string
-	Certificate   string
-	LoginKeyID    int
-	QRScanned     bool
-	PINRequired   bool
+	User                       *bridgev2.User
+	client                     *line.Client
+	AuthSessionID              string
+	Certificate                string
+	LoginKeyID                 int
+	LongPollingMaxCount        int
+	LongPollingIntervalSeconds int
+	QRScanned                  bool
+	PINRequired                bool
 
 	pollErr    chan error
 	pollResult chan struct{}
@@ -208,6 +210,8 @@ func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	}
 
 	lq.AuthSessionID = sessionID
+	lq.LongPollingMaxCount = qrCode.LongPollingMaxCount
+	lq.LongPollingIntervalSeconds = qrCode.LongPollingIntervalSeconds
 	lq.startPoll(func(ctx context.Context) error {
 		return lq.client.CheckQRCodeVerifiedContext(ctx, sessionID)
 	})
@@ -245,12 +249,16 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 		}
 		lq.QRScanned = true
 
-		if err := lq.client.VerifyCertificate(lq.AuthSessionID, lq.Certificate); err == nil {
-			res, err := lq.client.QRCodeLoginV2(lq.AuthSessionID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to complete QR login: %w", err)
+		if lq.Certificate != "" {
+			if err := lq.client.VerifyCertificate(lq.AuthSessionID, lq.Certificate); err == nil {
+				res, err := lq.client.QRCodeLoginV2(lq.AuthSessionID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to complete QR login: %w", err)
+				}
+				return finishLineLoginWithLoginKey(ctx, lq.User, "", "", res, lq.LoginKeyID)
+			} else if !line.IsQRLoginCertificateRejected(err) {
+				return nil, fmt.Errorf("failed to verify QR login certificate: %w", err)
 			}
-			return finishLineLoginWithLoginKey(ctx, lq.User, "", "", res, lq.LoginKeyID)
 		}
 
 		pin, err := lq.client.CreatePinCode(lq.AuthSessionID)
@@ -281,12 +289,47 @@ func (lq *LineQRLogin) startPoll(fn func(context.Context) error) {
 	lq.pollMu.Unlock()
 
 	go func() {
-		if err := fn(ctx); err != nil {
+		if err := lq.pollWithRetry(ctx, fn); err != nil {
 			pollErr <- err
 		} else {
 			pollResult <- struct{}{}
 		}
 	}()
+}
+
+func (lq *LineQRLogin) pollWithRetry(ctx context.Context, fn func(context.Context) error) error {
+	maxCount := lq.LongPollingMaxCount
+	if maxCount <= 0 {
+		maxCount = 1
+	}
+	interval := time.Duration(lq.LongPollingIntervalSeconds) * time.Second
+
+	var err error
+	for attempt := 0; attempt < maxCount; attempt++ {
+		err = fn(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if attempt == maxCount-1 {
+			break
+		}
+		if interval <= 0 {
+			continue
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 func (lq *LineQRLogin) waitForPoll(ctx context.Context) error {
@@ -320,6 +363,7 @@ type LineEmailLogin struct {
 	Email       string
 	Password    string
 	Verifier    string
+	LoginKeyID  int
 	AwaitingPIN bool
 	NoE2EE      bool // True when login fell back to non-E2EE (LSOFF account)
 
@@ -459,6 +503,7 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 
 	if (res.Type == 3 || res.Type == 0) && res.Verifier != "" {
 		ll.Verifier = res.Verifier
+		ll.LoginKeyID = res.LoginKeyID
 		ll.NoE2EE = res.NoE2EE
 		ll.AwaitingPIN = false
 		instructions := "Please open the LINE app on your mobile device to complete the login."
@@ -477,7 +522,7 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 		ll.pollErr = make(chan error, 1)
 		go func() {
 			client := line.NewClient("")
-			res, err := client.WaitForLogin(ll.Verifier, ll.NoE2EE)
+			res, err := client.WaitForLogin(ll.Verifier, ll.NoE2EE, ll.LoginKeyID)
 			if err != nil {
 				ll.pollErr <- err
 			} else {
@@ -516,7 +561,11 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 }
 
 func finishLineLogin(ctx context.Context, user *bridgev2.User, email, password string, res *line.LoginResult) (*bridgev2.LoginStep, error) {
-	return finishLineLoginWithLoginKey(ctx, user, email, password, res, 0)
+	loginKeyID := 0
+	if res != nil {
+		loginKeyID = res.LoginKeyID
+	}
+	return finishLineLoginWithLoginKey(ctx, user, email, password, res, loginKeyID)
 }
 
 func finishLineLoginWithLoginKey(ctx context.Context, user *bridgev2.User, email, password string, res *line.LoginResult, loginKeyID int) (*bridgev2.LoginStep, error) {
@@ -547,7 +596,7 @@ func finishLineLoginWithLoginKey(ctx context.Context, user *bridgev2.User, email
 		displayName = "LINE User"
 	}
 
-	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: email, Password: password, Certificate: res.Certificate, Mid: res.Mid}
+	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: email, Password: password, Certificate: res.Certificate, Mid: profile.Mid}
 
 	fetchLoginKeys(user, res, meta, client, loginKeyID)
 
@@ -563,6 +612,7 @@ func finishLineLoginWithLoginKey(ctx context.Context, user *bridgev2.User, email
 				UserLogin:    login,
 				AccessToken:  token,
 				RefreshToken: refreshToken,
+				Mid:          profile.Mid,
 				HTTPClient:   &http.Client{Timeout: 10 * time.Second},
 			}
 			return nil
