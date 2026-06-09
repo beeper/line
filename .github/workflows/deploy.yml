@@ -92,7 +92,7 @@ jobs:
           pull: true
           file: Dockerfile
           tags: |
-            ${{ env.CI_REGISTRY_IMAGE }}:${{ github.sha }}
+            ${{ env.CI_REGISTRY_IMAGE }}:${{ github.sha }}-amd64
           push: true
 
   deploy-docker:
