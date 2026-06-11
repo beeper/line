@@ -399,7 +399,9 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 // chat and queues any not already in the local DB through the normal inbound
 // (live) message path. Used by prefetchMessages on startup and as a delayed,
 // deduped fallback after unblock if bridgev2's silent forward backfill didn't
-// populate the restored room first.
+// backfillRecentMessages fetches up to limit recent messages for a single
+// chat and queues any not already in the local DB through the normal inbound
+// (live) message path. Used by prefetchMessages on startup.
 func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
 	start := time.Now()
 	client := line.NewClient(lc.AccessToken)
