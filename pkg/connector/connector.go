@@ -18,6 +18,13 @@ import (
 
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+	"github.com/highesttt/matrix-line-messenger/pkg/line/secret"
+)
+
+const (
+	lineQRLoginFlowID       = "qr"
+	lineEmailLoginFlowID    = "dev.highest.matrix.line.email_login"
+	lineEmailLoginFlowAlias = "email"
 )
 
 type LineConnector struct {
@@ -125,15 +132,230 @@ func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.User
 }
 
 func (lc *LineConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
-		Name:        "Login",
-		Description: "Login with your LINE Email and Password",
-		ID:          "dev.highest.matrix.line.email_login",
-	}}
+	return []bridgev2.LoginFlow{
+		{
+			Name:        "QR Code",
+			Description: "Login by scanning a QR code with the LINE mobile app",
+			ID:          lineQRLoginFlowID,
+		},
+		{
+			Name:        "Email and Password",
+			Description: "Login with your LINE email and password",
+			ID:          lineEmailLoginFlowID,
+		},
+	}
 }
 
 func (lc *LineConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	return &LineEmailLogin{User: user}, nil
+	switch flowID {
+	case "", lineQRLoginFlowID:
+		return &LineQRLogin{User: user, Certificate: storedCertificateForUser(user)}, nil
+	case lineEmailLoginFlowID, lineEmailLoginFlowAlias:
+		return &LineEmailLogin{User: user}, nil
+	default:
+		return nil, bridgev2.ErrInvalidLoginFlowID
+	}
+}
+
+func storedCertificateForUser(user *bridgev2.User) string {
+	if user == nil {
+		return ""
+	}
+	for _, login := range user.GetUserLogins() {
+		meta, ok := login.Metadata.(*UserLoginMetadata)
+		if ok && meta.Certificate != "" {
+			return meta.Certificate
+		}
+	}
+	return ""
+}
+
+type LineQRLogin struct {
+	User                       *bridgev2.User
+	client                     *line.Client
+	AuthSessionID              string
+	Certificate                string
+	LoginKeyID                 int
+	LongPollingMaxCount        int
+	LongPollingIntervalSeconds int
+	QRScanned                  bool
+	PINRequired                bool
+
+	pollErr    chan error
+	pollResult chan struct{}
+	pollCancel context.CancelFunc
+	pollMu     sync.Mutex
+}
+
+var _ bridgev2.LoginProcessDisplayAndWait = (*LineQRLogin)(nil)
+
+func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	lq.client = line.NewClient("")
+	sessionID, err := lq.client.CreateQRSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create QR session: %w", err)
+	}
+	qrCode, err := lq.client.CreateQRCode(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create QR code: %w", err)
+	}
+	secretRes, err := secret.GenerateSecret()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate QR login e2ee secret: %w", err)
+	}
+	lq.LoginKeyID = secretRes.LoginKeyID
+	callbackURL, err := line.QRCodeCallbackURLWithE2EESecret(qrCode.CallbackURL, secretRes.PublicKeyBase64)
+	if err != nil {
+		return nil, err
+	}
+
+	lq.AuthSessionID = sessionID
+	lq.LongPollingMaxCount = qrCode.LongPollingMaxCount
+	lq.LongPollingIntervalSeconds = qrCode.LongPollingIntervalSeconds
+	lq.startPoll(func(ctx context.Context) error {
+		return lq.client.CheckQRCodeVerifiedContext(ctx, sessionID)
+	})
+
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeDisplayAndWait,
+		StepID:       "dev.highest.matrix.line.qr",
+		Instructions: "Scan this QR code with the LINE mobile app.",
+		DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
+			Type: bridgev2.LoginDisplayTypeQR,
+			Data: callbackURL,
+		},
+	}, nil
+}
+
+func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
+	if lq.client == nil || lq.AuthSessionID == "" {
+		return nil, fmt.Errorf("QR login has not been started")
+	}
+
+	if lq.PINRequired {
+		if err := lq.waitForPoll(ctx); err != nil {
+			return nil, fmt.Errorf("PIN verification failed: %w", err)
+		}
+		res, err := lq.client.QRCodeLoginV2(lq.AuthSessionID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to complete QR login: %w", err)
+		}
+		return finishLineLoginWithLoginKey(ctx, lq.User, "", "", res, lq.LoginKeyID)
+	}
+
+	if !lq.QRScanned {
+		if err := lq.waitForPoll(ctx); err != nil {
+			return nil, fmt.Errorf("QR verification failed: %w", err)
+		}
+		lq.QRScanned = true
+
+		if lq.Certificate != "" {
+			if err := lq.client.VerifyCertificate(lq.AuthSessionID, lq.Certificate); err == nil {
+				res, err := lq.client.QRCodeLoginV2(lq.AuthSessionID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to complete QR login: %w", err)
+				}
+				return finishLineLoginWithLoginKey(ctx, lq.User, "", "", res, lq.LoginKeyID)
+			} else if !line.IsQRLoginCertificateRejected(err) {
+				return nil, fmt.Errorf("failed to verify QR login certificate: %w", err)
+			}
+		}
+
+		pin, err := lq.client.CreatePinCode(lq.AuthSessionID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create QR login PIN: %w", err)
+		}
+		lq.PINRequired = true
+		lq.startPoll(func(ctx context.Context) error {
+			return lq.client.CheckPinCodeVerifiedContext(ctx, lq.AuthSessionID)
+		})
+
+		return linePINStep("dev.highest.matrix.line.qr_pin", pin), nil
+	}
+
+	return nil, fmt.Errorf("no pending QR login continuation")
+}
+
+func (lq *LineQRLogin) startPoll(fn func(context.Context) error) {
+	lq.Cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	pollErr := make(chan error, 1)
+	pollResult := make(chan struct{}, 1)
+
+	lq.pollMu.Lock()
+	lq.pollCancel = cancel
+	lq.pollErr = pollErr
+	lq.pollResult = pollResult
+	lq.pollMu.Unlock()
+
+	go func() {
+		if err := lq.pollWithRetry(ctx, fn); err != nil {
+			pollErr <- err
+		} else {
+			pollResult <- struct{}{}
+		}
+	}()
+}
+
+func (lq *LineQRLogin) pollWithRetry(ctx context.Context, fn func(context.Context) error) error {
+	maxCount := lq.LongPollingMaxCount
+	if maxCount <= 0 {
+		maxCount = 1
+	}
+	interval := time.Duration(lq.LongPollingIntervalSeconds) * time.Second
+
+	var err error
+	for attempt := 0; attempt < maxCount; attempt++ {
+		err = fn(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if attempt == maxCount-1 {
+			break
+		}
+		if interval <= 0 {
+			continue
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
+func (lq *LineQRLogin) waitForPoll(ctx context.Context) error {
+	lq.pollMu.Lock()
+	pollResult := lq.pollResult
+	pollErr := lq.pollErr
+	lq.pollMu.Unlock()
+
+	select {
+	case <-pollResult:
+		return nil
+	case err := <-pollErr:
+		return err
+	case <-ctx.Done():
+		lq.Cancel()
+		return ctx.Err()
+	}
+}
+
+func (lq *LineQRLogin) Cancel() {
+	lq.pollMu.Lock()
+	defer lq.pollMu.Unlock()
+	if lq.pollCancel != nil {
+		lq.pollCancel()
+		lq.pollCancel = nil
+	}
 }
 
 type LineEmailLogin struct {
@@ -141,6 +363,7 @@ type LineEmailLogin struct {
 	Email       string
 	Password    string
 	Verifier    string
+	LoginKeyID  int
 	AwaitingPIN bool
 	NoE2EE      bool // True when login fell back to non-E2EE (LSOFF account)
 
@@ -280,6 +503,7 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 
 	if (res.Type == 3 || res.Type == 0) && res.Verifier != "" {
 		ll.Verifier = res.Verifier
+		ll.LoginKeyID = res.LoginKeyID
 		ll.NoE2EE = res.NoE2EE
 		ll.AwaitingPIN = false
 		instructions := "Please open the LINE app on your mobile device to complete the login."
@@ -298,7 +522,7 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 		ll.pollErr = make(chan error, 1)
 		go func() {
 			client := line.NewClient("")
-			res, err := client.WaitForLogin(ll.Verifier, ll.NoE2EE)
+			res, err := client.WaitForLogin(ll.Verifier, ll.NoE2EE, ll.LoginKeyID)
 			if err != nil {
 				ll.pollErr <- err
 			} else {
@@ -333,6 +557,18 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 }
 
 func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult) (*bridgev2.LoginStep, error) {
+	return finishLineLogin(ctx, ll.User, ll.Email, ll.Password, res)
+}
+
+func finishLineLogin(ctx context.Context, user *bridgev2.User, email, password string, res *line.LoginResult) (*bridgev2.LoginStep, error) {
+	loginKeyID := 0
+	if res != nil {
+		loginKeyID = res.LoginKeyID
+	}
+	return finishLineLoginWithLoginKey(ctx, user, email, password, res, loginKeyID)
+}
+
+func finishLineLoginWithLoginKey(ctx context.Context, user *bridgev2.User, email, password string, res *line.LoginResult, loginKeyID int) (*bridgev2.LoginStep, error) {
 	if res == nil {
 		return nil, fmt.Errorf("login result missing")
 	}
@@ -360,13 +596,13 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		displayName = "LINE User"
 	}
 
-	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: res.Certificate, Mid: res.Mid}
+	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: email, Password: password, Certificate: res.Certificate, Mid: profile.Mid}
 
-	ll.fetchLoginKeys(res, meta, client)
+	fetchLoginKeys(user, res, meta, client, loginKeyID)
 
 	detectedLineID := networkid.UserLoginID(profile.Mid)
 
-	ul, err := ll.User.NewLogin(ctx, &database.UserLogin{
+	ul, err := user.NewLogin(ctx, &database.UserLogin{
 		ID:         detectedLineID,
 		RemoteName: displayName,
 		Metadata:   meta,
@@ -376,6 +612,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 				UserLogin:    login,
 				AccessToken:  token,
 				RefreshToken: refreshToken,
+				Mid:          profile.Mid,
 				HTTPClient:   &http.Client{Timeout: 10 * time.Second},
 			}
 			return nil
@@ -396,7 +633,18 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}, nil
 }
 
-func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) {
+func linePINStep(stepID, pin string) *bridgev2.LoginStep {
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeDisplayAndWait,
+		StepID:       stepID,
+		Instructions: fmt.Sprintf("Please open the LINE app on your mobile device and enter this PIN code: %s", pin),
+		DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
+			Type: bridgev2.LoginDisplayTypeNothing,
+		},
+	}
+}
+
+func fetchLoginKeys(user *bridgev2.User, res *line.LoginResult, meta *UserLoginMetadata, client *line.Client, loginKeyID int) {
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
 		return
 	}
@@ -406,26 +654,26 @@ func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginM
 	meta.E2EEKeyID = res.E2EEKeyID
 	mgr, err := e2ee.NewManager()
 	if err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to create E2EE manager")
+		user.Bridge.Log.Warn().Err(err).Msg("Login: failed to create E2EE manager")
 		return
 	}
 	ei3, err := client.GetEncryptedIdentityV3()
 	if err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to get EncryptedIdentityV3")
+		user.Bridge.Log.Warn().Err(err).Msg("Login: failed to get EncryptedIdentityV3")
 		return
 	}
 	if err := mgr.InitStorage(ei3.WrappedNonce, ei3.KDFParameter1, ei3.KDFParameter2); err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: InitStorage failed")
+		user.Bridge.Log.Warn().Err(err).Msg("Login: InitStorage failed")
 		return
 	}
-	exported, err := mgr.InitFromLoginKeyChain(res.E2EEPublicKey, res.EncryptedKeyChain)
+	exported, err := mgr.InitFromLoginKeyChainWithKey(loginKeyID, res.E2EEPublicKey, res.EncryptedKeyChain)
 	if err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: InitFromLoginKeyChain failed")
+		user.Bridge.Log.Warn().Err(err).Msg("Login: InitFromLoginKeyChain failed")
 		return
 	}
 	meta.ExportedKeyMap = exported
-	_ = mgr.SaveSecureDataToFile(string(ll.User.MXID), map[string]any{"exportedKeyMap": exported})
-	ll.User.Bridge.Log.Info().Int("keys", len(exported)).Msg("Login: E2EE keys exported successfully")
+	_ = mgr.SaveSecureDataToFile(string(user.MXID), map[string]any{"exportedKeyMap": exported})
+	user.Bridge.Log.Info().Int("keys", len(exported)).Msg("Login: E2EE keys exported successfully")
 }
 
 func (ll *LineEmailLogin) Cancel() {}

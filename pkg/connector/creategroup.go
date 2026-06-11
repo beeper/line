@@ -26,7 +26,7 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 		name = params.Name.Name
 	}
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 	var chat *line.Chat
 	var err error
 	chatType := 1 // ROOM: members join automatically.
@@ -34,7 +34,7 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	chat, err = client.CreateChat(participantMids, lineName, chatType)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newLineClient()
 			chat, err = client.CreateChat(participantMids, lineName, chatType)
 		}
 	}
@@ -150,7 +150,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	}
 	members = otherMembers
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newLineClient()
 
 	// Fetch current E2EE public keys for all other members as a batch. If the batch
 	// call fails (e.g. server 500 for a specific member), fall back to fetching
@@ -163,7 +163,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	if err != nil {
 		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newLineClient()
 				pubKeys, err = client.GetLastE2EEPublicKeys(pubKeysReq)
 			}
 		}
@@ -184,7 +184,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 				}
 				if lc.isRefreshRequired(nErr) || lc.isLoggedOut(nErr) {
 					if errRecover := lc.recoverToken(ctx); errRecover == nil {
-						client = line.NewClient(lc.AccessToken)
+						client = lc.newLineClient()
 						res, nErr = client.NegotiateE2EEPublicKey(mid)
 					}
 				}
@@ -259,7 +259,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	if err := client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys); err != nil {
 		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newLineClient()
 				err = client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys)
 			}
 		}

@@ -10,6 +10,8 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
+const obsDownloadUnauthorizedMsg = "OBS download failed (401)"
+
 // Handler provides dependencies needed by content type conversion functions.
 type Handler struct {
 	Log        zerolog.Logger
@@ -32,6 +34,19 @@ type Handler struct {
 func (h *Handler) tryRecoverClient(ctx context.Context, err error) (*line.Client, bool) {
 	if err == nil {
 		return nil, false
+	}
+	isOBSAuthFailure := strings.Contains(err.Error(), obsDownloadUnauthorizedMsg)
+	if isOBSAuthFailure {
+		h.Log.Warn().
+			Err(err).
+			Str("action", "clearing_encrypted_access_token_cache").
+			Msg("Recovering stale OBS access token")
+		// isOBSAuthFailure means the OBS token derived from the main LINE access
+		// token is stale. Use line.ClearEncryptedAccessTokenCache() and retry
+		// with h.NewClient() instead of invoking the broader 401
+		// refresh/logout recovery.
+		line.ClearEncryptedAccessTokenCache()
+		return h.NewClient(), true
 	}
 	if !strings.Contains(err.Error(), "401") && !h.IsRefreshRequired(err) && !h.IsLoggedOut(err) {
 		return nil, false

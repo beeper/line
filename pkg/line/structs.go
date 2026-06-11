@@ -126,6 +126,7 @@ type LoginResult struct {
 	E2EEPublicKey       string              `json:"publicKey,omitempty"`
 	E2EEVersion         string              `json:"e2eeVersion,omitempty"`
 	E2EEKeyID           string              `json:"keyId,omitempty"`
+	LoginKeyID          int                 `json:"-"`
 	NoE2EE              bool                `json:"-"` // True when login fell back to non-E2EE (LSOFF)
 }
 
@@ -136,6 +137,12 @@ type TokenV3IssueResult struct {
 	RefreshApiRetryPolicy   *RefreshApiRetryPolicy `json:"refreshApiRetryPolicy,omitempty"`
 	LoginSessionID          string                 `json:"loginSessionId"`
 	TokenIssueTimeEpochSec  string                 `json:"tokenIssueTimeEpochSec"`
+}
+
+type QRCodeResponse struct {
+	CallbackURL                string `json:"callbackUrl"`
+	LongPollingMaxCount        int    `json:"longPollingMaxCount"`
+	LongPollingIntervalSeconds int    `json:"longPollingIntervalSec"`
 }
 
 type RefreshApiRetryPolicy struct {

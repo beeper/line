@@ -30,7 +30,7 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 		RecoverToken:      lc.recoverToken,
 		IsRefreshRequired: lc.isRefreshRequired,
 		IsLoggedOut:       lc.isLoggedOut,
-		NewClient:         func() *line.Client { return line.NewClient(lc.AccessToken) },
+		NewClient:         func() *line.Client { return lc.newLineClient() },
 		DecryptMedia:      lc.decryptImageData,
 	}
 }
