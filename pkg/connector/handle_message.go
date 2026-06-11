@@ -119,7 +119,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 func isBridgeableContentType(msg *line.Message) bool {
 	switch ContentType(msg.ContentType) {
 	case ContentText, ContentImage, ContentVideo, ContentAudio,
-		ContentSticker, ContentContact, ContentFile, ContentLocation:
+		ContentSticker, ContentContact, ContentFile, ContentLocation, ContentFlex:
 		return true
 	default:
 		return msg.ContentMetadata["ORGCONTP"] == "CALL" || msg.ContentMetadata["ORGCONTP"] == "CONTACT"
@@ -290,6 +290,8 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 		return h.ConvertLocation(data, replyRelatesTo)
 	case ContentContact:
 		return h.ConvertContact(data, replyRelatesTo)
+	case ContentFlex:
+		return h.ConvertFlex(data, replyRelatesTo)
 	}
 
 	// Handle device/phone contact shared via ORGCONTP (contentType 0 with vCard)
