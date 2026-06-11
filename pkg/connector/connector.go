@@ -110,6 +110,7 @@ type UserLoginMetadata struct {
 	E2EEVersion       string            `json:"e2ee_version,omitempty"`
 	E2EEKeyID         string            `json:"e2ee_key_id,omitempty"`
 	ExportedKeyMap    map[string]string `json:"exported_key_map,omitempty"`
+	BlockedMIDs       []string          `json:"blocked_mids,omitempty"`
 }
 
 func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
