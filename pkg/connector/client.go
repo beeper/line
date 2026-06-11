@@ -278,19 +278,8 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	}
 
 	// Fetch initial blocked contacts list before starting sync loops.
-	blockedMIDs, err := func() ([]string, error) {
-		client := line.NewClient(lc.AccessToken)
-		return client.GetBlockedContactIds()
-	}()
-	if err != nil {
+	if err := lc.refreshBlockedContacts(ctx); err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch blocked contacts, continuing without block list")
-	} else {
-		lc.cacheMu.Lock()
-		for _, mid := range blockedMIDs {
-			lc.blockedUsers[mid] = true
-		}
-		lc.cacheMu.Unlock()
-		lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedMIDs)).Msg("Fetched blocked contacts")
 	}
 
 	lc.wg.Add(4)
