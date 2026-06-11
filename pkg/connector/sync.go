@@ -24,9 +24,12 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
-const prefetchMessagesConcurrency = 4
+const (
+	prefetchMessagesConcurrency  = 4
+	unblockBackfillFallbackDelay = 10 * time.Second
+)
 
-func (lc *LineClient) refreshBlockedContacts(ctx context.Context) error {
+func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
 	client := line.NewClient(lc.AccessToken)
 	blockedMIDs, err := client.GetBlockedContactIds()
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
@@ -36,7 +39,7 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) error {
 		}
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	blockedUsers := make(map[string]bool, len(blockedMIDs))
@@ -45,11 +48,17 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) error {
 	}
 
 	lc.cacheMu.Lock()
+	var newlyUnblocked []string
+	for mid := range lc.blockedUsers {
+		if !blockedUsers[mid] {
+			newlyUnblocked = append(newlyUnblocked, mid)
+		}
+	}
 	lc.blockedUsers = blockedUsers
 	lc.cacheMu.Unlock()
 
 	lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedMIDs)).Msg("Refreshed blocked contacts")
-	return nil
+	return newlyUnblocked, nil
 }
 
 func (lc *LineClient) syncDMChats(ctx context.Context) {
@@ -145,6 +154,40 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 		},
 		CheckNeedsBackfillFunc: checkNeedsBackfill,
 	})
+}
+
+func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid string) {
+	lc.wg.Add(1)
+	go func() {
+		defer lc.wg.Done()
+
+		timer := time.NewTimer(unblockBackfillFallbackDelay)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		if lc.isUserBlocked(mid) {
+			lc.UserLogin.Bridge.Log.Debug().
+				Str("mid", mid).
+				Msg("Skipping unblock fallback backfill because contact is blocked again")
+			return
+		}
+
+		lc.UserLogin.Bridge.Log.Info().
+			Str("mid", mid).
+			Dur("delay", unblockBackfillFallbackDelay).
+			Msg("Running unblock fallback recent-message backfill")
+		lc.backfillRecentMessages(ctx, mid, 50)
+	}()
+}
+
+func isLineGroupOrRoomMID(mid string) bool {
+	lowerMid := strings.ToLower(mid)
+	return strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r")
 }
 
 // FetchMessages implements bridgev2.BackfillingNetworkAPI. It powers silent,
@@ -297,16 +340,25 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
-// (live) message path. Used by prefetchMessages on startup. Note that this
-// notifies for any not-yet-bridged messages; the silent backfill path used on
-// unblock goes through FetchMessages instead.
+// (live) message path. Used by prefetchMessages on startup and as a delayed,
+// deduped fallback after unblock if bridgev2's silent forward backfill didn't
+// populate the restored room first.
 func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
+	start := time.Now()
 	client := line.NewClient(lc.AccessToken)
 	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if errRecover := lc.recoverToken(ctx); errRecover == nil {
+			client = line.NewClient(lc.AccessToken)
+			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
+		}
+	}
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
 		return
 	}
+	queued := 0
+	skippedExisting := 0
 	// Reverse messages to process oldest first
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
@@ -316,6 +368,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 
 		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
 		if err == nil && existing != nil {
+			skippedExisting++
 			continue
 		}
 
@@ -324,7 +377,15 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 			opType = OpSendMessage
 		}
 		lc.queueIncomingMessage(msg, int(opType))
+		queued++
 	}
+	lc.UserLogin.Bridge.Log.Debug().
+		Str("chat_mid", chatMID).
+		Int("fetched", len(msgs)).
+		Int("queued", queued).
+		Int("skipped_existing", skippedExisting).
+		Dur("duration", time.Since(start)).
+		Msg("Finished recent-message backfill")
 }
 
 func (lc *LineClient) syncChats(ctx context.Context) {
@@ -761,8 +822,17 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 
 				}
 			}
-			if err := lc.refreshBlockedContacts(ctx); err != nil {
+			newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
+			if err != nil {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to refresh blocked contacts during fullSync")
+			}
+			for _, mid := range newlyUnblocked {
+				if isLineGroupOrRoomMID(mid) {
+					continue
+				}
+				lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Detected unblocked contact during fullSync")
+				lc.queueDMChatResync(ctx, mid, true, true)
+				lc.queueUnblockBackfillFallback(ctx, mid)
 			}
 			lc.wg.Add(3)
 			go lc.syncChats(ctx)
@@ -875,11 +945,11 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		// restored chat repopulates without firing a
 		// notification for every old message — a blocked contact can't have sent
 		// anything new, so notifying on unblock is never useful.
-		lowerMid := strings.ToLower(mid)
-		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
+		if isLineGroupOrRoomMID(mid) {
 			return
 		}
 		lc.queueDMChatResync(ctx, mid, true, true)
+		lc.queueUnblockBackfillFallback(ctx, mid)
 
 	case OpContactUpdate:
 		mid := op.Param1

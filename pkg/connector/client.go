@@ -278,7 +278,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	}
 
 	// Fetch initial blocked contacts list before starting sync loops.
-	if err := lc.refreshBlockedContacts(ctx); err != nil {
+	if _, err := lc.refreshBlockedContacts(ctx); err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch blocked contacts, continuing without block list")
 	}
 
