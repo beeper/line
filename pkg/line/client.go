@@ -508,7 +508,8 @@ func obsTypeFromSID(sid string) string {
 
 // UploadOBSPlain uploads plain (non-E2EE) media to a specific OID via the "m" endpoint.
 // obsType should be "image", "video", "audio", or "file".
-func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
+// fileName is used in the OBS params name field (falls back to timestamp if empty).
+func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string, fileName string) error {
 	obsToken, err := c.AcquireEncryptedAccessToken()
 	if err != nil {
 		return fmt.Errorf("failed to acquire OBS token: %w", err)
@@ -521,10 +522,15 @@ func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
 		return fmt.Errorf("failed to create OBS request: %w", err)
 	}
 
+	if fileName == "" {
+		fileName = fmt.Sprintf("%d", time.Now().UnixMilli())
+	}
+
 	obsParams := map[string]string{
 		"ver":  "2.0",
-		"name": fmt.Sprintf("%d", time.Now().UnixMilli()),
+		"name": fileName,
 		"type": obsType,
+		"cat":  "original",
 	}
 	obsParamsJSON, _ := json.Marshal(obsParams)
 	obsParamsB64 := base64.StdEncoding.EncodeToString(obsParamsJSON)
@@ -532,7 +538,7 @@ func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("x-line-application", "CHROMEOS\t3.7.2\tChrome_OS")
 	req.Header.Set("x-lal", "en_US")
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("X-Obs-Params", obsParamsB64)
 	req.Header.Set("x-line-access", obsToken)
 
@@ -682,6 +688,11 @@ func (c *Client) DownloadOBSWithOptions(ctx context.Context, oid string, message
 
 func (c *Client) DownloadOBSWithSID(ctx context.Context, oid string, messageID string, sid string) ([]byte, error) {
 	return c.DownloadOBSWithSIDOptions(ctx, oid, messageID, sid, OBSDownloadOptions{})
+}
+
+// DownloadOBSOriginal downloads the original quality media instead of LINE's preview.
+func (c *Client) DownloadOBSOriginal(ctx context.Context, oid string, messageID string, sid string) ([]byte, error) {
+	return c.DownloadOBSWithSIDOptions(ctx, oid, messageID, sid, OBSDownloadOptions{TID: "original"})
 }
 
 func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, messageID string, sid string, opts OBSDownloadOptions) ([]byte, error) {
