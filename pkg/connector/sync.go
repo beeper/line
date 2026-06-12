@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,9 +25,12 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
-const prefetchMessagesConcurrency = 4
+const (
+	prefetchMessagesConcurrency  = 4
+	unblockBackfillFallbackDelay = 10 * time.Second
+)
 
-func (lc *LineClient) refreshBlockedContacts(ctx context.Context) error {
+func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
 	client := line.NewClient(lc.AccessToken)
 	blockedMIDs, err := client.GetBlockedContactIds()
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
@@ -36,7 +40,7 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) error {
 		}
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	blockedUsers := make(map[string]bool, len(blockedMIDs))
@@ -44,12 +48,67 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) error {
 		blockedUsers[mid] = true
 	}
 
+	metadataBlockedUsers := lc.metadataBlockedContacts()
 	lc.cacheMu.Lock()
+	previousBlockedUsers := make(map[string]bool, len(lc.blockedUsers)+len(metadataBlockedUsers))
+	for mid := range lc.blockedUsers {
+		previousBlockedUsers[mid] = true
+	}
+	for mid := range metadataBlockedUsers {
+		previousBlockedUsers[mid] = true
+	}
+	var newlyUnblocked []string
+	for mid := range previousBlockedUsers {
+		if !blockedUsers[mid] {
+			newlyUnblocked = append(newlyUnblocked, mid)
+		}
+	}
 	lc.blockedUsers = blockedUsers
 	lc.cacheMu.Unlock()
 
+	lc.saveBlockedContacts(ctx, blockedUsers)
 	lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedMIDs)).Msg("Refreshed blocked contacts")
-	return nil
+	return newlyUnblocked, nil
+}
+
+func (lc *LineClient) metadataBlockedContacts() map[string]bool {
+	blockedUsers := make(map[string]bool)
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return blockedUsers
+	}
+	for _, mid := range meta.BlockedMIDs {
+		blockedUsers[mid] = true
+	}
+	return blockedUsers
+}
+
+func (lc *LineClient) saveBlockedContacts(ctx context.Context, blockedUsers map[string]bool) {
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return
+	}
+
+	mids := make([]string, 0, len(blockedUsers))
+	for mid := range blockedUsers {
+		mids = append(mids, mid)
+	}
+	sort.Strings(mids)
+	meta.BlockedMIDs = mids
+	if err := lc.UserLogin.Save(ctx); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save blocked contacts snapshot")
+	}
+}
+
+func (lc *LineClient) saveBlockedContactsSnapshot(ctx context.Context) {
+	lc.cacheMu.Lock()
+	blockedUsers := make(map[string]bool, len(lc.blockedUsers))
+	for mid := range lc.blockedUsers {
+		blockedUsers[mid] = true
+	}
+	lc.cacheMu.Unlock()
+
+	lc.saveBlockedContacts(ctx, blockedUsers)
 }
 
 func (lc *LineClient) syncDMChats(ctx context.Context) {
@@ -145,6 +204,47 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 		},
 		CheckNeedsBackfillFunc: checkNeedsBackfill,
 	})
+}
+
+func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid string) {
+	lc.wg.Add(1)
+	go func() {
+		defer lc.wg.Done()
+
+		timer := time.NewTimer(unblockBackfillFallbackDelay)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		if lc.isUserBlocked(mid) {
+			lc.UserLogin.Bridge.Log.Debug().
+				Str("mid", mid).
+				Msg("Skipping unblock fallback backfill because contact is blocked again")
+			return
+		}
+
+		lc.UserLogin.Bridge.Log.Info().
+			Str("mid", mid).
+			Dur("delay", unblockBackfillFallbackDelay).
+			Msg("Re-requesting silent unblock backfill")
+		lc.queueDMChatResync(ctx, mid, true, true)
+	}()
+}
+
+func (lc *LineClient) queueUnblockedDMRestore(ctx context.Context, mid, reason string) {
+	if isChatMID(mid) {
+		return
+	}
+	lc.UserLogin.Bridge.Log.Info().
+		Str("mid", mid).
+		Str("reason", reason).
+		Msg("Restoring unblocked DM with backfill")
+	lc.queueDMChatResync(ctx, mid, true, true)
+	lc.queueUnblockBackfillFallback(ctx, mid)
 }
 
 // FetchMessages implements bridgev2.BackfillingNetworkAPI. It powers silent,
@@ -297,16 +397,27 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
-// (live) message path. Used by prefetchMessages on startup. Note that this
-// notifies for any not-yet-bridged messages; the silent backfill path used on
-// unblock goes through FetchMessages instead.
+// (live) message path. Used by prefetchMessages on startup and as a delayed,
+// deduped fallback after unblock if bridgev2's silent forward backfill didn't
+// backfillRecentMessages fetches up to limit recent messages for a single
+// chat and queues any not already in the local DB through the normal inbound
+// (live) message path. Used by prefetchMessages on startup.
 func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
+	start := time.Now()
 	client := line.NewClient(lc.AccessToken)
 	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if errRecover := lc.recoverToken(ctx); errRecover == nil {
+			client = line.NewClient(lc.AccessToken)
+			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
+		}
+	}
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
 		return
 	}
+	queued := 0
+	skippedExisting := 0
 	// Reverse messages to process oldest first
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
@@ -316,6 +427,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 
 		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
 		if err == nil && existing != nil {
+			skippedExisting++
 			continue
 		}
 
@@ -324,7 +436,15 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 			opType = OpSendMessage
 		}
 		lc.queueIncomingMessage(msg, int(opType))
+		queued++
 	}
+	lc.UserLogin.Bridge.Log.Debug().
+		Str("chat_mid", chatMID).
+		Int("fetched", len(msgs)).
+		Int("queued", queued).
+		Int("skipped_existing", skippedExisting).
+		Dur("duration", time.Since(start)).
+		Msg("Finished recent-message backfill")
 }
 
 func (lc *LineClient) syncChats(ctx context.Context) {
@@ -761,8 +881,12 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 
 				}
 			}
-			if err := lc.refreshBlockedContacts(ctx); err != nil {
+			newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
+			if err != nil {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to refresh blocked contacts during fullSync")
+			}
+			for _, mid := range newlyUnblocked {
+				lc.queueUnblockedDMRestore(ctx, mid, "full_sync")
 			}
 			lc.wg.Add(3)
 			go lc.syncChats(ctx)
@@ -846,6 +970,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Lock()
 		lc.blockedUsers[mid] = true
 		lc.cacheMu.Unlock()
+		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact blocked")
 		// Block operations should only carry user MIDs; skip if it looks like a group/room
 		// to avoid blast-radius deleting a group portal on an unexpected payload.
@@ -869,17 +994,14 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Lock()
 		delete(lc.blockedUsers, mid)
 		lc.cacheMu.Unlock()
+		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact unblocked")
 		// Reattach the DM portal and request an immediate backfill in the same
 		// resync. The backfill is batch-sent silently (see FetchMessages), so the
 		// restored chat repopulates without firing a
 		// notification for every old message — a blocked contact can't have sent
 		// anything new, so notifying on unblock is never useful.
-		lowerMid := strings.ToLower(mid)
-		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
-			return
-		}
-		lc.queueDMChatResync(ctx, mid, true, true)
+		lc.queueUnblockedDMRestore(ctx, mid, "op_unblock")
 
 	case OpContactUpdate:
 		mid := op.Param1
