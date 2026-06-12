@@ -71,6 +71,8 @@ jobs:
 
   build-docker:
     runs-on: ubuntu-latest
+    # Forked PRs and fork pushes don't have access to Beeper registry secrets.
+    if: ${{ github.repository == 'beeper/line' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
       - uses: actions/checkout@v4
 
