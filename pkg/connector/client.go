@@ -277,9 +277,17 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		}
 	}
 
+	// Seed the last-known block list before fetching a fresh copy, so a
+	// transient LINE API failure doesn't reopen intentionally blocked DMs.
+	lc.cacheMu.Lock()
+	for mid := range lc.metadataBlockedContacts() {
+		lc.blockedUsers[mid] = true
+	}
+	lc.cacheMu.Unlock()
+
 	// Fetch initial blocked contacts list before starting sync loops.
 	if newlyUnblocked, err := lc.refreshBlockedContacts(ctx); err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch blocked contacts, continuing without block list")
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch blocked contacts, continuing with last known block list")
 	} else {
 		for _, mid := range newlyUnblocked {
 			lc.queueUnblockedDMRestore(ctx, mid, "startup")
