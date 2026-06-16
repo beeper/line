@@ -204,11 +204,10 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 }
 
 func (ll *LineEmailLogin) loginErrorStep(message string) *bridgev2.LoginStep {
-	instructions := fmt.Sprintf("Error when logging in: %s", message)
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeUserInput,
 		StepID:       "dev.highest.matrix.line.enter_creds",
-		Instructions: instructions,
+		Instructions: loginErrorInstructions(message),
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
@@ -224,6 +223,17 @@ func (ll *LineEmailLogin) loginErrorStep(message string) *bridgev2.LoginStep {
 			},
 		},
 	}
+}
+
+func loginErrorInstructions(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return "Could not log in to LINE. Please check your email and password and try again."
+	}
+	if strings.EqualFold(message, "Account ID or password is invalid") {
+		return "LINE rejected the email or password. Make sure you used the email from LINE Settings -> Account -> Email Address, then try again."
+	}
+	return fmt.Sprintf("Could not log in to LINE: %s", message)
 }
 
 func loginErrorReason(err error) string {
