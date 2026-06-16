@@ -1,6 +1,7 @@
 package line
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,12 @@ func InvalidateOBSTokenCache() {
 	obsTokenCache = ""
 	obsTokenExpiry = time.Time{}
 	obsTokenMu.Unlock()
+}
+
+func unmarshalJSONUseNumber(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return dec.Decode(v)
 }
 
 // LoginV2 performs the loginV2 RPC call to authenticate a user
@@ -608,6 +615,63 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 		return nil, fmt.Errorf("getChats failed: %s", wrapper.Message)
 	}
 	return &wrapper.Data, nil
+}
+
+// GetChatForUpdate fetches a raw chat object that can be round-tripped back to
+// updateChat. LINE's Chrome extension mutates its current Redux chat object, and
+// groupExtra member maps contain timestamp values that the bridge's typed Chat
+// struct intentionally normalizes away for membership checks.
+func (c *Client) GetChatForUpdate(chatMid string) (map[string]any, error) {
+	req := GetChatsRequest{
+		ChatMids:     []string{chatMid},
+		WithMembers:  true,
+		WithInvitees: true,
+	}
+	resp, err := c.callRPC("TalkService", "getChats", req, 2)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Chats []map[string]any `json:"chats"`
+		} `json:"data"`
+	}
+	if err := unmarshalJSONUseNumber(resp, &wrapper); err != nil {
+		return nil, err
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getChats failed: %s", wrapper.Message)
+	}
+	if len(wrapper.Data.Chats) == 0 {
+		return nil, fmt.Errorf("chat %s not found", chatMid)
+	}
+	return wrapper.Data.Chats[0], nil
+}
+
+func (c *Client) UpdateChat(chat map[string]any, updatedAttribute int) error {
+	req := UpdateChatRequest{
+		ReqSeq:           int(time.Now().UnixMilli() % 1_000_000_000),
+		Chat:             chat,
+		UpdatedAttribute: updatedAttribute,
+	}
+	resp, err := c.callRPC("TalkService", "updateChat", req)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse updateChat response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("updateChat failed: %s", wrapper.Message)
+	}
+	return nil
 }
 
 func (c *Client) GetLastOpRevision() (int64, error) {

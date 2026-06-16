@@ -625,6 +625,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		Members: &bridgev2.ChatMemberList{
 			IsFull:                     true,
 			Members:                    members,
+			PowerLevels:                lineGroupPowerLevelOverrides(),
 			ExcludeChangesFromTimeline: excludeFromTimeline,
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,

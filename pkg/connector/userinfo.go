@@ -42,7 +42,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 }
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
-	return &event.RoomFeatures{
+	features := &event.RoomFeatures{
 		MaxTextLength:         5000,
 		Reply:                 event.CapLevelFullySupported,
 		Reaction:              event.CapLevelPartialSupport,
@@ -130,6 +130,15 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 		},
 	}
+
+	if portal != nil && portal.RoomType != database.RoomTypeDM && isLineGroupPortalID(string(portal.ID)) {
+		features.State = event.StateFeatureMap{
+			event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
+			event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
+		}
+	}
+
+	return features
 }
 
 func (lc *LineClient) IsThisUser(ctx context.Context, userID networkid.UserID) bool {

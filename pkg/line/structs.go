@@ -5,9 +5,12 @@ import "encoding/json"
 type FlexibleMidMap map[string]bool
 
 func (f *FlexibleMidMap) UnmarshalJSON(data []byte) error {
-	var m map[string]bool
+	var m map[string]json.RawMessage
 	if err := json.Unmarshal(data, &m); err == nil {
-		*f = m
+		*f = make(FlexibleMidMap, len(m))
+		for mid := range m {
+			(*f)[mid] = true
+		}
 		return nil
 	}
 
@@ -346,4 +349,15 @@ type CreateChatRequest struct {
 
 type CreateChatResponse2 struct {
 	Chat Chat `json:"chat"`
+}
+
+const (
+	ChatAttributeName          = 1
+	ChatAttributePictureStatus = 2
+)
+
+type UpdateChatRequest struct {
+	ReqSeq           int            `json:"reqSeq"`
+	Chat             map[string]any `json:"chat"`
+	UpdatedAttribute int            `json:"updatedAttribute"`
 }
