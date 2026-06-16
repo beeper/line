@@ -30,6 +30,9 @@ type LineClient struct {
 	sentReqSeqs map[int]time.Time
 	lastReqSeq  int
 
+	recoverMu   sync.Mutex
+	recoverTime time.Time
+
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
 	// noE2EEGroups, groupMemberCache, and generatedGroupNameCache.
 	// Hold it only around map accesses; never across network calls.
@@ -67,6 +70,7 @@ type cachedContact struct {
 }
 
 const defaultMediaFlowTTL = 6 * time.Hour
+const recentTokenRecoveryWindow = 10 * time.Second
 
 func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
 	if picturePath == "" {
@@ -98,8 +102,9 @@ func (lc *LineClient) shouldUseE2EEMediaFlow(chatMid string, contentType int) bo
 	}
 	lc.cacheMu.Unlock()
 
-	client := line.NewClient(lc.AccessToken)
-	resp, err := client.DetermineMediaMessageFlow(chatMid)
+	_, resp, err := callLineResult(lc, context.Background(), func(client *line.Client) (*line.MediaMessageFlowResponse, error) {
+		return client.DetermineMediaMessageFlow(chatMid)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
 			Msg("Failed to determine media flow, defaulting to E2EE upload")
@@ -174,23 +179,39 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 }
 
 func (lc *LineClient) isRefreshRequired(err error) bool {
-	return strings.Contains(err.Error(), "\"code\":119") || strings.Contains(err.Error(), "Access token refresh required")
+	return line.IsRefreshRequired(err)
 }
 
 func (lc *LineClient) isLoggedOut(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "V3_TOKEN_CLIENT_LOGGED_OUT")
+	return line.IsLoggedOut(err)
 }
 
 // recoverToken attempts to restore a valid session by refreshing, then re-logging in.
 // Returns nil on success. On failure the caller should send StateBadCredentials.
 func (lc *LineClient) recoverToken(ctx context.Context) error {
-	if err := lc.refreshAndSave(ctx); err == nil {
-		lc.UserLogin.Bridge.Log.Info().Msg("Token recovered via refresh")
+	return lc.runTokenRecovery(ctx, func(ctx context.Context) error {
+		if err := lc.refreshAndSave(ctx); err == nil {
+			lc.UserLogin.Bridge.Log.Info().Msg("Token recovered via refresh")
+			return nil
+		}
+		lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
+		return lc.tryLogin(ctx)
+	})
+}
+
+func (lc *LineClient) runTokenRecovery(ctx context.Context, recover func(context.Context) error) error {
+	lc.recoverMu.Lock()
+	defer lc.recoverMu.Unlock()
+
+	if !lc.recoverTime.IsZero() && time.Since(lc.recoverTime) < recentTokenRecoveryWindow {
 		return nil
 	}
-	lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
-	return lc.tryLogin(ctx)
+
+	if err := recover(ctx); err != nil {
+		return err
+	}
+	lc.recoverTime = time.Now()
+	return nil
 }
 
 func (lc *LineClient) Connect(ctx context.Context) {

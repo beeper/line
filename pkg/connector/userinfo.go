@@ -37,8 +37,10 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 		return nil
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	return client.SendChatChecked(string(read.Portal.ID), targetID)
+	_, err := lc.callLine(ctx, func(client *line.Client) error {
+		return client.SendChatChecked(string(read.Portal.ID), targetID)
+	})
+	return err
 }
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {

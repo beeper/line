@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"net/http"
-	"strings"
 
 	"github.com/rs/zerolog"
 
@@ -33,7 +32,7 @@ func (h *Handler) tryRecoverClient(ctx context.Context, err error) (*line.Client
 	if err == nil {
 		return nil, false
 	}
-	if !strings.Contains(err.Error(), "401") && !h.IsRefreshRequired(err) && !h.IsLoggedOut(err) {
+	if !line.IsUnauthorizedStatus(err) && !h.IsRefreshRequired(err) && !h.IsLoggedOut(err) {
 		return nil, false
 	}
 	if errRecover := h.RecoverToken(ctx); errRecover != nil {
