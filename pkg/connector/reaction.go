@@ -31,10 +31,6 @@ type linePaidReactionRef struct {
 	Version      int
 }
 
-func (ref linePaidReactionRef) networkEmojiID() networkid.EmojiID {
-	return networkid.EmojiID("paid:" + ref.ProductID + ":" + ref.EmojiID)
-}
-
 func (ref linePaidReactionRef) reactionType() line.ReactionType {
 	return line.ReactionType{
 		PaidReactionType: &line.PaidReactionType{
@@ -342,13 +338,12 @@ func (lc *LineClient) consumeSentReqSeq(reqSeq int) bool {
 
 func (lc *LineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
 	key := msg.Content.RelatesTo.GetAnnotationKey()
-	ref, ok := linePaidReactionForMatrixEmoji(key)
+	_, ok := linePaidReactionForMatrixEmoji(key)
 	if !ok {
 		return bridgev2.MatrixReactionPreResponse{}, unsupportedMatrixReactionError(key)
 	}
 	return bridgev2.MatrixReactionPreResponse{
 		SenderID:     makeUserID(string(lc.UserLogin.ID)),
-		EmojiID:      ref.networkEmojiID(),
 		Emoji:        key,
 		MaxReactions: 1,
 	}, nil
@@ -378,8 +373,7 @@ func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Ma
 	}
 
 	return &database.Reaction{
-		EmojiID: ref.networkEmojiID(),
-		Emoji:   key,
+		Emoji: key,
 	}, nil
 }
 

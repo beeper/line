@@ -1131,7 +1131,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			// Curr == nil signals a reaction removal/clear from LINE.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (self)")
-				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(string(lc.UserLogin.ID))})
+				lc.handleReactionRemove(ctx, op, param2.ChatMid, []networkid.UserID{makeUserID(string(lc.UserLogin.ID))})
 				return
 			}
 
@@ -1168,7 +1168,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				if op.Param3 != "" && op.Param3 != param2.ChatMid {
 					senders = append(senders, makeUserID(op.Param3))
 				}
-				lc.handleReactionRemove(op, param2.ChatMid, senders)
+				lc.handleReactionRemove(ctx, op, param2.ChatMid, senders)
 				return
 			}
 
@@ -1354,34 +1354,59 @@ func (lc *LineClient) handlePredefinedReaction(ctx context.Context, op line.Oper
 }
 
 // handleReactionRemove queues a RemoteEventReactionRemove for each candidate
-// sender. Reactions are stored with EmojiID="" (see handlePaidReaction /
-// handlePredefinedReaction), so the framework's reaction lookup finds the
-// single row keyed by (target_message, sender) and redacts it. A miss is
-// silently ignored by bridgev2, which lets callers safely queue multiple
-// sender candidates when the previous reaction's actor is ambiguous.
+// sender. LINE reaction clears don't include the previous reaction type, so we
+// remove every stored reaction row for the target message and sender. This also
+// handles older Matrix-origin reactions that were stored with a paid EmojiID
+// before LINE clears were normalized to EmojiID="".
 //
 // It also evicts stale add-dedup entries for the target message so that
 // re-adding the same emoji after a clear isn't silently dropped by the
 // recentReactions sync.Map.
-func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, senders []networkid.UserID) {
+func (lc *LineClient) handleReactionRemove(ctx context.Context, op line.Operation, chatMid string, senders []networkid.UserID) {
 	ts, _ := op.CreatedTime.Int64()
 	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
+	targetMessage := networkid.MessageID(op.Param1)
 
 	for _, sender := range senders {
-		dedupKey := op.Param1 + "\x00remove\x00" + string(sender)
-		if _, loaded := lc.recentReactions.LoadOrStore(dedupKey, struct{}{}); loaded {
+		if _, loaded := lc.recentReactions.Load(op.Param1 + "\x00remove\x00" + string(sender) + "\x00all"); loaded {
 			lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("sender", string(sender)).Msg("Skipping duplicate reaction removal")
 			continue
 		}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventReactionRemove,
-				PortalKey: portalKey,
-				Timestamp: time.UnixMilli(ts),
-				Sender:    bridgev2.EventSender{Sender: sender},
-			},
-			TargetMessage: networkid.MessageID(op.Param1),
-		})
+
+		emojiIDs := []networkid.EmojiID{""}
+		existingReactions, err := lc.UserLogin.Bridge.DB.Reaction.GetAllToMessageBySender(ctx, lc.UserLogin.ID, targetMessage, sender)
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Error().Err(err).Str("msg_id", op.Param1).Str("sender", string(sender)).Msg("Failed to look up stored reactions for removal")
+		} else if len(existingReactions) > 0 {
+			emojiIDs = emojiIDs[:0]
+			seenEmojiIDs := make(map[networkid.EmojiID]struct{}, len(existingReactions))
+			for _, reaction := range existingReactions {
+				if _, seen := seenEmojiIDs[reaction.EmojiID]; seen {
+					continue
+				}
+				seenEmojiIDs[reaction.EmojiID] = struct{}{}
+				emojiIDs = append(emojiIDs, reaction.EmojiID)
+			}
+			lc.recentReactions.Store(op.Param1+"\x00remove\x00"+string(sender)+"\x00all", struct{}{})
+		}
+
+		for _, emojiID := range emojiIDs {
+			dedupKey := op.Param1 + "\x00remove\x00" + string(sender) + "\x00" + string(emojiID)
+			if _, loaded := lc.recentReactions.LoadOrStore(dedupKey, struct{}{}); loaded {
+				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("sender", string(sender)).Str("emoji_id", string(emojiID)).Msg("Skipping duplicate reaction removal")
+				continue
+			}
+			lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventReactionRemove,
+					PortalKey: portalKey,
+					Timestamp: time.UnixMilli(ts),
+					Sender:    bridgev2.EventSender{Sender: sender},
+				},
+				TargetMessage: targetMessage,
+				EmojiID:       emojiID,
+			})
+		}
 	}
 
 	lc.clearReactionDedupEntries(op.Param1, false)
