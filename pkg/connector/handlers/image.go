@@ -1,14 +1,22 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"net/http"
 	"strings"
 	"time"
 
+	_ "golang.org/x/image/webp"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
@@ -105,8 +113,9 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	// Upload to Matrix
+	fileName, mimeType, imageInfo := lineImageMediaInfo(imgData)
 	uploadStart := time.Now()
-	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, "image.jpg", "image/jpeg")
+	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, fileName, mimeType)
 	uploadDuration := time.Since(uploadStart)
 	if err != nil {
 		h.Log.Error().
@@ -135,17 +144,76 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{
 			{
-				Type: event.EventMessage,
-				Content: &event.MessageEventContent{
-					MsgType:   event.MsgImage,
-					Body:      "image.jpg",
-					URL:       mxc,
-					File:      file,
-					RelatesTo: relatesTo,
-				},
+				Type:    event.EventMessage,
+				Content: lineImageEventContent(mxc, file, fileName, imageInfo, relatesTo),
 			},
 		},
 	}, nil
+}
+
+func lineImageEventContent(mxc id.ContentURIString, file *event.EncryptedFileInfo, fileName string, info *event.FileInfo, relatesTo *event.RelatesTo) *event.MessageEventContent {
+	return &event.MessageEventContent{
+		MsgType:   event.MsgImage,
+		Body:      fileName,
+		URL:       mxc,
+		File:      file,
+		Info:      info,
+		RelatesTo: relatesTo,
+	}
+}
+
+func lineImageMediaInfo(data []byte) (string, string, *event.FileInfo) {
+	mimeType := detectLineImageMimeType(data)
+	info := &event.FileInfo{
+		MimeType: mimeType,
+		Size:     len(data),
+	}
+
+	if config, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		info.Width = config.Width
+		info.Height = config.Height
+	}
+
+	return "image." + imageExtensionForMIME(mimeType), mimeType, info
+}
+
+func detectLineImageMimeType(data []byte) string {
+	mimeType := http.DetectContentType(data)
+	if strings.HasPrefix(mimeType, "image/") {
+		return mimeType
+	}
+
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		switch string(data[8:12]) {
+		case "heic", "heix", "hevc", "hevx":
+			return "image/heic"
+		case "heim", "heis", "mif1", "msf1":
+			return "image/heif"
+		case "avif", "avis":
+			return "image/avif"
+		}
+	}
+
+	return "image/jpeg"
+}
+
+func imageExtensionForMIME(mimeType string) string {
+	switch mimeType {
+	case "image/png":
+		return "png"
+	case "image/gif":
+		return "gif"
+	case "image/webp":
+		return "webp"
+	case "image/heic":
+		return "heic"
+	case "image/heif":
+		return "heif"
+	case "image/avif":
+		return "avif"
+	default:
+		return "jpg"
+	}
 }
 
 func lineMediaCategory(metadata map[string]string) string {
