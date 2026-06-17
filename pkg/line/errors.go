@@ -19,9 +19,9 @@ func IsRefreshRequired(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "\"code\":119") ||
-		strings.Contains(msg, "Access token refresh required")
+		strings.Contains(msg, "access token refresh required")
 }
 
 func IsLoggedOut(err error) bool {
@@ -35,17 +35,17 @@ func IsUnauthorizedStatus(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "API error 401") ||
-		strings.Contains(msg, "API error 403") ||
-		strings.Contains(msg, "HTTP 401") ||
-		strings.Contains(msg, "HTTP 403") ||
-		strings.Contains(msg, "SSE error: 401") ||
-		strings.Contains(msg, "SSE error: 403") ||
-		strings.Contains(msg, "OBS upload failed (401)") ||
-		strings.Contains(msg, "OBS upload failed (403)") ||
-		strings.Contains(msg, "OBS download failed (401)") ||
-		strings.Contains(msg, "OBS download failed (403)")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "api error 401") ||
+		strings.Contains(msg, "api error 403") ||
+		strings.Contains(msg, "http 401") ||
+		strings.Contains(msg, "http 403") ||
+		strings.Contains(msg, "sse error: 401") ||
+		strings.Contains(msg, "sse error: 403") ||
+		strings.Contains(msg, "obs upload failed (401)") ||
+		strings.Contains(msg, "obs upload failed (403)") ||
+		strings.Contains(msg, "obs download failed (401)") ||
+		strings.Contains(msg, "obs download failed (403)")
 }
 
 func IsAuthError(err error) bool {

@@ -31,21 +31,22 @@ type mentionEntry struct {
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	callLINE := func(call func(*line.Client) error) error {
+	client := line.NewClient(lc.AccessToken)
+	callLineErr := func(call func(*line.Client) error) error {
 		var err error
-		_, err = lc.callLine(ctx, call)
+		client, err = lc.callLineUsing(ctx, client, call)
 		return err
 	}
 	callLineString := func(call func(*line.Client) (string, error)) (string, error) {
 		var err error
 		var res string
-		_, res, err = callLineResult(lc, ctx, call)
+		client, res, err = callLineResultUsing(lc, ctx, client, call)
 		return res, err
 	}
 	sendLineMessage := func(reqSeq int, lineMsg *line.Message) (*line.Message, error) {
 		var err error
 		var sentMsg *line.Message
-		_, sentMsg, err = callLineResult(lc, ctx, func(client *line.Client) (*line.Message, error) {
+		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
 			return client.SendMessage(int64(reqSeq), lineMsg)
 		})
 		return sentMsg, err
@@ -237,7 +238,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to encrypt thumbnail, continuing without it")
 			} else {
 				previewOID := fmt.Sprintf("%s__ud-preview", oid)
-				if err := callLINE(func(client *line.Client) error {
+				if err := callLineErr(func(client *line.Client) error {
 					return client.UploadOBSWithOID(thumbToUpload, previewOID)
 				}); err != nil {
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload preview, continuing without it")
@@ -418,7 +419,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			chunkHashes := generateChunkHashes(uploadData[:len(uploadData)-32])
 			if len(chunkHashes) > 0 {
 				hashOID := fmt.Sprintf("%s__ud-hash", oid)
-				if err := callLINE(func(client *line.Client) error {
+				if err := callLineErr(func(client *line.Client) error {
 					return client.UploadOBSWithOIDAndSID(chunkHashes, hashOID, "emv")
 				}); err != nil {
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload video hash, continuing without it")
@@ -446,7 +447,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to encrypt video thumbnail, continuing without it")
 				} else {
 					previewOID := fmt.Sprintf("%s__ud-preview", oid)
-					if err := callLINE(func(client *line.Client) error {
+					if err := callLineErr(func(client *line.Client) error {
 						return client.UploadOBSWithOIDAndSID(thumbToUpload, previewOID, "emv")
 					}); err != nil {
 						lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload video preview, continuing without it")
@@ -767,7 +768,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			obsType = "file"
 		}
 
-		if err := callLINE(func(client *line.Client) error {
+		if err := callLineErr(func(client *line.Client) error {
 			return client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType)
 		}); err != nil {
 			return nil, fmt.Errorf("failed to upload plain media to OBS: %w", err)
@@ -780,7 +781,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 		if plainThumbData != nil {
 			previewID := fmt.Sprintf("%s__ud-preview", sentMsg.ID)
-			if err := callLINE(func(client *line.Client) error {
+			if err := callLineErr(func(client *line.Client) error {
 				return client.UploadOBSPlain(plainThumbData, previewID, obsType)
 			}); err != nil {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload plain media thumbnail, continuing without it")

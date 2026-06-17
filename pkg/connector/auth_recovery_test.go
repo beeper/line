@@ -82,7 +82,7 @@ func TestCallLineWithRecovery(t *testing.T) {
 			var calls int
 			var recoveries int
 
-			_, _, err := callLineWithRecovery(context.Background(), lineCallDeps[struct{}]{
+			_, _, err := callLineWithRecovery(context.Background(), nil, lineCallDeps[struct{}]{
 				newClient: func() *line.Client {
 					return line.NewClient("token")
 				},
@@ -116,6 +116,74 @@ func TestCallLineWithRecovery(t *testing.T) {
 				t.Fatalf("unexpected err: %v", err)
 			}
 		})
+	}
+}
+
+func TestCallLineWithRecoveryReusesClientUntilRecovery(t *testing.T) {
+	ctx := context.Background()
+	initialClient := line.NewClient("initial")
+	refreshedClient := line.NewClient("refreshed")
+	var newClients int
+	var calls []string
+
+	client, _, err := callLineWithRecovery(ctx, initialClient, lineCallDeps[struct{}]{
+		newClient: func() *line.Client {
+			newClients++
+			return refreshedClient
+		},
+		recover: func(context.Context) error {
+			return nil
+		},
+		isAuthError: line.IsAuthError,
+		call: func(client *line.Client) (struct{}, error) {
+			calls = append(calls, client.AccessToken)
+			if len(calls) == 1 {
+				return struct{}{}, errAuthRequired
+			}
+			return struct{}{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if client != refreshedClient {
+		t.Fatal("expected recovered client to be returned")
+	}
+	if newClients != 1 {
+		t.Fatalf("new clients = %d, want 1", newClients)
+	}
+	if len(calls) != 2 || calls[0] != "initial" || calls[1] != "refreshed" {
+		t.Fatalf("calls used clients %v, want [initial refreshed]", calls)
+	}
+}
+
+func TestCallLineWithRecoveryUsesProvidedClientWithoutRecreating(t *testing.T) {
+	ctx := context.Background()
+	initialClient := line.NewClient("initial")
+	var newClients int
+
+	client, _, err := callLineWithRecovery(ctx, initialClient, lineCallDeps[struct{}]{
+		newClient: func() *line.Client {
+			newClients++
+			return line.NewClient("unexpected")
+		},
+		recover:     func(context.Context) error { return nil },
+		isAuthError: line.IsAuthError,
+		call: func(client *line.Client) (struct{}, error) {
+			if client.AccessToken != "initial" {
+				t.Fatalf("client token = %q, want initial", client.AccessToken)
+			}
+			return struct{}{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if client != initialClient {
+		t.Fatal("expected provided client to be returned")
+	}
+	if newClients != 0 {
+		t.Fatalf("new clients = %d, want 0", newClients)
 	}
 }
 

@@ -22,6 +22,11 @@ func TestIsRefreshRequired(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "refresh text lower case",
+			err:  errors.New("access token refresh required"),
+			want: true,
+		},
+		{
 			name: "other talk exception",
 			err:  errors.New(`API error 400: {"code":10051,"data":{"name":"TalkException","code":10,"reason":"not a member"}}`),
 			want: false,
@@ -63,6 +68,10 @@ func TestIsUnauthorizedStatus(t *testing.T) {
 		errors.New("OBS upload failed (403): forbidden"),
 		errors.New("OBS download failed (401): unauthorized"),
 		errors.New("OBS download failed (403): forbidden"),
+		errors.New("api error 401: unauthorized"),
+		errors.New("http 403: forbidden"),
+		errors.New("sse ERROR: 401"),
+		errors.New("obs DOWNLOAD failed (403): forbidden"),
 	} {
 		if !IsUnauthorizedStatus(err) {
 			t.Fatalf("expected %q to be unauthorized", err)
