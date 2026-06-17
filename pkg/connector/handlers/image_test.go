@@ -51,6 +51,12 @@ func TestLineImageMediaInfo(t *testing.T) {
 			mimeType: "image/heif",
 		},
 		{
+			name:     "heif brand",
+			data:     testFTYP("heif"),
+			fileName: "image.heif",
+			mimeType: "image/heif",
+		},
+		{
 			name:     "heic compatible brand",
 			data:     testFTYP("mif1", "heic"),
 			fileName: "image.heic",
@@ -77,6 +83,18 @@ func TestLineImageMediaInfo(t *testing.T) {
 		{
 			name:     "fallback",
 			data:     []byte("not an image"),
+			fileName: "image.jpg",
+			mimeType: "image/jpeg",
+		},
+		{
+			name:     "invalid ftyp box size",
+			data:     testFTYPWithSize(12, "mif1", "heic"),
+			fileName: "image.jpg",
+			mimeType: "image/jpeg",
+		},
+		{
+			name:     "oversized ftyp box size",
+			data:     testFTYPWithSize(1024, "mif1", "heic"),
 			fileName: "image.jpg",
 			mimeType: "image/jpeg",
 		},
@@ -227,6 +245,12 @@ func testFTYP(majorBrand string, compatibleBrands ...string) []byte {
 	for index, brand := range compatibleBrands {
 		copy(data[16+4*index:], brand)
 	}
+	return data
+}
+
+func testFTYPWithSize(boxSize uint32, majorBrand string, compatibleBrands ...string) []byte {
+	data := testFTYP(majorBrand, compatibleBrands...)
+	binary.BigEndian.PutUint32(data[:4], boxSize)
 	return data
 }
 

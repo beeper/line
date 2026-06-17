@@ -216,28 +216,26 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 
 	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
 		boxSize := binary.BigEndian.Uint32(data[:4])
-		end := len(data)
-		if boxSize >= 16 && uint64(boxSize) < uint64(end) {
-			end = int(boxSize)
-		}
-		detected := ""
-		for offset := 8; offset+4 <= end; {
-			switch [4]byte{data[offset], data[offset+1], data[offset+2], data[offset+3]} {
-			case [4]byte{'a', 'v', 'i', 'f'}, [4]byte{'a', 'v', 'i', 's'}:
-				return "image/avif", false
-			case [4]byte{'h', 'e', 'i', 'c'}, [4]byte{'h', 'e', 'i', 'x'}, [4]byte{'h', 'e', 'v', 'c'}, [4]byte{'h', 'e', 'v', 'x'}:
-				return "image/heic", false
-			case [4]byte{'h', 'e', 'i', 'm'}, [4]byte{'h', 'e', 'i', 's'}, [4]byte{'m', 'i', 'f', '1'}, [4]byte{'m', 's', 'f', '1'}:
-				detected = "image/heif"
+		if boxSize >= 16 && uint64(boxSize) <= uint64(len(data)) {
+			detected := ""
+			for offset, end := 8, int(boxSize); offset+4 <= end; {
+				switch [4]byte{data[offset], data[offset+1], data[offset+2], data[offset+3]} {
+				case [4]byte{'a', 'v', 'i', 'f'}, [4]byte{'a', 'v', 'i', 's'}:
+					return "image/avif", false
+				case [4]byte{'h', 'e', 'i', 'c'}, [4]byte{'h', 'e', 'i', 'x'}, [4]byte{'h', 'e', 'v', 'c'}, [4]byte{'h', 'e', 'v', 'x'}:
+					return "image/heic", false
+				case [4]byte{'h', 'e', 'i', 'f'}, [4]byte{'h', 'e', 'i', 'm'}, [4]byte{'h', 'e', 'i', 's'}, [4]byte{'m', 'i', 'f', '1'}, [4]byte{'m', 's', 'f', '1'}:
+					detected = "image/heif"
+				}
+				if offset == 8 {
+					offset = 16
+				} else {
+					offset += 4
+				}
 			}
-			if offset == 8 {
-				offset = 16
-			} else {
-				offset += 4
+			if detected != "" {
+				return detected, false
 			}
-		}
-		if detected != "" {
-			return detected, false
 		}
 	}
 
