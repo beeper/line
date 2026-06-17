@@ -20,6 +20,11 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
+const (
+	loginTooManyAttemptsReason       = "Too many login attempts"
+	loginTooManyAttemptsInstructions = "Too many login attempts. LINE has locked login for this account temporarily."
+)
+
 type LineConnector struct {
 	br *bridgev2.Bridge
 }
@@ -239,11 +244,6 @@ func loginErrorInstructions(message string) string {
 	return fmt.Sprintf("Could not log in to LINE: %s", message)
 }
 
-const (
-	loginTooManyAttemptsReason       = "Too many login attempts"
-	loginTooManyAttemptsInstructions = "Too many login attempts. LINE has locked login for this account temporarily."
-)
-
 func loginErrorReason(err error) string {
 	if err == nil {
 		return ""
@@ -261,23 +261,20 @@ func loginErrorReason(err error) string {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(msg[start:end+1]), &payload); err != nil {
-		if isBlockedUserLoginError(msg) {
-			return loginTooManyAttemptsReason
-		}
 		return ""
 	}
 	reason := payload.Data.Reason
 	if reason == "" {
 		reason = payload.Data.Message
 	}
-	if isBlockedUserLoginError(reason) || isBlockedUserLoginError(msg) {
+	if isBlockedUserLoginError(reason) {
 		return loginTooManyAttemptsReason
 	}
 	return reason
 }
 
 func isBlockedUserLoginError(message string) bool {
-	return strings.Contains(strings.ToLower(message), "blocked user")
+	return strings.EqualFold(strings.TrimSpace(message), "blocked user")
 }
 
 func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
