@@ -44,6 +44,24 @@ func TestLineImageMediaInfo(t *testing.T) {
 			mimeType: "image/heic",
 		},
 		{
+			name:     "heif",
+			data:     []byte("\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00"),
+			fileName: "image.heif",
+			mimeType: "image/heif",
+		},
+		{
+			name:     "avif",
+			data:     []byte("\x00\x00\x00\x18ftypavif\x00\x00\x00\x00"),
+			fileName: "image.avif",
+			mimeType: "image/avif",
+		},
+		{
+			name:     "bmp",
+			data:     []byte("BM line image data"),
+			fileName: "image.bmp",
+			mimeType: "image/bmp",
+		},
+		{
 			name:     "fallback",
 			data:     []byte("not an image"),
 			fileName: "image.jpg",
@@ -53,25 +71,63 @@ func TestLineImageMediaInfo(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fileName, mimeType, info := lineImageMediaInfo(tt.data)
+			media := lineImageMediaInfo(tt.data)
 
-			if fileName != tt.fileName {
-				t.Fatalf("unexpected file name: got %q, want %q", fileName, tt.fileName)
+			if media.fileName != tt.fileName {
+				t.Fatalf("unexpected file name: got %q, want %q", media.fileName, tt.fileName)
 			}
-			if mimeType != tt.mimeType {
-				t.Fatalf("unexpected mime type: got %q, want %q", mimeType, tt.mimeType)
+			if media.mimeType != tt.mimeType {
+				t.Fatalf("unexpected mime type: got %q, want %q", media.mimeType, tt.mimeType)
 			}
-			if info == nil {
+			if media.info == nil {
 				t.Fatal("expected file info")
 			}
-			if info.MimeType != tt.mimeType {
-				t.Fatalf("unexpected info mime type: got %q, want %q", info.MimeType, tt.mimeType)
+			if media.info.MimeType != tt.mimeType {
+				t.Fatalf("unexpected info mime type: got %q, want %q", media.info.MimeType, tt.mimeType)
 			}
-			if info.Size != len(tt.data) {
-				t.Fatalf("unexpected info size: got %d, want %d", info.Size, len(tt.data))
+			if media.info.Size != len(tt.data) {
+				t.Fatalf("unexpected info size: got %d, want %d", media.info.Size, len(tt.data))
 			}
-			if info.Width != tt.width || info.Height != tt.height {
-				t.Fatalf("unexpected dimensions: got %dx%d, want %dx%d", info.Width, info.Height, tt.width, tt.height)
+			if media.info.Width != tt.width || media.info.Height != tt.height {
+				t.Fatalf("unexpected dimensions: got %dx%d, want %dx%d", media.info.Width, media.info.Height, tt.width, tt.height)
+			}
+		})
+	}
+}
+
+func TestLineImageMediaInfoFallbackState(t *testing.T) {
+	tests := []struct {
+		name             string
+		data             []byte
+		usedMimeFallback bool
+		hasDecodeErr     bool
+	}{
+		{
+			name: "jpeg",
+			data: testJPEG(t, 2, 2),
+		},
+		{
+			name:             "unknown",
+			data:             []byte("not an image"),
+			usedMimeFallback: true,
+			hasDecodeErr:     true,
+		},
+		{
+			name:         "heif without decoder",
+			data:         []byte("\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00"),
+			hasDecodeErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			media := lineImageMediaInfo(tt.data)
+
+			if media.usedMimeFallback != tt.usedMimeFallback {
+				t.Fatalf("unexpected fallback state: got %t, want %t", media.usedMimeFallback, tt.usedMimeFallback)
+			}
+			if (media.decodeErr != nil) != tt.hasDecodeErr {
+				t.Fatalf("unexpected decode error state: got %v, want error %t", media.decodeErr, tt.hasDecodeErr)
 			}
 		})
 	}

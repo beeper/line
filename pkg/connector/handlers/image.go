@@ -9,6 +9,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -113,9 +114,22 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	// Upload to Matrix
-	fileName, mimeType, imageInfo := lineImageMediaInfo(imgData)
+	imageMedia := lineImageMediaInfo(imgData)
+	if imageMedia.usedMimeFallback {
+		h.Log.Debug().
+			Int("size_bytes", len(imgData)).
+			Msg("Falling back to JPEG MIME type for LINE image")
+	}
+	if imageMedia.decodeErr != nil {
+		h.Log.Debug().
+			Err(imageMedia.decodeErr).
+			Str("mime_type", imageMedia.mimeType).
+			Int("size_bytes", len(imgData)).
+			Msg("Could not decode LINE image dimensions")
+	}
+
 	uploadStart := time.Now()
-	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, fileName, mimeType)
+	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, imageMedia.fileName, imageMedia.mimeType)
 	uploadDuration := time.Since(uploadStart)
 	if err != nil {
 		h.Log.Error().
@@ -145,7 +159,7 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		Parts: []*bridgev2.ConvertedMessagePart{
 			{
 				Type:    event.EventMessage,
-				Content: lineImageEventContent(mxc, file, fileName, imageInfo, relatesTo),
+				Content: lineImageEventContent(mxc, file, imageMedia.fileName, imageMedia.info, relatesTo),
 			},
 		},
 	}, nil
@@ -162,43 +176,66 @@ func lineImageEventContent(mxc id.ContentURIString, file *event.EncryptedFileInf
 	}
 }
 
-func lineImageMediaInfo(data []byte) (string, string, *event.FileInfo) {
-	mimeType := detectLineImageMimeType(data)
+type lineImageMedia struct {
+	fileName         string
+	mimeType         string
+	info             *event.FileInfo
+	usedMimeFallback bool
+	decodeErr        error
+}
+
+func lineImageMediaInfo(data []byte) lineImageMedia {
+	mimeType, usedFallback := detectLineImageMimeType(data)
 	info := &event.FileInfo{
 		MimeType: mimeType,
 		Size:     len(data),
 	}
 
+	var decodeErr error
 	if config, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 		info.Width = config.Width
 		info.Height = config.Height
+	} else {
+		decodeErr = err
 	}
 
-	return "image." + imageExtensionForMIME(mimeType), mimeType, info
+	return lineImageMedia{
+		fileName:         "image." + imageExtensionForMIME(mimeType),
+		mimeType:         mimeType,
+		info:             info,
+		usedMimeFallback: usedFallback,
+		decodeErr:        decodeErr,
+	}
 }
 
-func detectLineImageMimeType(data []byte) string {
+func detectLineImageMimeType(data []byte) (string, bool) {
 	mimeType := http.DetectContentType(data)
 	if strings.HasPrefix(mimeType, "image/") {
-		return mimeType
+		return mimeType, false
 	}
 
-	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
-		switch string(data[8:12]) {
-		case "heic", "heix", "hevc", "hevx":
-			return "image/heic"
-		case "heim", "heis", "mif1", "msf1":
-			return "image/heif"
-		case "avif", "avis":
-			return "image/avif"
+	if len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftyp")) {
+		brand := data[8:12]
+		switch {
+		case bytes.Equal(brand, []byte("heic")) || bytes.Equal(brand, []byte("heix")) || bytes.Equal(brand, []byte("hevc")) || bytes.Equal(brand, []byte("hevx")):
+			return "image/heic", false
+		case bytes.Equal(brand, []byte("heim")) || bytes.Equal(brand, []byte("heis")) || bytes.Equal(brand, []byte("mif1")) || bytes.Equal(brand, []byte("msf1")):
+			return "image/heif", false
+		case bytes.Equal(brand, []byte("avif")) || bytes.Equal(brand, []byte("avis")):
+			return "image/avif", false
 		}
 	}
 
-	return "image/jpeg"
+	return "image/jpeg", true
 }
 
 func imageExtensionForMIME(mimeType string) string {
-	switch mimeType {
+	normalizedMIMEType, _, _ := strings.Cut(mimeType, ";")
+	normalizedMIMEType = strings.ToLower(strings.TrimSpace(normalizedMIMEType))
+
+	switch normalizedMIMEType {
+	case "image/jpeg":
+		return "jpg"
 	case "image/png":
 		return "png"
 	case "image/gif":
@@ -211,9 +248,19 @@ func imageExtensionForMIME(mimeType string) string {
 		return "heif"
 	case "image/avif":
 		return "avif"
-	default:
-		return "jpg"
+	case "image/bmp":
+		return "bmp"
+	case "image/tiff":
+		return "tiff"
+	case "image/x-icon", "image/vnd.microsoft.icon":
+		return "ico"
 	}
+
+	if extensions, err := mime.ExtensionsByType(normalizedMIMEType); err == nil && len(extensions) > 0 {
+		return strings.TrimPrefix(extensions[0], ".")
+	}
+
+	return "jpg"
 }
 
 func lineMediaCategory(metadata map[string]string) string {
