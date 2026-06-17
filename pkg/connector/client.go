@@ -30,6 +30,7 @@ type LineClient struct {
 	sentReqSeqs map[int]time.Time
 	lastReqSeq  int
 
+	tokenMu     sync.RWMutex
 	recoverMu   sync.Mutex
 	recoverTime time.Time
 
@@ -71,6 +72,36 @@ type cachedContact struct {
 
 const defaultMediaFlowTTL = 6 * time.Hour
 const recentTokenRecoveryWindow = 10 * time.Second
+
+func (lc *LineClient) getAccessToken() string {
+	lc.tokenMu.RLock()
+	defer lc.tokenMu.RUnlock()
+	return lc.AccessToken
+}
+
+func (lc *LineClient) getTokens() (string, string) {
+	lc.tokenMu.RLock()
+	defer lc.tokenMu.RUnlock()
+	return lc.AccessToken, lc.RefreshToken
+}
+
+func (lc *LineClient) setTokens(accessToken, refreshToken string) (string, string) {
+	lc.tokenMu.Lock()
+	defer lc.tokenMu.Unlock()
+	lc.AccessToken = accessToken
+	if refreshToken != "" {
+		lc.RefreshToken = refreshToken
+	}
+	return lc.AccessToken, lc.RefreshToken
+}
+
+func (lc *LineClient) hasAccessToken() bool {
+	return lc.getAccessToken() != ""
+}
+
+func (lc *LineClient) newClient() *line.Client {
+	return line.NewClient(lc.getAccessToken())
+}
 
 func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
 	if picturePath == "" {
@@ -146,28 +177,26 @@ var _ bridgev2.BackfillingNetworkAPI = (*LineClient)(nil)
 var _ bridgev2.ReactionHandlingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) refreshAndSave(ctx context.Context) error {
-	if lc.RefreshToken == "" {
+	accessToken, refreshToken := lc.getTokens()
+	if refreshToken == "" {
 		return fmt.Errorf("no refresh token available")
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	res, err := client.RefreshAccessToken(lc.RefreshToken)
+	client := line.NewClient(accessToken)
+	res, err := client.RefreshAccessToken(refreshToken)
 	if err != nil {
 		return fmt.Errorf("failed to refresh token: %w", err)
 	}
 
-	lc.AccessToken = res.AccessToken
-	if res.RefreshToken != "" {
-		lc.RefreshToken = res.RefreshToken
-	}
+	accessToken, refreshToken = lc.setTokens(res.AccessToken, res.RefreshToken)
 
 	// Rotating the main access token invalidates any OBS token derived from it,
 	// so drop the cached one — the next OBS call will mint a fresh one.
 	line.InvalidateOBSTokenCache()
 
 	meta := lc.UserLogin.Metadata.(*UserLoginMetadata)
-	meta.AccessToken = lc.AccessToken
-	meta.RefreshToken = lc.RefreshToken
+	meta.AccessToken = accessToken
+	meta.RefreshToken = refreshToken
 	err = lc.UserLogin.Save(ctx)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save refreshed tokens to DB")
@@ -240,7 +269,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 			lc.Mid = meta.Mid
 		}
 	}
-	if lc.AccessToken == "" {
+	if !lc.hasAccessToken() {
 		if err := lc.tryLogin(ctx); err != nil {
 			lc.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
@@ -263,7 +292,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		return
 	}
 
-	lc.UserLogin.Bridge.Log.Info().Int("token_len", len(lc.AccessToken)).Msg("LINE client connected; notifying bridge")
+	lc.UserLogin.Bridge.Log.Info().Int("token_len", len(lc.getAccessToken())).Msg("LINE client connected; notifying bridge")
 	lc.UserLogin.BridgeState.Send(status.BridgeState{
 		StateEvent: status.StateConnected,
 	})
@@ -283,7 +312,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		}
 
 		// Storage key is optional for runtime decrypt/encrypt; try it for file support
-		client := line.NewClient(lc.AccessToken)
+		client := lc.newClient()
 		ei3, err := client.GetEncryptedIdentityV3()
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch EncryptedIdentityV3")
@@ -379,15 +408,17 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		res = waitRes
 		client = waitClient
 	}
-	lc.AccessToken = client.AccessToken
+	accessToken := client.AccessToken
+	refreshToken := ""
 	if res.TokenV3IssueResult != nil {
 		if res.TokenV3IssueResult.AccessToken != "" {
-			lc.AccessToken = res.TokenV3IssueResult.AccessToken
+			accessToken = res.TokenV3IssueResult.AccessToken
 		}
 		if res.TokenV3IssueResult.RefreshToken != "" {
-			lc.RefreshToken = res.TokenV3IssueResult.RefreshToken
+			refreshToken = res.TokenV3IssueResult.RefreshToken
 		}
 	}
+	accessToken, refreshToken = lc.setTokens(accessToken, refreshToken)
 
 	// Re-login replaces the main access token, which invalidates any cached
 	// OBS token derived from the previous one.
@@ -402,8 +433,8 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 
 	// Save the new tokens and updated certificate to metadata
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
-		meta.AccessToken = lc.AccessToken
-		meta.RefreshToken = lc.RefreshToken
+		meta.AccessToken = accessToken
+		meta.RefreshToken = refreshToken
 		if res.Certificate != "" {
 			meta.Certificate = res.Certificate
 		}
@@ -417,7 +448,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 }
 
 func (lc *LineClient) ensureValidToken(ctx context.Context) error {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	_, err := client.GetProfile()
 	if err == nil {
 		return nil
@@ -449,7 +480,7 @@ func (lc *LineClient) Disconnect() {
 	lc.wg.Wait()
 }
 
-func (lc *LineClient) IsLoggedIn() bool { return lc.AccessToken != "" }
+func (lc *LineClient) IsLoggedIn() bool { return lc.hasAccessToken() }
 
 func (lc *LineClient) GetUserID() networkid.UserID {
 	return makeUserID(lc.Mid)

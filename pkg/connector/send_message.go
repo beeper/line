@@ -31,7 +31,7 @@ type mentionEntry struct {
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
 		var err error
 		client, err = lc.callLineUsing(ctx, client, call)

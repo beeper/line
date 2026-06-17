@@ -31,11 +31,11 @@ const (
 )
 
 func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	blockedMIDs, err := client.GetBlockedContactIds()
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			blockedMIDs, err = client.GetBlockedContactIds()
 		}
 	}
@@ -114,7 +114,7 @@ func (lc *LineClient) saveBlockedContactsSnapshot(ctx context.Context) {
 func (lc *LineClient) syncDMChats(ctx context.Context) {
 	defer lc.wg.Done()
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
 		MessageBoxCountLimit:           100,
@@ -125,7 +125,7 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 	res, err := client.GetMessageBoxes(opts)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			res, err = client.GetMessageBoxes(opts)
 		}
 	}
@@ -265,11 +265,11 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		limit = 50
 	}
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
 		}
 	}
@@ -331,7 +331,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	defer lc.wg.Done()
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
 		MessageBoxCountLimit:           100,
@@ -342,7 +342,7 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	res, err := client.GetMessageBoxes(opts)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			res, err = client.GetMessageBoxes(opts)
 		}
 	}
@@ -404,11 +404,11 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 // (live) message path. Used by prefetchMessages on startup.
 func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
 	start := time.Now()
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
 		}
 	}
@@ -450,11 +450,11 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 func (lc *LineClient) syncChats(ctx context.Context) {
 	defer lc.wg.Done()
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	midsResp, err := client.GetAllChatMids(true, true)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			midsResp, err = client.GetAllChatMids(true, true)
 		}
 	}
@@ -478,7 +478,7 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 		chatsResp, err := client.GetChats(batch, true, true)
 		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newClient()
 				chatsResp, err = client.GetChats(batch, true, true)
 			}
 		}
@@ -742,11 +742,11 @@ func (lc *LineClient) cacheGroupMembersFromRecentMessages(ctx context.Context, c
 	if len(lc.getCachedGroupMembers(chatMid)) > 1 {
 		return
 	}
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	msgs, err := client.GetRecentMessagesV2(chatMid, 50)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			msgs, err = client.GetRecentMessagesV2(chatMid, 50)
 		}
 	}
@@ -841,13 +841,13 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	defer lc.wg.Done()
 
 	var localRev int64 = 0
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
 	rev, err := client.GetLastOpRevision()
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			rev, err = client.GetLastOpRevision()
 		} else {
 			lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token for getLastOpRevision")
@@ -936,7 +936,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 						})
 						return
 					}
-					client = line.NewClient(lc.AccessToken)
+					client = lc.newClient()
 				}
 			}
 			time.Sleep(3 * time.Second)
@@ -1414,11 +1414,11 @@ func (lc *LineClient) clearReactionDedupEntries(msgID string, removeOnly bool) {
 
 func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 	chatMid := op.Param1
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
 		}
 	}
@@ -1475,11 +1475,11 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 // checkChatMembership calls GetAllChatMids to verify whether the bridge user
 // is a member or invitee of the given chat.
 func (lc *LineClient) checkChatMembership(ctx context.Context, chatMid string) (isMember, isInvitee bool) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	midsResp, err := client.GetAllChatMids(true, true)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			midsResp, err = client.GetAllChatMids(true, true)
 		}
 	}
@@ -1550,11 +1550,11 @@ func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
 }
 
 func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType OperationType) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
 		}
 	}
@@ -1598,11 +1598,11 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType O
 }
 
 func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
 		}
 	}
