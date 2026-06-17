@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -208,16 +209,16 @@ func lineImageMediaInfo(data []byte) lineImageMedia {
 }
 
 func detectLineImageMimeType(data []byte) (string, bool) {
-	mimeType := http.DetectContentType(data)
+	mimeType := normalizedImageMIMEType(http.DetectContentType(data))
 	if strings.HasPrefix(mimeType, "image/") {
 		return mimeType, false
 	}
 
-	if len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftyp")) {
-		boxSize := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		boxSize := binary.BigEndian.Uint32(data[:4])
 		end := len(data)
-		if boxSize >= 16 && boxSize < end {
-			end = boxSize
+		if boxSize >= 16 && uint64(boxSize) < uint64(end) {
+			end = int(boxSize)
 		}
 		detected := ""
 		for offset := 8; offset+4 <= end; {

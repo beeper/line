@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -220,7 +221,7 @@ func testPNG(t *testing.T, width, height int) []byte {
 
 func testFTYP(majorBrand string, compatibleBrands ...string) []byte {
 	data := make([]byte, 16+4*len(compatibleBrands))
-	data[3] = byte(len(data))
+	binary.BigEndian.PutUint32(data[:4], uint32(len(data)))
 	copy(data[4:8], "ftyp")
 	copy(data[8:12], majorBrand)
 	for index, brand := range compatibleBrands {
