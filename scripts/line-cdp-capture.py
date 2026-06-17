@@ -363,7 +363,7 @@ def wait_for_chrome(timeout: int = 60) -> bool:
 
 
 def main():
-    output_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/line-capture/line-cdp-capture.json"
+    output_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/line-chrome-extension-capture/line-cdp-capture.json"
 
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
