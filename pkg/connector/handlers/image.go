@@ -195,7 +195,7 @@ func lineImageMediaInfo(data []byte) lineImageMedia {
 	if config, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 		info.Width = config.Width
 		info.Height = config.Height
-	} else {
+	} else if !usedFallback && shouldLogLineImageDecodeError(mimeType) {
 		decodeErr = err
 	}
 
@@ -215,13 +215,12 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 	}
 
 	if len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftyp")) {
-		brand := data[8:12]
-		switch {
-		case bytes.Equal(brand, []byte("heic")) || bytes.Equal(brand, []byte("heix")) || bytes.Equal(brand, []byte("hevc")) || bytes.Equal(brand, []byte("hevx")):
+		switch [4]byte{data[8], data[9], data[10], data[11]} {
+		case [4]byte{'h', 'e', 'i', 'c'}, [4]byte{'h', 'e', 'i', 'x'}, [4]byte{'h', 'e', 'v', 'c'}, [4]byte{'h', 'e', 'v', 'x'}:
 			return "image/heic", false
-		case bytes.Equal(brand, []byte("heim")) || bytes.Equal(brand, []byte("heis")) || bytes.Equal(brand, []byte("mif1")) || bytes.Equal(brand, []byte("msf1")):
+		case [4]byte{'h', 'e', 'i', 'm'}, [4]byte{'h', 'e', 'i', 's'}, [4]byte{'m', 'i', 'f', '1'}, [4]byte{'m', 's', 'f', '1'}:
 			return "image/heif", false
-		case bytes.Equal(brand, []byte("avif")) || bytes.Equal(brand, []byte("avis")):
+		case [4]byte{'a', 'v', 'i', 'f'}, [4]byte{'a', 'v', 'i', 's'}:
 			return "image/avif", false
 		}
 	}
@@ -230,8 +229,7 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 }
 
 func imageExtensionForMIME(mimeType string) string {
-	normalizedMIMEType, _, _ := strings.Cut(mimeType, ";")
-	normalizedMIMEType = strings.ToLower(strings.TrimSpace(normalizedMIMEType))
+	normalizedMIMEType := normalizedImageMIMEType(mimeType)
 
 	switch normalizedMIMEType {
 	case "image/jpeg":
@@ -261,6 +259,19 @@ func imageExtensionForMIME(mimeType string) string {
 	}
 
 	return "jpg"
+}
+
+func shouldLogLineImageDecodeError(mimeType string) bool {
+	switch normalizedImageMIMEType(mimeType) {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	}
+	return false
+}
+
+func normalizedImageMIMEType(mimeType string) string {
+	normalizedMIMEType, _, _ := strings.Cut(mimeType, ";")
+	return strings.ToLower(strings.TrimSpace(normalizedMIMEType))
 }
 
 func lineMediaCategory(metadata map[string]string) string {

@@ -110,11 +110,14 @@ func TestLineImageMediaInfoFallbackState(t *testing.T) {
 			name:             "unknown",
 			data:             []byte("not an image"),
 			usedMimeFallback: true,
-			hasDecodeErr:     true,
 		},
 		{
-			name:         "heif without decoder",
-			data:         []byte("\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00"),
+			name: "heif without decoder",
+			data: []byte("\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00"),
+		},
+		{
+			name:         "truncated jpeg",
+			data:         []byte{0xff, 0xd8, 0xff},
 			hasDecodeErr: true,
 		},
 	}
@@ -128,6 +131,36 @@ func TestLineImageMediaInfoFallbackState(t *testing.T) {
 			}
 			if (media.decodeErr != nil) != tt.hasDecodeErr {
 				t.Fatalf("unexpected decode error state: got %v, want error %t", media.decodeErr, tt.hasDecodeErr)
+			}
+		})
+	}
+}
+
+func TestImageExtensionForMIME(t *testing.T) {
+	tests := []struct {
+		mimeType  string
+		extension string
+	}{
+		{mimeType: "image/jpeg", extension: "jpg"},
+		{mimeType: "image/png", extension: "png"},
+		{mimeType: "image/gif", extension: "gif"},
+		{mimeType: "image/webp", extension: "webp"},
+		{mimeType: "image/heic", extension: "heic"},
+		{mimeType: "image/heif", extension: "heif"},
+		{mimeType: "image/avif", extension: "avif"},
+		{mimeType: "image/bmp", extension: "bmp"},
+		{mimeType: "image/tiff", extension: "tiff"},
+		{mimeType: "image/x-icon", extension: "ico"},
+		{mimeType: "image/vnd.microsoft.icon", extension: "ico"},
+		{mimeType: "image/png; charset=binary", extension: "png"},
+		{mimeType: "image/svg+xml", extension: "svg"},
+		{mimeType: "unknown/unknown", extension: "jpg"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.mimeType, func(t *testing.T) {
+			if extension := imageExtensionForMIME(tt.mimeType); extension != tt.extension {
+				t.Fatalf("unexpected extension: got %q, want %q", extension, tt.extension)
 			}
 		})
 	}
