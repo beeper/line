@@ -39,19 +39,31 @@ func TestLineImageMediaInfo(t *testing.T) {
 		},
 		{
 			name:     "heic",
-			data:     []byte("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"),
+			data:     testFTYP("heic"),
 			fileName: "image.heic",
 			mimeType: "image/heic",
 		},
 		{
 			name:     "heif",
-			data:     []byte("\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00"),
+			data:     testFTYP("mif1"),
 			fileName: "image.heif",
 			mimeType: "image/heif",
 		},
 		{
+			name:     "heic compatible brand",
+			data:     testFTYP("mif1", "heic"),
+			fileName: "image.heic",
+			mimeType: "image/heic",
+		},
+		{
 			name:     "avif",
-			data:     []byte("\x00\x00\x00\x18ftypavif\x00\x00\x00\x00"),
+			data:     testFTYP("avif"),
+			fileName: "image.avif",
+			mimeType: "image/avif",
+		},
+		{
+			name:     "avif compatible brand",
+			data:     testFTYP("mif1", "avif"),
 			fileName: "image.avif",
 			mimeType: "image/avif",
 		},
@@ -113,7 +125,7 @@ func TestLineImageMediaInfoFallbackState(t *testing.T) {
 		},
 		{
 			name: "heif without decoder",
-			data: []byte("\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00"),
+			data: testFTYP("mif1"),
 		},
 		{
 			name:         "truncated jpeg",
@@ -204,6 +216,17 @@ func testPNG(t *testing.T, width, height int) []byte {
 		t.Fatalf("encode png: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func testFTYP(majorBrand string, compatibleBrands ...string) []byte {
+	data := make([]byte, 16+4*len(compatibleBrands))
+	data[3] = byte(len(data))
+	copy(data[4:8], "ftyp")
+	copy(data[8:12], majorBrand)
+	for index, brand := range compatibleBrands {
+		copy(data[16+4*index:], brand)
+	}
+	return data
 }
 
 func testImage(width, height int) image.Image {

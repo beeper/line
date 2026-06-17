@@ -9,7 +9,6 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
-	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -215,13 +214,29 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 	}
 
 	if len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftyp")) {
-		switch [4]byte{data[8], data[9], data[10], data[11]} {
-		case [4]byte{'h', 'e', 'i', 'c'}, [4]byte{'h', 'e', 'i', 'x'}, [4]byte{'h', 'e', 'v', 'c'}, [4]byte{'h', 'e', 'v', 'x'}:
-			return "image/heic", false
-		case [4]byte{'h', 'e', 'i', 'm'}, [4]byte{'h', 'e', 'i', 's'}, [4]byte{'m', 'i', 'f', '1'}, [4]byte{'m', 's', 'f', '1'}:
-			return "image/heif", false
-		case [4]byte{'a', 'v', 'i', 'f'}, [4]byte{'a', 'v', 'i', 's'}:
-			return "image/avif", false
+		boxSize := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+		end := len(data)
+		if boxSize >= 16 && boxSize < end {
+			end = boxSize
+		}
+		detected := ""
+		for offset := 8; offset+4 <= end; {
+			switch [4]byte{data[offset], data[offset+1], data[offset+2], data[offset+3]} {
+			case [4]byte{'a', 'v', 'i', 'f'}, [4]byte{'a', 'v', 'i', 's'}:
+				return "image/avif", false
+			case [4]byte{'h', 'e', 'i', 'c'}, [4]byte{'h', 'e', 'i', 'x'}, [4]byte{'h', 'e', 'v', 'c'}, [4]byte{'h', 'e', 'v', 'x'}:
+				return "image/heic", false
+			case [4]byte{'h', 'e', 'i', 'm'}, [4]byte{'h', 'e', 'i', 's'}, [4]byte{'m', 'i', 'f', '1'}, [4]byte{'m', 's', 'f', '1'}:
+				detected = "image/heif"
+			}
+			if offset == 8 {
+				offset = 16
+			} else {
+				offset += 4
+			}
+		}
+		if detected != "" {
+			return detected, false
 		}
 	}
 
@@ -229,33 +244,15 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 }
 
 func imageExtensionForMIME(mimeType string) string {
-	normalizedMIMEType := normalizedImageMIMEType(mimeType)
-	switch normalizedMIMEType {
+	switch normalizedMIMEType := normalizedImageMIMEType(mimeType); normalizedMIMEType {
 	case "image/jpeg":
 		return "jpg"
-	case "image/png":
-		return "png"
-	case "image/gif":
-		return "gif"
-	case "image/webp":
-		return "webp"
-	case "image/heic":
-		return "heic"
-	case "image/heif":
-		return "heif"
-	case "image/avif":
-		return "avif"
-	case "image/bmp":
-		return "bmp"
-	case "image/tiff":
-		return "tiff"
 	case "image/svg+xml":
 		return "svg"
 	case "image/x-icon", "image/vnd.microsoft.icon":
 		return "ico"
-	}
-	if extensions, err := mime.ExtensionsByType(normalizedMIMEType); err == nil && len(extensions) > 0 {
-		return strings.TrimPrefix(extensions[0], ".")
+	case "image/png", "image/gif", "image/webp", "image/heic", "image/heif", "image/avif", "image/bmp", "image/tiff":
+		return strings.TrimPrefix(normalizedMIMEType, "image/")
 	}
 	return "jpg"
 }
