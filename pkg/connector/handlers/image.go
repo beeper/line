@@ -230,7 +230,6 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 
 func imageExtensionForMIME(mimeType string) string {
 	normalizedMIMEType := normalizedImageMIMEType(mimeType)
-
 	switch normalizedMIMEType {
 	case "image/jpeg":
 		return "jpg"
@@ -250,14 +249,14 @@ func imageExtensionForMIME(mimeType string) string {
 		return "bmp"
 	case "image/tiff":
 		return "tiff"
+	case "image/svg+xml":
+		return "svg"
 	case "image/x-icon", "image/vnd.microsoft.icon":
 		return "ico"
 	}
-
 	if extensions, err := mime.ExtensionsByType(normalizedMIMEType); err == nil && len(extensions) > 0 {
 		return strings.TrimPrefix(extensions[0], ".")
 	}
-
 	return "jpg"
 }
 
