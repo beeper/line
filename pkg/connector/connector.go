@@ -230,11 +230,19 @@ func loginErrorInstructions(message string) string {
 	if message == "" {
 		return "Could not log in to LINE. Please check your email and password and try again."
 	}
+	if strings.EqualFold(message, loginTooManyAttemptsReason) || isBlockedUserLoginError(message) {
+		return loginTooManyAttemptsInstructions
+	}
 	if strings.EqualFold(message, "Account ID or password is invalid") {
 		return "LINE rejected the email or password. Make sure you used the email from LINE Settings -> Account -> Email Address, then try again."
 	}
 	return fmt.Sprintf("Could not log in to LINE: %s", message)
 }
+
+const (
+	loginTooManyAttemptsReason       = "Too many login attempts"
+	loginTooManyAttemptsInstructions = "Too many login attempts. LINE has locked login for this account temporarily."
+)
 
 func loginErrorReason(err error) string {
 	if err == nil {
@@ -248,13 +256,28 @@ func loginErrorReason(err error) string {
 	}
 	var payload struct {
 		Data struct {
-			Reason string `json:"reason"`
+			Message string `json:"message"`
+			Reason  string `json:"reason"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(msg[start:end+1]), &payload); err != nil {
+		if isBlockedUserLoginError(msg) {
+			return loginTooManyAttemptsReason
+		}
 		return ""
 	}
-	return payload.Data.Reason
+	reason := payload.Data.Reason
+	if reason == "" {
+		reason = payload.Data.Message
+	}
+	if isBlockedUserLoginError(reason) || isBlockedUserLoginError(msg) {
+		return loginTooManyAttemptsReason
+	}
+	return reason
+}
+
+func isBlockedUserLoginError(message string) bool {
+	return strings.Contains(strings.ToLower(message), "blocked user")
 }
 
 func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
