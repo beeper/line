@@ -214,12 +214,12 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 		return mimeType, false
 	}
 
-	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+	if len(data) >= 12 && lineImageBrandAt(data, 4) == [4]byte{'f', 't', 'y', 'p'} {
 		boxSize := binary.BigEndian.Uint32(data[:4])
 		if boxSize >= 16 && uint64(boxSize) <= uint64(len(data)) {
 			detected := ""
 			for offset, end := 8, int(boxSize); offset+4 <= end; {
-				switch [4]byte{data[offset], data[offset+1], data[offset+2], data[offset+3]} {
+				switch lineImageBrandAt(data, offset) {
 				case [4]byte{'a', 'v', 'i', 'f'}, [4]byte{'a', 'v', 'i', 's'}:
 					return "image/avif", false
 				case [4]byte{'h', 'e', 'i', 'c'}, [4]byte{'h', 'e', 'i', 'x'}, [4]byte{'h', 'e', 'v', 'c'}, [4]byte{'h', 'e', 'v', 'x'}:
@@ -240,6 +240,10 @@ func detectLineImageMimeType(data []byte) (string, bool) {
 	}
 
 	return "image/jpeg", true
+}
+
+func lineImageBrandAt(data []byte, offset int) [4]byte {
+	return [4]byte{data[offset], data[offset+1], data[offset+2], data[offset+3]}
 }
 
 func imageExtensionForMIME(mimeType string) string {

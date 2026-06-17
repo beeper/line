@@ -17,6 +17,7 @@ func TestLineImageMediaInfo(t *testing.T) {
 	tests := []struct {
 		name     string
 		data     []byte
+		makeData func(t *testing.T) []byte
 		fileName string
 		mimeType string
 		width    int
@@ -24,7 +25,7 @@ func TestLineImageMediaInfo(t *testing.T) {
 	}{
 		{
 			name:     "jpeg",
-			data:     testJPEG(t, 23, 17),
+			makeData: func(t *testing.T) []byte { return testJPEG(t, 23, 17) },
 			fileName: "image.jpg",
 			mimeType: "image/jpeg",
 			width:    23,
@@ -32,7 +33,7 @@ func TestLineImageMediaInfo(t *testing.T) {
 		},
 		{
 			name:     "png",
-			data:     testPNG(t, 19, 11),
+			makeData: func(t *testing.T) []byte { return testPNG(t, 19, 11) },
 			fileName: "image.png",
 			mimeType: "image/png",
 			width:    19,
@@ -102,7 +103,12 @@ func TestLineImageMediaInfo(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			media := lineImageMediaInfo(tt.data)
+			data := tt.data
+			if tt.makeData != nil {
+				data = tt.makeData(t)
+			}
+
+			media := lineImageMediaInfo(data)
 
 			if media.fileName != tt.fileName {
 				t.Fatalf("unexpected file name: got %q, want %q", media.fileName, tt.fileName)
@@ -116,8 +122,8 @@ func TestLineImageMediaInfo(t *testing.T) {
 			if media.info.MimeType != tt.mimeType {
 				t.Fatalf("unexpected info mime type: got %q, want %q", media.info.MimeType, tt.mimeType)
 			}
-			if media.info.Size != len(tt.data) {
-				t.Fatalf("unexpected info size: got %d, want %d", media.info.Size, len(tt.data))
+			if media.info.Size != len(data) {
+				t.Fatalf("unexpected info size: got %d, want %d", media.info.Size, len(data))
 			}
 			if media.info.Width != tt.width || media.info.Height != tt.height {
 				t.Fatalf("unexpected dimensions: got %dx%d, want %dx%d", media.info.Width, media.info.Height, tt.width, tt.height)
@@ -130,12 +136,13 @@ func TestLineImageMediaInfoFallbackState(t *testing.T) {
 	tests := []struct {
 		name             string
 		data             []byte
+		makeData         func(t *testing.T) []byte
 		usedMimeFallback bool
 		hasDecodeErr     bool
 	}{
 		{
-			name: "jpeg",
-			data: testJPEG(t, 2, 2),
+			name:     "jpeg",
+			makeData: func(t *testing.T) []byte { return testJPEG(t, 2, 2) },
 		},
 		{
 			name:             "unknown",
@@ -155,7 +162,12 @@ func TestLineImageMediaInfoFallbackState(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			media := lineImageMediaInfo(tt.data)
+			data := tt.data
+			if tt.makeData != nil {
+				data = tt.makeData(t)
+			}
+
+			media := lineImageMediaInfo(data)
 
 			if media.usedMimeFallback != tt.usedMimeFallback {
 				t.Fatalf("unexpected fallback state: got %t, want %t", media.usedMimeFallback, tt.usedMimeFallback)
