@@ -294,8 +294,14 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		}
 	}
 
-	lc.wg.Add(4)
-	go lc.syncChats(ctx)
+	// Create/sync group portals before message prefetching or SSE polling can
+	// deliver messages. Otherwise an existing LINE group whose Matrix room
+	// doesn't exist yet may be created by the first message, which makes the
+	// sender's existing membership look like a fresh join.
+	lc.wg.Add(1)
+	lc.syncChats(ctx)
+
+	lc.wg.Add(3)
 	go lc.syncDMChats(ctx)
 	go lc.prefetchMessages(ctx)
 	go lc.pollLoop(ctx)
