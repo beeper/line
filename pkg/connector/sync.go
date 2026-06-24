@@ -674,7 +674,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		Avatar: lc.avatarFromPicturePath(chat.PicturePath),
 		Members: &bridgev2.ChatMemberList{
 			IsFull:                     true,
-			Members:                    members,
+			MemberMap:                  chatMemberMapFromList(members),
 			ExcludeChangesFromTimeline: excludeFromTimeline,
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
@@ -854,6 +854,14 @@ func hiddenMemberEventExtra(exclude bool) map[string]any {
 	return map[string]any{beeperExcludeFromTimelineKey: true}
 }
 
+func chatMemberMapFromList(members []bridgev2.ChatMember) bridgev2.ChatMemberMap {
+	memberMap := make(bridgev2.ChatMemberMap, len(members))
+	for _, member := range members {
+		memberMap.Set(member)
+	}
+	return memberMap
+}
+
 func (lc *LineClient) selfChatMember() bridgev2.ChatMember {
 	return bridgev2.ChatMember{
 		EventSender: bridgev2.EventSender{
@@ -881,29 +889,24 @@ func (lc *LineClient) stripRemoteMembersFromInitialChatInfo(info *bridgev2.ChatI
 	}
 
 	members := info.Members
+	filteredMemberMap := make(bridgev2.ChatMemberMap)
+	for userID, member := range members.MemberMap {
+		if lc.isOwnChatMember(member) {
+			filteredMemberMap[userID] = member
+		}
+	}
+	if len(filteredMemberMap) == 0 {
+		filteredMemberMap.Set(lc.selfChatMember())
+	}
+
 	filtered := &bridgev2.ChatMemberList{
 		IsFull:                     false,
 		CheckAllLogins:             members.CheckAllLogins,
 		ExcludeChangesFromTimeline: members.ExcludeChangesFromTimeline,
 		TotalMemberCount:           members.TotalMemberCount,
 		OtherUserID:                members.OtherUserID,
+		MemberMap:                  filteredMemberMap,
 		PowerLevels:                members.PowerLevels,
-	}
-	for _, member := range members.Members {
-		if lc.isOwnChatMember(member) {
-			filtered.Members = append(filtered.Members, member)
-		}
-	}
-	if members.MemberMap != nil {
-		filtered.MemberMap = make(bridgev2.ChatMemberMap, len(members.MemberMap))
-		for userID, member := range members.MemberMap {
-			if lc.isOwnChatMember(member) {
-				filtered.MemberMap[userID] = member
-			}
-		}
-	}
-	if len(filtered.Members) == 0 && len(filtered.MemberMap) == 0 {
-		filtered.Members = append(filtered.Members, lc.selfChatMember())
 	}
 	info.Members = filtered
 }
