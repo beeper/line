@@ -316,8 +316,9 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	// Try by LINE user ID first
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
 	if lowerQuery != "" {
-		client := lc.newClient()
-		contact, err := client.FindContactByUserid(lowerQuery)
+		_, contact, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByUserid(lowerQuery)
+		})
 		if err == nil && contact != nil && contact.Mid != "" {
 			if r := lc.midToResolveIdentifier(ctx, contact.Mid); r != nil {
 				results = append(results, r)
