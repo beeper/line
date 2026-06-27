@@ -1,8 +1,9 @@
 Parse and analyze a LINE Chrome Extension network capture.
 
-## Arguments
+## Input
 
-$ARGUMENTS is the path to a net-log JSON file (default: `/tmp/line-capture/line-net-log.json`).
+Use the provided path to a net-log JSON file. If no path is provided, default to
+`/tmp/line-chrome-extension-capture/line-net-log.json`.
 
 ## What to do
 
@@ -35,7 +36,7 @@ $ARGUMENTS is the path to a net-log JSON file (default: `/tmp/line-capture/line-
 
 5. Highlight any **unimplemented** endpoints or behaviors that differ from what the bridge currently does. Cross-reference with `pkg/line/methods.go` and `pkg/connector/`.
 
-6. After presenting the analysis, ask the user if they want to clean up the capture files (`/tmp/line-capture/`). Warn that the raw net-log and parsed output contain sensitive data (auth tokens in `X-Line-Access` headers, message IDs, etc.) and should not be left on disk or committed to the repository. If the user agrees, delete the entire capture directory.
+6. After presenting the analysis, ask the user if they want to clean up the capture files (`/tmp/line-chrome-extension-capture/`). Warn that the raw net-log and parsed output contain sensitive data (auth tokens in `X-Line-Access` headers, message IDs, etc.) and should not be left on disk or committed to the repository. If the user agrees, delete the entire capture directory.
 
 ## LINE protocol context
 

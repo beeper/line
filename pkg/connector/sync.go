@@ -28,6 +28,8 @@ import (
 const (
 	prefetchMessagesConcurrency  = 4
 	unblockBackfillFallbackDelay = 10 * time.Second
+	groupPortalCreateWait        = 30 * time.Second
+	beeperExcludeFromTimelineKey = "com.beeper.exclude_from_timeline"
 )
 
 func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
@@ -281,9 +283,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	backfillMsgs := make([]*bridgev2.BackfillMessage, 0, len(msgs))
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
-		if msg.ContentType == 18 {
-			lc.cacheGroupMembersFromSystemMessage(msg)
-		}
+		lc.cacheGroupMembersFromMessage(chatMID, msg)
 		if !isBridgeableContentType(msg) {
 			continue
 		}
@@ -421,9 +421,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 	// Reverse messages to process oldest first
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
-		if msg.ContentType == 18 {
-			lc.cacheGroupMembersFromSystemMessage(msg)
-		}
+		lc.cacheGroupMembersFromMessage(chatMID, msg)
 
 		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
 		if err == nil && existing != nil {
@@ -467,6 +465,11 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 	if len(allMids) == 0 {
 		return
 	}
+	memberChatMids := make(map[string]struct{}, len(midsResp.MemberChatMids))
+	for _, mid := range midsResp.MemberChatMids {
+		memberChatMids[mid] = struct{}{}
+	}
+	var pendingPortalCreates []*bridgev2.Portal
 
 	chunkSize := 20
 	for i := 0; i < len(allMids); i += chunkSize {
@@ -490,11 +493,25 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 		for _, chat := range chatsResp.Chats {
 			portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
 
+			existingPortal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+			if err != nil {
+				lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chat.ChatMid).Msg("Failed to find existing group portal before sync")
+			}
+
 			info := lc.chatToChatInfo(ctx, &chat, true)
-			// Member chats are created lazily on their first message; invited (not-yet-joined)
-			// chats have no incoming messages, so create their portal here so the pending
-			// invite surfaces as a Request even when it was outstanding before this sync.
+			// Existing member groups must have their Matrix portal before prefetch/SSE can
+			// deliver messages. If the first message creates the portal, bridgev2 has to
+			// join the sender ghost on demand and Beeper shows that old membership as a
+			// fresh "joined the chat" event. Invited (not-yet-joined) chats are also
+			// created so the pending invite surfaces as a Request.
 			createPortal := info.MessageRequest != nil && *info.MessageRequest
+			_, isMemberChat := memberChatMids[chat.ChatMid]
+			if isMemberChat {
+				createPortal = true
+			}
+			if createPortal && isMemberChat && (existingPortal == nil || existingPortal.MXID == "") {
+				lc.stripRemoteMembersFromInitialChatInfo(info)
+			}
 			lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
 				EventMeta: simplevent.EventMeta{
 					Type:         bridgev2.RemoteEventChatResync,
@@ -504,6 +521,36 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 				},
 				ChatInfo: info,
 			})
+			if createPortal {
+				portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+				if err != nil {
+					lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chat.ChatMid).Msg("Failed to find group portal after queueing create")
+				} else if portal != nil && portal.MXID == "" {
+					pendingPortalCreates = append(pendingPortalCreates, portal)
+				}
+			}
+		}
+	}
+
+	lc.waitForGroupPortalCreates(ctx, pendingPortalCreates)
+}
+
+func (lc *LineClient) waitForGroupPortalCreates(ctx context.Context, portals []*bridgev2.Portal) {
+	if len(portals) == 0 {
+		return
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, groupPortalCreateWait)
+	defer cancel()
+	for _, portal := range portals {
+		if portal == nil || portal.MXID != "" || portal.RoomCreated.IsSet() {
+			continue
+		}
+		if err := portal.RoomCreated.Wait(waitCtx); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().
+				Err(err).
+				Object("portal_key", portal.PortalKey).
+				Msg("Timed out waiting for startup group portal creation")
+			return
 		}
 	}
 }
@@ -551,7 +598,8 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
-				Membership: event.MembershipJoin,
+				Membership:       event.MembershipJoin,
+				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
 		}
 		for m := range chat.Extra.GroupExtra.InviteeMids {
@@ -567,7 +615,8 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
-				Membership: membership,
+				Membership:       membership,
+				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
 		}
 		if len(allMemberMids) == 0 {
@@ -581,7 +630,8 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 					EventSender: bridgev2.EventSender{
 						Sender: makeUserID(m),
 					},
-					Membership: event.MembershipJoin,
+					Membership:       event.MembershipJoin,
+					MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 				})
 			}
 		}
@@ -624,7 +674,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		Avatar: lc.avatarFromPicturePath(chat.PicturePath),
 		Members: &bridgev2.ChatMemberList{
 			IsFull:                     true,
-			Members:                    members,
+			MemberMap:                  chatMemberMapFromList(members),
 			ExcludeChangesFromTimeline: excludeFromTimeline,
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
@@ -708,34 +758,34 @@ func (lc *LineClient) cacheGroupMembersFromSystemMessage(msg *line.Message) {
 	}
 	locKey := msg.ContentMetadata["LOC_KEY"]
 	switch locKey {
-	case "C_GI", "C_MI", "A_MI", "A_MC":
-	default:
+	case "C_GI", "C_MI", "A_MI":
+		lc.addGroupMembersToCache(chatMid, midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"])...)
+	case "A_MC":
+		lc.addGroupMembersToCache(chatMid, append(midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"]), msg.From)...)
+	case "C_MJ", "A_MJ":
+		lc.addGroupMembersToCache(chatMid, msg.From)
+	case "C_ML", "A_ML", "C_MR", "A_MR":
+		lc.removeGroupMemberFromCache(chatMid, msg.From)
+	case "C_IC":
+		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+		if len(parts) == 2 {
+			lc.removeGroupMemberFromCache(chatMid, parts[1])
+		}
+	}
+}
+
+func (lc *LineClient) cacheGroupMembersFromMessage(chatMid string, msg *line.Message) {
+	if msg == nil || !isChatMID(chatMid) {
 		return
 	}
-
-	seen := map[string]struct{}{
-		lc.Mid: {},
-	}
-	for _, mid := range lc.getCachedGroupMembers(chatMid) {
-		seen[mid] = struct{}{}
-	}
-	for _, mid := range midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"]) {
-		seen[mid] = struct{}{}
-	}
-	if len(seen) <= 1 {
+	if msg.ContentType == 18 {
+		lc.cacheGroupMembersFromSystemMessage(msg)
 		return
 	}
-
-	members := make([]string, 0, len(seen))
-	for mid := range seen {
-		members = append(members, mid)
+	if !isBridgeableContentType(msg) {
+		return
 	}
-	lc.cacheMu.Lock()
-	if lc.groupMemberCache == nil {
-		lc.groupMemberCache = make(map[string][]string)
-	}
-	lc.groupMemberCache[chatMid] = members
-	lc.cacheMu.Unlock()
+	lc.addGroupMembersToCache(chatMid, msg.From)
 }
 
 func (lc *LineClient) cacheGroupMembersFromRecentMessages(ctx context.Context, chatMid string) {
@@ -755,10 +805,7 @@ func (lc *LineClient) cacheGroupMembersFromRecentMessages(ctx context.Context, c
 		return
 	}
 	for i := len(msgs) - 1; i >= 0; i-- {
-		msg := msgs[i]
-		if msg.ContentType == 18 {
-			lc.cacheGroupMembersFromSystemMessage(msg)
-		}
+		lc.cacheGroupMembersFromMessage(chatMid, msgs[i])
 	}
 }
 
@@ -785,6 +832,189 @@ func isChatMID(mid string) bool {
 	}
 	lower := strings.ToLower(mid)
 	return strings.HasPrefix(lower, "c") || strings.HasPrefix(lower, "r")
+}
+
+func (lc *LineClient) isOwnMID(mid string) bool {
+	if mid == "" {
+		return false
+	}
+	if mid == lc.Mid {
+		return true
+	}
+	if lc.UserLogin != nil && mid == string(lc.UserLogin.ID) {
+		return true
+	}
+	return false
+}
+
+func hiddenMemberEventExtra(exclude bool) map[string]any {
+	if !exclude {
+		return nil
+	}
+	return map[string]any{beeperExcludeFromTimelineKey: true}
+}
+
+func chatMemberMapFromList(members []bridgev2.ChatMember) bridgev2.ChatMemberMap {
+	memberMap := make(bridgev2.ChatMemberMap, len(members))
+	for _, member := range members {
+		memberMap.Set(member)
+	}
+	return memberMap
+}
+
+func (lc *LineClient) selfChatMember() bridgev2.ChatMember {
+	return bridgev2.ChatMember{
+		EventSender: bridgev2.EventSender{
+			IsFromMe: true,
+			Sender:   networkid.UserID(lc.UserLogin.ID),
+		},
+		Membership: event.MembershipJoin,
+		PowerLevel: ptr.Ptr(0),
+	}
+}
+
+func (lc *LineClient) isOwnChatMember(member bridgev2.ChatMember) bool {
+	if member.IsFromMe {
+		return true
+	}
+	if lc.UserLogin != nil && member.SenderLogin == lc.UserLogin.ID {
+		return true
+	}
+	return lc.isOwnMID(string(member.Sender))
+}
+
+func (lc *LineClient) stripRemoteMembersFromInitialChatInfo(info *bridgev2.ChatInfo) {
+	if info == nil || info.Members == nil {
+		return
+	}
+
+	members := info.Members
+	filteredMemberMap := make(bridgev2.ChatMemberMap)
+	for userID, member := range members.MemberMap {
+		if lc.isOwnChatMember(member) {
+			filteredMemberMap[userID] = member
+		}
+	}
+	if len(filteredMemberMap) == 0 {
+		filteredMemberMap.Set(lc.selfChatMember())
+	}
+
+	filtered := &bridgev2.ChatMemberList{
+		IsFull:                     false,
+		CheckAllLogins:             members.CheckAllLogins,
+		ExcludeChangesFromTimeline: members.ExcludeChangesFromTimeline,
+		TotalMemberCount:           members.TotalMemberCount,
+		OtherUserID:                members.OtherUserID,
+		MemberMap:                  filteredMemberMap,
+		PowerLevels:                members.PowerLevels,
+	}
+	info.Members = filtered
+}
+
+func (lc *LineClient) addGroupMembersToCache(chatMid string, mids ...string) bool {
+	if !isChatMID(chatMid) {
+		return false
+	}
+
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+
+	if lc.groupMemberCache == nil {
+		lc.groupMemberCache = make(map[string][]string)
+	}
+
+	seen := make(map[string]struct{}, len(lc.groupMemberCache[chatMid])+len(mids)+1)
+	members := make([]string, 0, len(lc.groupMemberCache[chatMid])+len(mids)+1)
+	appendMID := func(mid string) bool {
+		if !isUserMID(mid) {
+			return false
+		}
+		if _, ok := seen[mid]; ok {
+			return false
+		}
+		seen[mid] = struct{}{}
+		members = append(members, mid)
+		return true
+	}
+
+	appendMID(lc.Mid)
+	if lc.UserLogin != nil {
+		appendMID(string(lc.UserLogin.ID))
+	}
+	for _, mid := range lc.groupMemberCache[chatMid] {
+		appendMID(mid)
+	}
+
+	added := false
+	for _, mid := range mids {
+		if appendMID(mid) {
+			added = true
+		}
+	}
+	if len(members) > 0 {
+		lc.groupMemberCache[chatMid] = members
+	}
+	return added
+}
+
+func (lc *LineClient) removeGroupMemberFromCache(chatMid, mid string) bool {
+	if !isChatMID(chatMid) || !isUserMID(mid) {
+		return false
+	}
+
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+
+	members := lc.groupMemberCache[chatMid]
+	if len(members) == 0 {
+		return false
+	}
+
+	changed := false
+	next := members[:0]
+	for _, member := range members {
+		if member == mid {
+			changed = true
+			continue
+		}
+		next = append(next, member)
+	}
+	if changed {
+		lc.groupMemberCache[chatMid] = append([]string(nil), next...)
+	}
+	return changed
+}
+
+func (lc *LineClient) ensureGroupMessageSenderKnown(chatMid, senderMid string, ts time.Time) {
+	if !isChatMID(chatMid) || !isUserMID(senderMid) || lc.isOwnMID(senderMid) {
+		return
+	}
+	if !lc.addGroupMembersToCache(chatMid, senderMid) {
+		return
+	}
+	lc.emitMemberChange(chatMid, senderMid, event.MembershipJoin, ts, true)
+}
+
+func (lc *LineClient) hiddenJoinGroupMessageSender(ctx context.Context, portal *bridgev2.Portal, chatMid, senderMid string, ts time.Time) {
+	if !isChatMID(chatMid) || !isUserMID(senderMid) || lc.isOwnMID(senderMid) {
+		return
+	}
+	lc.addGroupMembersToCache(chatMid, senderMid)
+	if portal == nil || portal.MXID == "" {
+		return
+	}
+	portal.ProcessChatInfoChange(ctx, bridgev2.EventSender{}, lc.UserLogin, &bridgev2.ChatInfoChange{
+		MemberChanges: &bridgev2.ChatMemberList{
+			ExcludeChangesFromTimeline: true,
+			Members: []bridgev2.ChatMember{
+				{
+					EventSender:      bridgev2.EventSender{Sender: makeUserID(senderMid)},
+					Membership:       event.MembershipJoin,
+					MemberEventExtra: hiddenMemberEventExtra(true),
+				},
+			},
+		},
+	}, ts)
 }
 
 func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
@@ -1500,7 +1730,8 @@ func (lc *LineClient) checkChatMembership(ctx context.Context, chatMid string) (
 	return false, false
 }
 
-func (lc *LineClient) emitMemberChange(chatMid, userMid string, membership event.Membership, ts time.Time) {
+func (lc *LineClient) emitMemberChange(chatMid, userMid string, membership event.Membership, ts time.Time, excludeFromTimeline ...bool) {
+	exclude := len(excludeFromTimeline) > 0 && excludeFromTimeline[0]
 	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
 	sender := bridgev2.EventSender{Sender: networkid.UserID(userMid)}
 	if userMid == string(lc.UserLogin.ID) || userMid == lc.Mid {
@@ -1514,10 +1745,12 @@ func (lc *LineClient) emitMemberChange(chatMid, userMid string, membership event
 		},
 		ChatInfoChange: &bridgev2.ChatInfoChange{
 			MemberChanges: &bridgev2.ChatMemberList{
+				ExcludeChangesFromTimeline: exclude,
 				Members: []bridgev2.ChatMember{
 					{
-						EventSender: sender,
-						Membership:  membership,
+						EventSender:      sender,
+						Membership:       membership,
+						MemberEventExtra: hiddenMemberEventExtra(exclude),
 					},
 				},
 			},
@@ -1526,6 +1759,9 @@ func (lc *LineClient) emitMemberChange(chatMid, userMid string, membership event
 }
 
 func (lc *LineClient) handleSelfLeave(chatMid string) {
+	lc.cacheMu.Lock()
+	delete(lc.groupMemberCache, chatMid)
+	lc.cacheMu.Unlock()
 	lc.emitMemberChange(chatMid, string(lc.UserLogin.ID), event.MembershipLeave, time.Now())
 }
 
@@ -1538,6 +1774,7 @@ func (lc *LineClient) handleMemberLeave(chatMid, leaverMid string) {
 		lc.handleSelfLeave(chatMid)
 		return
 	}
+	lc.removeGroupMemberFromCache(chatMid, leaverMid)
 	lc.emitMemberChange(chatMid, leaverMid, event.MembershipLeave, time.Now())
 }
 
@@ -1546,6 +1783,7 @@ func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
 	if !strings.HasPrefix(lower, "c") && !strings.HasPrefix(lower, "r") {
 		return
 	}
+	lc.addGroupMembersToCache(chatMid, joinerMid)
 	lc.emitMemberChange(chatMid, joinerMid, event.MembershipJoin, time.Now())
 }
 
@@ -1659,9 +1897,11 @@ func (lc *LineClient) handleSystemMessage(op line.Operation) {
 	case "C_PN":
 		lc.handleGroupRename(op)
 	case "C_MJ", "A_MJ":
+		lc.addGroupMembersToCache(msg.To, msg.From)
 		lc.emitMemberChange(msg.To, msg.From, event.MembershipJoin, tsTime)
 	case "C_ML", "A_ML", "C_MR", "A_MR":
 		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("leaver_mid", msg.From).Msg("System message: member leave")
+		lc.removeGroupMemberFromCache(msg.To, msg.From)
 		lc.emitMemberChange(msg.To, msg.From, event.MembershipLeave, tsTime)
 	case "C_GI", "C_MI", "A_MI":
 		// msg.From is the inviter, not the invitee.
@@ -1697,11 +1937,13 @@ func (lc *LineClient) handleSystemMessage(op line.Operation) {
 		parts := strings.SplitN(locArgs, "\x1e", 2)
 		if len(parts) == 2 {
 			inviteeMid := parts[1]
+			lc.removeGroupMemberFromCache(msg.To, inviteeMid)
 			lc.emitMemberChange(msg.To, inviteeMid, event.MembershipLeave, tsTime)
 		}
 	case "A_MC":
 		// A_MC = Auto-join via call / member added.
 		// msg.From is the person added.
+		lc.addGroupMembersToCache(msg.To, msg.From)
 		lc.emitMemberChange(msg.To, msg.From, event.MembershipJoin, tsTime)
 	default:
 		lc.UserLogin.Bridge.Log.Debug().

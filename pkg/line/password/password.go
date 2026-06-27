@@ -1,6 +1,7 @@
 package password
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/hex"
@@ -11,7 +12,10 @@ import (
 // EncryptPassword constructs the payload and encrypts it using RSA-PKCS1v15.
 func EncryptPassword(email, password, sessionKey, nHex, eHex string) (string, error) {
 	// 1. Construct the payload: [len + val]...
-	payload := createPayload(email, password, sessionKey)
+	payload, err := createPayload(email, password, sessionKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to create password payload: %w", err)
+	}
 
 	// 2. Parse Public Key from Hex
 	pubKey, err := parseRSAPublicKey(nHex, eHex)
@@ -20,7 +24,7 @@ func EncryptPassword(email, password, sessionKey, nHex, eHex string) (string, er
 	}
 
 	// 3. Encrypt using RSA-PKCS1-v1.5
-	encryptedBytes, err := rsa.EncryptPKCS1v15(rand.Reader, pubKey, []byte(payload))
+	encryptedBytes, err := rsa.EncryptPKCS1v15(rand.Reader, pubKey, payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt payload: %w", err)
 	}
@@ -30,12 +34,16 @@ func EncryptPassword(email, password, sessionKey, nHex, eHex string) (string, er
 }
 
 // Format: [len(sessionKey) + sessionKey + len(email) + email + len(password) + password]
-func createPayload(email, password, sessionKey string) string {
-	return fmt.Sprintf("%c%s%c%s%c%s",
-		len(sessionKey), sessionKey,
-		len(email), email,
-		len(password), password,
-	)
+func createPayload(email, password, sessionKey string) ([]byte, error) {
+	var payload bytes.Buffer
+	for _, field := range []string{sessionKey, email, password} {
+		if len(field) > 255 {
+			return nil, fmt.Errorf("field is too long: %d bytes", len(field))
+		}
+		payload.WriteByte(byte(len(field)))
+		payload.WriteString(field)
+	}
+	return payload.Bytes(), nil
 }
 
 // parseRSAPublicKey converts hex modulus and exponent into *rsa.PublicKey.
