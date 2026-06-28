@@ -27,10 +27,52 @@ import (
 
 const (
 	prefetchMessagesConcurrency  = 4
+	messageBoxPageLimit          = 100
+	startupBackfillMessageLimit  = 50
 	unblockBackfillFallbackDelay = 10 * time.Second
 	groupPortalCreateWait        = 30 * time.Second
 	beeperExcludeFromTimelineKey = "com.beeper.exclude_from_timeline"
 )
+
+func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
+	client := lc.newClient()
+	res, err := client.GetMessageBoxes(opts)
+	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if errRecover := lc.recoverToken(ctx); errRecover == nil {
+			client = lc.newClient()
+			res, err = client.GetMessageBoxes(opts)
+		}
+	}
+	return res, err
+}
+
+func (lc *LineClient) fetchAllMessageBoxes(ctx context.Context, opts line.MessageBoxesOptions) ([]line.MessageBox, error) {
+	var boxes []line.MessageBox
+	seenCursors := make(map[string]struct{})
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		res, err := lc.getMessageBoxesWithRecovery(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		boxes = append(boxes, res.MessageBoxes...)
+		if !res.HasNext || len(res.MessageBoxes) == 0 {
+			return boxes, nil
+		}
+
+		nextCursor := res.MessageBoxes[len(res.MessageBoxes)-1].ID
+		if nextCursor == "" {
+			return boxes, nil
+		}
+		if _, ok := seenCursors[nextCursor]; ok {
+			return boxes, nil
+		}
+		seenCursors[nextCursor] = struct{}{}
+		opts.MinChatID = nextCursor
+	}
+}
 
 func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
 	client := lc.newClient()
@@ -116,27 +158,20 @@ func (lc *LineClient) saveBlockedContactsSnapshot(ctx context.Context) {
 func (lc *LineClient) syncDMChats(ctx context.Context) {
 	defer lc.wg.Done()
 
-	client := lc.newClient()
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
-		MessageBoxCountLimit:           100,
+		MessageBoxCountLimit:           messageBoxPageLimit,
 		WithUnreadCount:                false,
 		LastMessagesPerMessageBoxCount: 0,
 	}
 
-	res, err := client.GetMessageBoxes(opts)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			res, err = client.GetMessageBoxes(opts)
-		}
-	}
+	messageBoxes, err := lc.fetchAllMessageBoxes(ctx, opts)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch message boxes for DM sync")
 		return
 	}
 
-	for _, box := range res.MessageBoxes {
+	for _, box := range messageBoxes {
 		mid := box.ID
 		lowerMid := strings.ToLower(mid)
 		// Skip group chats — they're handled by syncChats
@@ -331,36 +366,31 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	defer lc.wg.Done()
 
-	client := lc.newClient()
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
-		MessageBoxCountLimit:           100,
+		MessageBoxCountLimit:           messageBoxPageLimit,
 		WithUnreadCount:                true,
 		LastMessagesPerMessageBoxCount: 0,
 	}
 
-	res, err := client.GetMessageBoxes(opts)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			res, err = client.GetMessageBoxes(opts)
-		}
-	}
+	messageBoxes, err := lc.fetchAllMessageBoxes(ctx, opts)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to prefetch message boxes")
 		return
 	}
+	chatMIDs := collectStartupBackfillChatMIDs(messageBoxes, lc.getKnownMemberChatMIDs(), lc.isUserBlocked)
 
 	workerCount := prefetchMessagesConcurrency
-	if len(res.MessageBoxes) < workerCount {
-		workerCount = len(res.MessageBoxes)
+	if len(chatMIDs) < workerCount {
+		workerCount = len(chatMIDs)
 	}
 	if workerCount == 0 {
 		return
 	}
 
 	lc.UserLogin.Bridge.Log.Info().
-		Int("chat_count", len(res.MessageBoxes)).
+		Int("message_box_count", len(messageBoxes)).
+		Int("chat_count", len(chatMIDs)).
 		Int("concurrency", workerCount).
 		Msg("Prefetching recent messages")
 
@@ -374,25 +404,47 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				lc.backfillRecentMessages(ctx, chatMID, 50)
+				lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit)
 			}
 		}()
 	}
 
-	for _, box := range res.MessageBoxes {
-		if lc.isUserBlocked(box.ID) {
-			continue
-		}
+	for _, chatMID := range chatMIDs {
 		select {
 		case <-ctx.Done():
 			close(jobs)
 			workers.Wait()
 			return
-		case jobs <- box.ID:
+		case jobs <- chatMID:
 		}
 	}
 	close(jobs)
 	workers.Wait()
+}
+
+func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMIDs []string, isBlocked func(string) bool) []string {
+	seen := make(map[string]struct{}, len(messageBoxes)+len(memberChatMIDs))
+	chatMIDs := make([]string, 0, len(messageBoxes)+len(memberChatMIDs))
+	add := func(mid string) {
+		if mid == "" {
+			return
+		}
+		if isBlocked != nil && isBlocked(mid) {
+			return
+		}
+		if _, ok := seen[mid]; ok {
+			return
+		}
+		seen[mid] = struct{}{}
+		chatMIDs = append(chatMIDs, mid)
+	}
+	for _, box := range messageBoxes {
+		add(box.ID)
+	}
+	for _, mid := range memberChatMIDs {
+		add(mid)
+	}
+	return chatMIDs
 }
 
 // backfillRecentMessages fetches up to limit recent messages for a single
@@ -463,8 +515,10 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 
 	allMids := append(midsResp.MemberChatMids, midsResp.InvitedChatMids...)
 	if len(allMids) == 0 {
+		lc.setKnownMemberChatMIDs(nil)
 		return
 	}
+	lc.setKnownMemberChatMIDs(midsResp.MemberChatMids)
 	memberChatMids := make(map[string]struct{}, len(midsResp.MemberChatMids))
 	for _, mid := range midsResp.MemberChatMids {
 		memberChatMids[mid] = struct{}{}
@@ -553,6 +607,28 @@ func (lc *LineClient) waitForGroupPortalCreates(ctx context.Context, portals []*
 			return
 		}
 	}
+}
+
+func (lc *LineClient) setKnownMemberChatMIDs(mids []string) {
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	lc.knownMemberChatMIDs = make(map[string]struct{}, len(mids))
+	for _, mid := range mids {
+		if isChatMID(mid) {
+			lc.knownMemberChatMIDs[mid] = struct{}{}
+		}
+	}
+}
+
+func (lc *LineClient) getKnownMemberChatMIDs() []string {
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	mids := make([]string, 0, len(lc.knownMemberChatMIDs))
+	for mid := range lc.knownMemberChatMIDs {
+		mids = append(mids, mid)
+	}
+	sort.Strings(mids)
+	return mids
 }
 
 func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, excludeFromTimeline bool) *bridgev2.ChatInfo {
