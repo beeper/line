@@ -13,6 +13,45 @@ var (
 	ErrGroupKeyNotFound      = errors.New("group key not found")
 )
 
+// IsRefreshRequired returns true when LINE reports that the access token must
+// be refreshed before the request can be retried.
+func IsRefreshRequired(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "\"code\":119") ||
+		strings.Contains(msg, "access token refresh required")
+}
+
+func IsLoggedOut(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT")
+}
+
+func IsUnauthorizedStatus(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "api error 401") ||
+		strings.Contains(msg, "api error 403") ||
+		strings.Contains(msg, "http 401") ||
+		strings.Contains(msg, "http 403") ||
+		strings.Contains(msg, "sse error: 401") ||
+		strings.Contains(msg, "sse error: 403") ||
+		strings.Contains(msg, "obs upload failed (401)") ||
+		strings.Contains(msg, "obs upload failed (403)") ||
+		strings.Contains(msg, "obs download failed (401)") ||
+		strings.Contains(msg, "obs download failed (403)")
+}
+
+func IsAuthError(err error) bool {
+	return IsRefreshRequired(err) || IsLoggedOut(err) || IsUnauthorizedStatus(err)
+}
+
 // IsNoUsableE2EEPublicKey returns true when a peer has Letter Sealing disabled
 // (negotiateE2EEPublicKey returns empty allowedTypes / specVersion -1, or no key data).
 func IsNoUsableE2EEPublicKey(err error) bool {

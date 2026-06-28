@@ -53,7 +53,6 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		client = newClient
 		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
 	}
-	_ = client
 
 	if err != nil {
 		h.Log.Warn().

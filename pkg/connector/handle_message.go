@@ -30,7 +30,7 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 		RecoverToken:      lc.recoverToken,
 		IsRefreshRequired: lc.isRefreshRequired,
 		IsLoggedOut:       lc.isLoggedOut,
-		NewClient:         func() *line.Client { return line.NewClient(lc.AccessToken) },
+		NewClient:         func() *line.Client { return lc.newClient() },
 		DecryptMedia:      lc.decryptImageData,
 	}
 }
@@ -74,6 +74,31 @@ func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID strin
 	return evt
 }
 
+type messageWithChatInfo struct {
+	*simplevent.Message[line.Message]
+	GetChatInfoFunc func(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error)
+}
+
+var _ bridgev2.RemoteChatResyncWithInfo = (*messageWithChatInfo)(nil)
+
+func (evt *messageWithChatInfo) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+	if evt.GetChatInfoFunc == nil {
+		return nil, nil
+	}
+	return evt.GetChatInfoFunc(ctx, portal)
+}
+
+func (lc *LineClient) getChatInfoForIncomingMessage(ctx context.Context, portal *bridgev2.Portal, chatMid string) (*bridgev2.ChatInfo, error) {
+	info, err := lc.GetChatInfo(ctx, portal)
+	if err != nil {
+		return nil, err
+	}
+	if isChatMID(chatMid) {
+		lc.stripRemoteMembersFromInitialChatInfo(info)
+	}
+	return info, nil
+}
+
 func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 	// Only process known content types; skip system messages (group created, member invited, etc.)
 	if !isBridgeableContentType(msg) {
@@ -87,15 +112,16 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 		return
 	}
 
-	senderID := makeUserID(msg.From)
-
 	portalIDStr := portalMIDForMessage(msg, opType)
 	portalKey := networkid.PortalKey{ID: makePortalID(portalIDStr), Receiver: lc.UserLogin.ID}
-
-	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr, opType)
 	ts := lc.parseMessageTimestamp(msg)
 
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Message[line.Message]{
+	lc.ensureGroupMessageSenderKnown(portalIDStr, msg.From, ts)
+
+	senderID := makeUserID(msg.From)
+	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr, opType)
+
+	messageEvent := &simplevent.Message[line.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventMessage,
 			LogContext:   func(c zerolog.Context) zerolog.Context { return c.Str("msg_id", msg.ID) },
@@ -103,13 +129,28 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 			CreatePortal: true,
 			Sender:       bridgev2.EventSender{Sender: senderID, IsFromMe: OperationType(opType) == OpSendMessage},
 			Timestamp:    ts,
+			PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+				lc.hiddenJoinGroupMessageSender(ctx, portal, portalIDStr, msg.From, ts)
+			},
 		},
 		Data: *msg,
 		ID:   networkid.MessageID(msg.ID),
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message) (*bridgev2.ConvertedMessage, error) {
 			return lc.convertLineMessage(ctx, portal, intent, data, bodyText, unwrappedText)
 		},
-	})
+	}
+
+	var remoteEvent bridgev2.RemoteEvent = messageEvent
+	if isChatMID(portalIDStr) {
+		remoteEvent = &messageWithChatInfo{
+			Message: messageEvent,
+			GetChatInfoFunc: func(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+				return lc.getChatInfoForIncomingMessage(ctx, portal, portalIDStr)
+			},
+		}
+	}
+
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, remoteEvent)
 }
 
 // isBridgeableContentType reports whether an inbound LINE message should be

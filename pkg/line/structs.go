@@ -273,11 +273,12 @@ type AcquireEncryptedAccessTokenResponse struct {
 }
 
 type MessageBoxesOptions struct {
-	ActiveOnly                     bool `json:"activeOnly"`
-	UnreadOnly                     bool `json:"unreadOnly"`
-	MessageBoxCountLimit           int  `json:"messageBoxCountLimit"`
-	WithUnreadCount                bool `json:"withUnreadCount"`
-	LastMessagesPerMessageBoxCount int  `json:"lastMessagesPerMessageBoxCount"`
+	MinChatID                      string `json:"minChatId,omitempty"`
+	ActiveOnly                     bool   `json:"activeOnly"`
+	UnreadOnly                     bool   `json:"unreadOnly"`
+	MessageBoxCountLimit           int    `json:"messageBoxCountLimit"`
+	WithUnreadCount                bool   `json:"withUnreadCount"`
+	LastMessagesPerMessageBoxCount int    `json:"lastMessagesPerMessageBoxCount"`
 }
 
 type MessageBoxesResponse struct {
