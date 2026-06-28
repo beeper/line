@@ -30,15 +30,20 @@ const (
 	obsMaxRetries    = 5
 )
 
+const OBSOriginalMediaMaxRetries = 60
+
 type Client struct {
 	HTTPClient  *http.Client
 	OBSClient   *http.Client
 	AccessToken string
+
+	obsRetryDelay time.Duration
 }
 
 type OBSDownloadOptions struct {
-	TID    string
-	OBSPop string
+	TID                  string
+	OBSPop               string
+	MaxProcessingRetries int
 }
 
 func NewClient(token string) *Client {
@@ -57,6 +62,20 @@ func (c *Client) obsHTTPClient() *http.Client {
 		return c.HTTPClient
 	}
 	return &http.Client{}
+}
+
+func (c *Client) obsProcessingRetryDelay() time.Duration {
+	if c.obsRetryDelay > 0 {
+		return c.obsRetryDelay
+	}
+	return obsRetryDelay
+}
+
+func obsProcessingMaxRetries(opts OBSDownloadOptions) int {
+	if opts.MaxProcessingRetries > 0 {
+		return opts.MaxProcessingRetries
+	}
+	return obsMaxRetries
 }
 
 func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
@@ -701,7 +720,9 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 	}
 
 	// Retry loop for 202/404 (media still processing, e.g. video transcoding).
-	for attempt := 0; attempt <= obsMaxRetries; attempt++ {
+	retryDelay := c.obsProcessingRetryDelay()
+	maxRetries := obsProcessingMaxRetries(opts)
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, "GET", obsURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create OBS download request: %w", err)
@@ -725,11 +746,11 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 
 		if resp.StatusCode == 202 || resp.StatusCode == 404 {
 			resp.Body.Close()
-			if attempt >= obsMaxRetries {
-				return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", obsMaxRetries)
+			if attempt >= maxRetries {
+				return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", maxRetries)
 			}
 			select {
-			case <-time.After(obsRetryDelay):
+			case <-time.After(retryDelay):
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
@@ -751,7 +772,7 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 		return data, nil
 	}
 
-	return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", obsMaxRetries)
+	return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", maxRetries)
 }
 
 // this builds x-talk-meta
