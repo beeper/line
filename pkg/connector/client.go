@@ -35,7 +35,7 @@ type LineClient struct {
 	recoverTime time.Time
 
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
-	// noE2EEGroups, groupMemberCache, and generatedGroupNameCache.
+	// noE2EEGroups, groupMemberCache, generatedGroupNameCache, and knownMemberChatMIDs.
 	// Hold it only around map accesses; never across network calls.
 	cacheMu                 sync.Mutex
 	blockedUsers            map[string]bool      // mid -> true if the user has blocked this contact in LINE
@@ -44,6 +44,7 @@ type LineClient struct {
 	mediaFlowCache          map[string]cachedMediaFlow
 	groupMemberCache        map[string][]string // chatMid -> list of member MIDs from CreateGroup or getChatMemberMIDs
 	generatedGroupNameCache map[string]bool     // chatMid -> true when Matrix name should be generated from member names
+	knownMemberChatMIDs     map[string]struct{} // chatMid -> current member chats returned by getAllChatMids
 	reactionIconMXC         map[int]string      // predefinedReactionType -> cached MXC URI
 	recentReactions         sync.Map            // "msgID\x00emoji" -> struct{} to dedup concurrent 139/140 events
 
@@ -256,6 +257,9 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	}
 	if lc.groupMemberCache == nil {
 		lc.groupMemberCache = make(map[string][]string)
+	}
+	if lc.knownMemberChatMIDs == nil {
+		lc.knownMemberChatMIDs = make(map[string]struct{})
 	}
 	lc.cacheMu.Unlock()
 	lc.reqSeqMu.Lock()
