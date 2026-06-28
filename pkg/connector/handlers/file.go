@@ -37,6 +37,12 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+
+	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
+		client = newClient
+		fileData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+	}
+
 	if err != nil {
 		h.Log.Warn().
 			Err(err).

@@ -24,8 +24,5 @@
 # Executables
 *.exe
 
-# Internal Test files
-*_test.go
-
 # internal tools
 /tools

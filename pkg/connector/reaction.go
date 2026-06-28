@@ -365,9 +365,11 @@ func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Ma
 		return nil, err
 	}
 
-	client := line.NewClient(lc.AccessToken)
 	reqSeq := lc.nextReqSeq()
-	if err = client.React(int64(reqSeq), targetID, ref.reactionType()); err != nil {
+	_, err = lc.callLine(ctx, func(client *line.Client) error {
+		return client.React(int64(reqSeq), targetID, ref.reactionType())
+	})
+	if err != nil {
 		if line.IsInvalidPaidReactionType(err) {
 			return nil, unsupportedMatrixReactionError(key)
 		}
@@ -391,9 +393,10 @@ func (lc *LineClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridg
 	if err != nil {
 		return err
 	}
-	client := line.NewClient(lc.AccessToken)
 	reqSeq := lc.nextReqSeq()
-	err = client.CancelReaction(int64(reqSeq), targetID)
+	_, err = lc.callLine(ctx, func(client *line.Client) error {
+		return client.CancelReaction(int64(reqSeq), targetID)
+	})
 	if line.IsNotAMemberError(err) {
 		return reactionNotAMemberError()
 	}

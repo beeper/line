@@ -37,8 +37,10 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 		return nil
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	return client.SendChatChecked(string(read.Portal.ID), targetID)
+	_, err := lc.callLine(ctx, func(client *line.Client) error {
+		return client.SendChatChecked(string(read.Portal.ID), targetID)
+	})
+	return err
 }
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
@@ -140,11 +142,11 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	mid := string(portal.ID)
 	lowerMid := strings.ToLower(mid)
 	if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
-		client := line.NewClient(lc.AccessToken)
+		client := lc.newClient()
 		res, err := client.GetChats([]string{mid}, true, true)
 		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newClient()
 				res, err = client.GetChats([]string{mid}, true, true)
 			}
 		}
@@ -207,11 +209,11 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 
 	// Use GetProfile for our own user data
 	if mid == lc.Mid || mid == string(lc.UserLogin.ID) {
-		client := line.NewClient(lc.AccessToken)
+		client := lc.newClient()
 		profile, err := client.GetProfile()
 		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newClient()
 				profile, err = client.GetProfile()
 			}
 		}
@@ -223,11 +225,11 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 		return line.Contact{Mid: mid, DisplayName: mid}
 	}
 
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	res, err := client.GetContactsV2([]string{mid})
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			res, err = client.GetContactsV2([]string{mid})
 		}
 	}
@@ -243,7 +245,7 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 	buddy, err := client.GetBuddyProfile(mid)
 	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
+			client = lc.newClient()
 			buddy, err = client.GetBuddyProfile(mid)
 		}
 	}
@@ -314,8 +316,9 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	// Try by LINE user ID first
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
 	if lowerQuery != "" {
-		client := line.NewClient(lc.AccessToken)
-		contact, err := client.FindContactByUserid(lowerQuery)
+		_, contact, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByUserid(lowerQuery)
+		})
 		if err == nil && contact != nil && contact.Mid != "" {
 			if r := lc.midToResolveIdentifier(ctx, contact.Mid); r != nil {
 				results = append(results, r)
@@ -327,12 +330,12 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	}
 
 	// Search contacts by display name
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	allMids, err := client.GetAllContactIds()
 	if err != nil {
 		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newClient()
 				allMids, err = client.GetAllContactIds()
 			}
 		}
@@ -373,12 +376,12 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 var _ bridgev2.UserSearchingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveIdentifierResponse, error) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 	allMids, err := client.GetAllContactIds()
 	if err != nil {
 		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
+				client = lc.newClient()
 				allMids, err = client.GetAllContactIds()
 			}
 		}
