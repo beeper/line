@@ -14,6 +14,8 @@ import (
 
 var (
 	errAuthRequired = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":119,"reason":"Access token refresh required"}}`)
+	errLoggedOut    = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":8,"reason":"V3_TOKEN_CLIENT_LOGGED_OUT"}}`)
+	errSenderKey    = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":83,"reason":"invalid sender key"}}`)
 	errNotMember    = errors.New(`API error 400: {"code":10051,"data":{"name":"TalkException","code":10,"reason":"not a member"}}`)
 	errNetwork      = errors.New("request failed: dial tcp: i/o timeout")
 )
@@ -187,11 +189,22 @@ func TestCallLineWithRecoveryUsesProvidedClientWithoutRecreating(t *testing.T) {
 	}
 }
 
-func TestLineClientIsTokenErrorExcludesE2EEErrors(t *testing.T) {
+func TestLineClientIsTokenErrorExcludesNonRecoverableErrors(t *testing.T) {
 	lc := &LineClient{}
 	if !lc.isTokenError(errAuthRequired) {
 		t.Fatal("expected auth-required error to be classified as token error")
 	}
+	if lc.isTokenError(errLoggedOut) {
+		t.Fatal("logged-out sessions must not trigger token recovery")
+	}
+	if lc.isTokenError(errSenderKey) {
+		t.Fatal("invalid sender key sessions must not trigger token recovery")
+	}
+	lc.sessionInvalidated = true
+	if lc.isTokenError(errAuthRequired) {
+		t.Fatal("invalidated sessions must not trigger token recovery")
+	}
+	lc.sessionInvalidated = false
 	if lc.isTokenError(line.ErrNoUsableE2EEGroupKey) {
 		t.Fatal("E2EE group key errors must not trigger token recovery")
 	}
@@ -210,6 +223,22 @@ func TestRunTokenRecoverySkipsRecentRecovery(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("recovery calls = %d, want 0", calls)
+	}
+}
+
+func TestRunTokenRecoveryRejectsInvalidatedSessionBeforeRecentRecovery(t *testing.T) {
+	lc := &LineClient{recoverTime: time.Now(), sessionInvalidated: true}
+	var calls int
+
+	err := lc.runTokenRecovery(context.Background(), func(context.Context) error {
+		calls++
+		return nil
+	})
+	if !errors.Is(err, errLineSessionInvalidated) {
+		t.Fatalf("err = %v, want errLineSessionInvalidated", err)
 	}
 	if calls != 0 {
 		t.Fatalf("recovery calls = %d, want 0", calls)

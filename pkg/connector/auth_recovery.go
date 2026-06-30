@@ -37,6 +37,12 @@ func (lc *LineClient) isTokenError(err error) bool {
 	if line.IsNoUsableE2EEGroupKey(err) || line.IsNoUsableE2EEPublicKey(err) {
 		return false
 	}
+	if lc.isSessionInvalidated() {
+		return false
+	}
+	if line.IsLoggedOut(err) {
+		return false
+	}
 	return line.IsAuthError(err)
 }
 
@@ -53,6 +59,9 @@ func (lc *LineClient) callLineUsing(ctx context.Context, client *line.Client, ca
 			return struct{}{}, call(client)
 		},
 	})
+	if lc.isLoggedOut(err) {
+		lc.markLoggedOutByOtherClient(ctx, err)
+	}
 	return client, err
 }
 
@@ -61,10 +70,14 @@ func callLineResult[T any](lc *LineClient, ctx context.Context, call func(*line.
 }
 
 func callLineResultUsing[T any](lc *LineClient, ctx context.Context, client *line.Client, call func(*line.Client) (T, error)) (*line.Client, T, error) {
-	return callLineWithRecovery(ctx, client, lineCallDeps[T]{
+	client, res, err := callLineWithRecovery(ctx, client, lineCallDeps[T]{
 		newClient:   func() *line.Client { return lc.newClient() },
 		recover:     lc.recoverToken,
 		isAuthError: lc.isTokenError,
 		call:        call,
 	})
+	if lc.isLoggedOut(err) {
+		lc.markLoggedOutByOtherClient(ctx, err)
+	}
+	return client, res, err
 }

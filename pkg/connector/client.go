@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -16,6 +17,18 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
+
+var errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
+
+var newLineAPIClient = line.NewClient
+
+var loginWithCredentials = func(email, password, certificate string) (*line.LoginResult, error) {
+	return newLineAPIClient("").Login(email, password, certificate)
+}
+
+var getProfileWithToken = func(token string) (*line.Profile, error) {
+	return newLineAPIClient(token).GetProfile()
+}
 
 type LineClient struct {
 	UserLogin    *bridgev2.UserLogin
@@ -33,6 +46,10 @@ type LineClient struct {
 	tokenMu     sync.RWMutex
 	recoverMu   sync.Mutex
 	recoverTime time.Time
+	// sessionInvalidated is set when LINE forcefully logs out this Chrome-style
+	// session. It prevents background calls from re-logging in before the user
+	// clicks Reconnect.
+	sessionInvalidated bool
 
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
 	// noE2EEGroups, groupMemberCache, generatedGroupNameCache, and knownMemberChatMIDs.
@@ -90,18 +107,34 @@ func (lc *LineClient) setTokens(accessToken, refreshToken string) (string, strin
 	lc.tokenMu.Lock()
 	defer lc.tokenMu.Unlock()
 	lc.AccessToken = accessToken
+	if accessToken != "" {
+		lc.sessionInvalidated = false
+	}
 	if refreshToken != "" {
 		lc.RefreshToken = refreshToken
 	}
 	return lc.AccessToken, lc.RefreshToken
 }
 
+func (lc *LineClient) invalidateAccessToken() {
+	lc.tokenMu.Lock()
+	lc.AccessToken = ""
+	lc.sessionInvalidated = true
+	lc.tokenMu.Unlock()
+}
+
 func (lc *LineClient) hasAccessToken() bool {
 	return lc.getAccessToken() != ""
 }
 
+func (lc *LineClient) isSessionInvalidated() bool {
+	lc.tokenMu.RLock()
+	defer lc.tokenMu.RUnlock()
+	return lc.sessionInvalidated
+}
+
 func (lc *LineClient) newClient() *line.Client {
-	return line.NewClient(lc.getAccessToken())
+	return newLineAPIClient(lc.getAccessToken())
 }
 
 func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
@@ -183,7 +216,7 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 		return fmt.Errorf("no refresh token available")
 	}
 
-	client := line.NewClient(accessToken)
+	client := newLineAPIClient(accessToken)
 	res, err := client.RefreshAccessToken(refreshToken)
 	if err != nil {
 		return fmt.Errorf("failed to refresh token: %w", err)
@@ -198,6 +231,7 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	meta := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	meta.AccessToken = accessToken
 	meta.RefreshToken = refreshToken
+	meta.SessionInvalidated = false
 	err = lc.UserLogin.Save(ctx)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save refreshed tokens to DB")
@@ -216,6 +250,58 @@ func (lc *LineClient) isLoggedOut(err error) bool {
 	return line.IsLoggedOut(err)
 }
 
+func (lc *LineClient) shouldAttemptTokenRecovery(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if lc.isSessionInvalidated() {
+		return false
+	}
+	if lc.isLoggedOut(err) {
+		lc.markLoggedOutByOtherClient(ctx, err)
+		return false
+	}
+	return lc.isRefreshRequired(err) || line.IsUnauthorizedStatus(err)
+}
+
+func (lc *LineClient) markLoggedOutByOtherClient(ctx context.Context, err error) {
+	if lc.UserLogin == nil {
+		lc.invalidateAccessToken()
+		line.InvalidateOBSTokenCache()
+		return
+	}
+	if lc.UserLogin.Client != nil && lc.UserLogin.Client != lc {
+		if lc.UserLogin.Bridge != nil {
+			lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Ignoring forced logout from stale LINE client")
+		}
+		return
+	}
+	lc.invalidateAccessToken()
+	line.InvalidateOBSTokenCache()
+	lc.saveSessionInvalidated(ctx)
+	if lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated by another client; marking login bad credentials")
+	}
+	lc.UserLogin.BridgeState.Send(status.BridgeState{
+		StateEvent: status.StateBadCredentials,
+		Error:      "line-logged-out",
+		Message:    "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE.",
+		UserAction: status.UserActionRelogin,
+	})
+}
+
+func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return
+	}
+	meta.AccessToken = ""
+	meta.SessionInvalidated = true
+	if err := lc.UserLogin.Save(ctx); err != nil && lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save LINE session invalidation")
+	}
+}
+
 // recoverToken attempts to restore a valid session by refreshing, then re-logging in.
 // Returns nil on success. On failure the caller should send StateBadCredentials.
 func (lc *LineClient) recoverToken(ctx context.Context) error {
@@ -232,6 +318,10 @@ func (lc *LineClient) recoverToken(ctx context.Context) error {
 func (lc *LineClient) runTokenRecovery(ctx context.Context, recover func(context.Context) error) error {
 	lc.recoverMu.Lock()
 	defer lc.recoverMu.Unlock()
+
+	if lc.isSessionInvalidated() {
+		return errLineSessionInvalidated
+	}
 
 	if !lc.recoverTime.IsZero() && time.Since(lc.recoverTime) < recentTokenRecoveryWindow {
 		return nil
@@ -274,6 +364,10 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		}
 	}
 	if !lc.hasAccessToken() {
+		if lc.isSessionInvalidated() {
+			lc.markLoggedOutByOtherClient(ctx, errLineSessionInvalidated)
+			return
+		}
 		if err := lc.tryLogin(ctx); err != nil {
 			lc.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
@@ -287,6 +381,10 @@ func (lc *LineClient) Connect(ctx context.Context) {
 
 	// Verify the token is still valid before proceeding
 	if err := lc.ensureValidToken(ctx); err != nil {
+		if lc.isLoggedOut(err) {
+			lc.markLoggedOutByOtherClient(ctx, err)
+			return
+		}
 		lc.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      "line-token-expired",
@@ -377,8 +475,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		Str("email", email).
 		Bool("has_certificate", certificate != "").
 		Msg("Attempting to login with email/password...")
-	client := line.NewClient("")
-	res, err := client.Login(email, password, certificate)
+	res, err := loginWithCredentials(email, password, certificate)
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)
 	}
@@ -406,7 +503,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		}
 
 		lc.UserLogin.Bridge.Log.Info().Msg("Waiting for PIN verification on mobile device...")
-		waitClient := line.NewClient("")
+		waitClient := newLineAPIClient("")
 		waitRes, err := waitClient.WaitForLogin(res.Verifier, res.NoE2EE)
 		if err != nil {
 			return fmt.Errorf("PIN verification failed: %w", err)
@@ -416,9 +513,8 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		}
 		// Replace res with the verified result
 		res = waitRes
-		client = waitClient
 	}
-	accessToken := client.AccessToken
+	accessToken := res.AuthToken
 	refreshToken := ""
 	if res.TokenV3IssueResult != nil {
 		if res.TokenV3IssueResult.AccessToken != "" {
@@ -445,6 +541,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
 		meta.AccessToken = accessToken
 		meta.RefreshToken = refreshToken
+		meta.SessionInvalidated = false
 		if res.Certificate != "" {
 			meta.Certificate = res.Certificate
 		}
@@ -458,15 +555,13 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 }
 
 func (lc *LineClient) ensureValidToken(ctx context.Context) error {
-	client := lc.newClient()
-	_, err := client.GetProfile()
+	_, err := getProfileWithToken(lc.getAccessToken())
 	if err == nil {
 		return nil
 	}
 
 	if lc.isLoggedOut(err) {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Session invalidated (logged out by another client), attempting recovery...")
-		return lc.recoverToken(ctx)
+		return err
 	}
 
 	if !lc.isRefreshRequired(err) {

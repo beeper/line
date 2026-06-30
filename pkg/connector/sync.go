@@ -37,7 +37,7 @@ const (
 func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
 	client := lc.newClient()
 	res, err := client.GetMessageBoxes(opts)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			res, err = client.GetMessageBoxes(opts)
@@ -77,7 +77,7 @@ func (lc *LineClient) fetchAllMessageBoxes(ctx context.Context, opts line.Messag
 func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
 	client := lc.newClient()
 	blockedMIDs, err := client.GetBlockedContactIds()
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			blockedMIDs, err = client.GetBlockedContactIds()
@@ -304,7 +304,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 
 	client := lc.newClient()
 	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
@@ -458,7 +458,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 	start := time.Now()
 	client := lc.newClient()
 	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
@@ -502,7 +502,7 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 
 	client := lc.newClient()
 	midsResp, err := client.GetAllChatMids(true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			midsResp, err = client.GetAllChatMids(true, true)
@@ -533,7 +533,7 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 		}
 		batch := allMids[i:end]
 		chatsResp, err := client.GetChats(batch, true, true)
-		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				chatsResp, err = client.GetChats(batch, true, true)
@@ -870,7 +870,7 @@ func (lc *LineClient) cacheGroupMembersFromRecentMessages(ctx context.Context, c
 	}
 	client := lc.newClient()
 	msgs, err := client.GetRecentMessagesV2(chatMid, 50)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			msgs, err = client.GetRecentMessagesV2(chatMid, 50)
@@ -1151,7 +1151,11 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
 	rev, err := client.GetLastOpRevision()
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.isLoggedOut(err) {
+		lc.markLoggedOutByOtherClient(ctx, err)
+		return
+	}
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			rev, err = client.GetLastOpRevision()
@@ -1227,11 +1231,16 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			if err.Error() != "EOF" {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
 
-				isAuthErr := strings.Contains(err.Error(), "SSE error: 401") ||
-					strings.Contains(err.Error(), "SSE error: 403") ||
-					lc.isLoggedOut(err)
+				if lc.isLoggedOut(err) {
+					lc.markLoggedOutByOtherClient(ctx, err)
+					return
+				}
 
-				if isAuthErr {
+				if strings.Contains(err.Error(), "SSE error: 401") ||
+					strings.Contains(err.Error(), "SSE error: 403") {
+					if !lc.shouldAttemptTokenRecovery(ctx, err) {
+						return
+					}
 					if errRecover := lc.recoverToken(ctx); errRecover != nil {
 						lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
 						lc.UserLogin.BridgeState.Send(status.BridgeState{
@@ -1722,7 +1731,7 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 	chatMid := op.Param1
 	client := lc.newClient()
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
@@ -1783,7 +1792,7 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 func (lc *LineClient) checkChatMembership(ctx context.Context, chatMid string) (isMember, isInvitee bool) {
 	client := lc.newClient()
 	midsResp, err := client.GetAllChatMids(true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			midsResp, err = client.GetAllChatMids(true, true)
@@ -1866,7 +1875,7 @@ func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
 func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType OperationType) {
 	client := lc.newClient()
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
@@ -1914,7 +1923,7 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType O
 func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
 	client := lc.newClient()
 	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			chatsResp, err = client.GetChats([]string{chatMid}, true, true)

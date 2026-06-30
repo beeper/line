@@ -42,7 +42,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 		sharedKey, err = fetch()
 	}
 	// Token recovery for other error types
-	if err != nil && !line.IsNoUsableE2EEGroupKey(err) && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && !line.IsNoUsableE2EEGroupKey(err) && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			sharedKey, err = fetch()
@@ -168,7 +168,7 @@ func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]
 	client := lc.newClient()
 	chats, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
+		if lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				chats, err = client.GetChats([]string{chatMid}, true, true)

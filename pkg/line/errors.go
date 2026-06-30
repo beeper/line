@@ -28,7 +28,18 @@ func IsLoggedOut(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT")
+	return strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") || IsInvalidSenderKey(err)
+}
+
+func IsInvalidSenderKey(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return hasResponseErrorCode(msg) &&
+		strings.Contains(msg, "talkexception") &&
+		strings.Contains(msg, "\"code\":83") &&
+		strings.Contains(msg, "invalid sender key")
 }
 
 func IsUnauthorizedStatus(err error) bool {

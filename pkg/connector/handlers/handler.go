@@ -16,8 +16,10 @@ type Handler struct {
 
 	// RecoverToken attempts to restore a valid session by refreshing or re-logging in.
 	RecoverToken      func(ctx context.Context) error
+	ShouldRecover     func(ctx context.Context, err error) bool
 	IsRefreshRequired func(err error) bool
 	IsLoggedOut       func(err error) bool
+	HandleLoggedOut   func(ctx context.Context, err error)
 
 	// NewClient creates a new LINE API client with the current access token.
 	NewClient func() *line.Client
@@ -32,7 +34,17 @@ func (h *Handler) tryRecoverClient(ctx context.Context, err error) (*line.Client
 	if err == nil {
 		return nil, false
 	}
-	if !line.IsUnauthorizedStatus(err) && !h.IsRefreshRequired(err) && !h.IsLoggedOut(err) {
+	if h.IsLoggedOut(err) {
+		if h.HandleLoggedOut != nil {
+			h.HandleLoggedOut(ctx, err)
+		}
+		return nil, false
+	}
+	if h.ShouldRecover != nil {
+		if !h.ShouldRecover(ctx, err) {
+			return nil, false
+		}
+	} else if !line.IsUnauthorizedStatus(err) && !h.IsRefreshRequired(err) {
 		return nil, false
 	}
 	if errRecover := h.RecoverToken(ctx); errRecover != nil {

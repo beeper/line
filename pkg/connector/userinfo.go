@@ -144,7 +144,7 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
 		client := lc.newClient()
 		res, err := client.GetChats([]string{mid}, true, true)
-		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				res, err = client.GetChats([]string{mid}, true, true)
@@ -211,7 +211,7 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 	if mid == lc.Mid || mid == string(lc.UserLogin.ID) {
 		client := lc.newClient()
 		profile, err := client.GetProfile()
-		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+		if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				profile, err = client.GetProfile()
@@ -227,7 +227,7 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 
 	client := lc.newClient()
 	res, err := client.GetContactsV2([]string{mid})
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			res, err = client.GetContactsV2([]string{mid})
@@ -243,7 +243,7 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 	// Fall back to BuddyService for official/business accounts
 	lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Msg("Contact not found via GetContactsV2, trying BuddyService")
 	buddy, err := client.GetBuddyProfile(mid)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			buddy, err = client.GetBuddyProfile(mid)
@@ -333,7 +333,7 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	client := lc.newClient()
 	allMids, err := client.GetAllContactIds()
 	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
+		if lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				allMids, err = client.GetAllContactIds()
@@ -379,7 +379,7 @@ func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveId
 	client := lc.newClient()
 	allMids, err := client.GetAllContactIds()
 	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
+		if lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				allMids, err = client.GetAllContactIds()

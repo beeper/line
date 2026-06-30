@@ -28,8 +28,10 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 		Log:               lc.UserLogin.Bridge.Log,
 		HTTPClient:        lc.HTTPClient,
 		RecoverToken:      lc.recoverToken,
+		ShouldRecover:     lc.shouldAttemptTokenRecovery,
 		IsRefreshRequired: lc.isRefreshRequired,
 		IsLoggedOut:       lc.isLoggedOut,
+		HandleLoggedOut:   lc.markLoggedOutByOtherClient,
 		NewClient:         func() *line.Client { return lc.newClient() },
 		DecryptMedia:      lc.decryptImageData,
 	}
