@@ -146,6 +146,7 @@ type LineEmailLogin struct {
 	User        *bridgev2.User
 	Email       string
 	Password    string
+	Certificate string
 	Verifier    string
 	AwaitingPIN bool
 	NoE2EE      bool // True when login fell back to non-E2EE (LSOFF account)
@@ -158,6 +159,7 @@ type LineEmailLogin struct {
 
 var _ bridgev2.LoginProcessUserInput = (*LineEmailLogin)(nil)
 var _ bridgev2.LoginProcessDisplayAndWait = (*LineEmailLogin)(nil)
+var _ bridgev2.LoginProcessWithOverride = (*LineEmailLogin)(nil)
 
 func (ll *LineEmailLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	return &bridgev2.LoginStep{
@@ -181,6 +183,32 @@ func (ll *LineEmailLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 	}, nil
 }
 
+func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridgev2.UserLogin) (*bridgev2.LoginStep, error) {
+	meta, ok := override.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return nil, fmt.Errorf("existing LINE login metadata has unexpected type %T", override.Metadata)
+	}
+	ll.Email = meta.Email
+	ll.Password = meta.Password
+	ll.Certificate = meta.Certificate
+
+	if ll.Email == "" || ll.Password == "" {
+		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
+	}
+
+	override.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
+
+	res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)
+	if err != nil {
+		reason := loginErrorReason(err)
+		if reason == "" {
+			reason = fmt.Sprintf("Login failed: %v", err)
+		}
+		return ll.loginErrorStep(reason), nil
+	}
+	return ll.handleLoginResponse(ctx, res)
+}
+
 func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
 	if ll.Verifier != "" {
 		return ll.Wait(ctx)
@@ -189,14 +217,14 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 	if input["email"] != "" {
 		ll.Email = input["email"]
 		ll.Password = input["password"]
+		ll.Certificate = ""
 	}
 
 	if ll.Email == "" || ll.Password == "" {
 		return ll.loginErrorStep("Email and password are required"), nil
 	}
 
-	client := line.NewClient("")
-	res, err := client.Login(ll.Email, ll.Password, "")
+	res, err := loginWithCredentials(ll.Email, ll.Password, "")
 	if err != nil {
 		reason := loginErrorReason(err)
 		if reason == "" {
@@ -293,8 +321,7 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 	}
 
 	if ll.AwaitingPIN {
-		client := line.NewClient("")
-		res, err := client.Login(ll.Email, ll.Password, "")
+		res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)
 		if err != nil {
 			return nil, fmt.Errorf("login failed: %w", err)
 		}
@@ -328,7 +355,7 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 		ll.pollResult = make(chan *line.LoginResult, 1)
 		ll.pollErr = make(chan error, 1)
 		go func() {
-			client := line.NewClient("")
+			client := newLineAPIClient("")
 			res, err := client.WaitForLogin(ll.Verifier, ll.NoE2EE)
 			if err != nil {
 				ll.pollErr <- err
@@ -380,8 +407,8 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		return nil, fmt.Errorf("missing access token in login result")
 	}
 
-	client := line.NewClient(token)
-	profile, err := client.GetProfile()
+	client := newLineAPIClient(token)
+	profile, err := getProfileWithToken(token)
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify token: %w", err)
 	}
@@ -391,11 +418,20 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		displayName = "LINE User"
 	}
 
-	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: res.Certificate, Mid: res.Mid}
+	certificate := res.Certificate
+	if certificate == "" {
+		certificate = ll.Certificate
+	}
+	mid := res.Mid
+	if mid == "" {
+		mid = profile.Mid
+	}
+
+	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
 
 	ll.fetchLoginKeys(res, meta, client)
 
-	detectedLineID := networkid.UserLoginID(profile.Mid)
+	detectedLineID := networkid.UserLoginID(mid)
 
 	ul, err := ll.User.NewLogin(ctx, &database.UserLogin{
 		ID:         detectedLineID,
@@ -407,6 +443,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 				UserLogin:    login,
 				AccessToken:  token,
 				RefreshToken: refreshToken,
+				Mid:          mid,
 				HTTPClient:   &http.Client{Timeout: 10 * time.Second},
 			}
 			return nil

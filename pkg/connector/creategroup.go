@@ -32,7 +32,7 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	chatType := 1 // ROOM: members join automatically.
 	lineName := name
 	chat, err = client.CreateChat(participantMids, lineName, chatType)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
+	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
 			chat, err = client.CreateChat(participantMids, lineName, chatType)
@@ -161,7 +161,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	}
 	pubKeys, err := client.GetLastE2EEPublicKeys(pubKeysReq)
 	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
+		if lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				pubKeys, err = client.GetLastE2EEPublicKeys(pubKeysReq)
@@ -182,7 +182,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 					lc.UserLogin.Bridge.Log.Debug().Str("member", mid).Msg("Member has Letter Sealing disabled, skipping")
 					continue
 				}
-				if lc.isRefreshRequired(nErr) || lc.isLoggedOut(nErr) {
+				if lc.shouldAttemptTokenRecovery(ctx, nErr) {
 					if errRecover := lc.recoverToken(ctx); errRecover == nil {
 						client = lc.newClient()
 						res, nErr = client.NegotiateE2EEPublicKey(mid)
@@ -257,7 +257,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	encryptedKeys = append(encryptedKeys, selfEncryptedKey)
 
 	if err := client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys); err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
+		if lc.shouldAttemptTokenRecovery(ctx, err) {
 			if errRecover := lc.recoverToken(ctx); errRecover == nil {
 				client = lc.newClient()
 				err = client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys)
