@@ -231,6 +231,7 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	meta := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	meta.AccessToken = accessToken
 	meta.RefreshToken = refreshToken
+	meta.SessionInvalidated = false
 	err = lc.UserLogin.Save(ctx)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save refreshed tokens to DB")
@@ -263,10 +264,10 @@ func (lc *LineClient) shouldAttemptTokenRecovery(ctx context.Context, err error)
 	return lc.isRefreshRequired(err) || line.IsUnauthorizedStatus(err)
 }
 
-func (lc *LineClient) markLoggedOutByOtherClient(_ context.Context, err error) {
-	lc.invalidateAccessToken()
-	line.InvalidateOBSTokenCache()
+func (lc *LineClient) markLoggedOutByOtherClient(ctx context.Context, err error) {
 	if lc.UserLogin == nil {
+		lc.invalidateAccessToken()
+		line.InvalidateOBSTokenCache()
 		return
 	}
 	if lc.UserLogin.Client != nil && lc.UserLogin.Client != lc {
@@ -275,6 +276,9 @@ func (lc *LineClient) markLoggedOutByOtherClient(_ context.Context, err error) {
 		}
 		return
 	}
+	lc.invalidateAccessToken()
+	line.InvalidateOBSTokenCache()
+	lc.saveSessionInvalidated(ctx)
 	if lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated by another client; marking login bad credentials")
 	}
@@ -284,6 +288,18 @@ func (lc *LineClient) markLoggedOutByOtherClient(_ context.Context, err error) {
 		Message:    "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE.",
 		UserAction: status.UserActionRelogin,
 	})
+}
+
+func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return
+	}
+	meta.AccessToken = ""
+	meta.SessionInvalidated = true
+	if err := lc.UserLogin.Save(ctx); err != nil && lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save LINE session invalidation")
+	}
 }
 
 // recoverToken attempts to restore a valid session by refreshing, then re-logging in.
@@ -302,6 +318,10 @@ func (lc *LineClient) recoverToken(ctx context.Context) error {
 func (lc *LineClient) runTokenRecovery(ctx context.Context, recover func(context.Context) error) error {
 	lc.recoverMu.Lock()
 	defer lc.recoverMu.Unlock()
+
+	if lc.isSessionInvalidated() {
+		return errLineSessionInvalidated
+	}
 
 	if !lc.recoverTime.IsZero() && time.Since(lc.recoverTime) < recentTokenRecoveryWindow {
 		return nil
@@ -521,6 +541,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
 		meta.AccessToken = accessToken
 		meta.RefreshToken = refreshToken
+		meta.SessionInvalidated = false
 		if res.Certificate != "" {
 			meta.Certificate = res.Certificate
 		}

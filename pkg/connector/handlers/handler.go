@@ -16,6 +16,7 @@ type Handler struct {
 
 	// RecoverToken attempts to restore a valid session by refreshing or re-logging in.
 	RecoverToken      func(ctx context.Context) error
+	ShouldRecover     func(ctx context.Context, err error) bool
 	IsRefreshRequired func(err error) bool
 	IsLoggedOut       func(err error) bool
 	HandleLoggedOut   func(ctx context.Context, err error)
@@ -39,7 +40,11 @@ func (h *Handler) tryRecoverClient(ctx context.Context, err error) (*line.Client
 		}
 		return nil, false
 	}
-	if !line.IsUnauthorizedStatus(err) && !h.IsRefreshRequired(err) {
+	if h.ShouldRecover != nil {
+		if !h.ShouldRecover(ctx, err) {
+			return nil, false
+		}
+	} else if !line.IsUnauthorizedStatus(err) && !h.IsRefreshRequired(err) {
 		return nil, false
 	}
 	if errRecover := h.RecoverToken(ctx); errRecover != nil {

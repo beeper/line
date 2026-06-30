@@ -56,7 +56,7 @@ func TestStartWithOverrideUsesStoredCredentials(t *testing.T) {
 		gotEmail = email
 		gotPassword = password
 		gotCertificate = certificate
-		return &line.LoginResult{Type: 3, Verifier: "verifier", Pin: "123456"}, nil
+		return &line.LoginResult{Certificate: "123456"}, nil
 	}
 
 	override := &bridgev2.UserLogin{
@@ -79,7 +79,7 @@ func TestStartWithOverrideUsesStoredCredentials(t *testing.T) {
 	if step == nil || step.Type != bridgev2.LoginStepTypeDisplayAndWait {
 		t.Fatalf("step = %#v, want display-and-wait verification step", step)
 	}
-	if step.StepID != "dev.highest.matrix.line.wait_verification" {
-		t.Fatalf("step ID = %q, want wait verification", step.StepID)
+	if step.StepID != "dev.highest.matrix.line.enter_pin" {
+		t.Fatalf("step ID = %q, want enter PIN", step.StepID)
 	}
 }

@@ -1238,6 +1238,9 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 
 				if strings.Contains(err.Error(), "SSE error: 401") ||
 					strings.Contains(err.Error(), "SSE error: 403") {
+					if !lc.shouldAttemptTokenRecovery(ctx, err) {
+						return
+					}
 					if errRecover := lc.recoverToken(ctx); errRecover != nil {
 						lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
 						lc.UserLogin.BridgeState.Send(status.BridgeState{

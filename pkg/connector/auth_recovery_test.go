@@ -229,6 +229,22 @@ func TestRunTokenRecoverySkipsRecentRecovery(t *testing.T) {
 	}
 }
 
+func TestRunTokenRecoveryRejectsInvalidatedSessionBeforeRecentRecovery(t *testing.T) {
+	lc := &LineClient{recoverTime: time.Now(), sessionInvalidated: true}
+	var calls int
+
+	err := lc.runTokenRecovery(context.Background(), func(context.Context) error {
+		calls++
+		return nil
+	})
+	if !errors.Is(err, errLineSessionInvalidated) {
+		t.Fatalf("err = %v, want errLineSessionInvalidated", err)
+	}
+	if calls != 0 {
+		t.Fatalf("recovery calls = %d, want 0", calls)
+	}
+}
+
 func TestRunTokenRecoverySerializesConcurrentRecovery(t *testing.T) {
 	var lc LineClient
 	var calls int32
