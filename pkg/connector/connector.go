@@ -157,6 +157,8 @@ type LineEmailLogin struct {
 	AwaitingPIN bool
 	NoE2EE      bool // True when login fell back to non-E2EE (LSOFF account)
 
+	ExistingMetadata *UserLoginMetadata
+
 	pollResult chan *line.LoginResult
 	pollErr    chan error
 	polling    bool
@@ -197,9 +199,16 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 	ll.Email = meta.Email
 	ll.Password = meta.Password
 	ll.Certificate = meta.Certificate
+	ll.ExistingMetadata = meta
 
 	if ll.Email == "" || ll.Password == "" {
 		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
+	}
+	if len(meta.ExportedKeyMap) == 0 {
+		ll.Certificate = ""
+		if override.Bridge != nil {
+			override.Bridge.Log.Info().Msg("No stored LINE E2EE keys, forcing full reconnect")
+		}
 	}
 
 	override.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
@@ -435,7 +444,14 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 
 	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
 
-	ll.fetchLoginKeys(res, meta, client)
+	exportedKeys := ll.fetchLoginKeys(res, meta, client)
+	if !exportedKeys && ll.ExistingMetadata != nil && len(ll.ExistingMetadata.ExportedKeyMap) > 0 {
+		copyLoginE2EEKeyMetadata(meta, ll.ExistingMetadata)
+		ll.User.Bridge.Log.Info().Int("keys", len(meta.ExportedKeyMap)).Msg("Preserved existing E2EE keys after re-login")
+	}
+	if !res.NoE2EE && len(meta.ExportedKeyMap) == 0 {
+		return nil, fmt.Errorf("LINE login completed without E2EE keychain; please reconnect again and complete the LINE verification prompt")
+	}
 
 	detectedLineID := networkid.UserLoginID(mid)
 
@@ -499,6 +515,19 @@ func saveLoginE2EEKeyMetadata(meta *UserLoginMetadata, res *line.LoginResult) {
 	meta.E2EEKeyID = res.E2EEKeyID
 }
 
+func copyLoginE2EEKeyMetadata(dst, src *UserLoginMetadata) {
+	dst.EncryptedKeyChain = src.EncryptedKeyChain
+	dst.E2EEPublicKey = src.E2EEPublicKey
+	dst.E2EEVersion = src.E2EEVersion
+	dst.E2EEKeyID = src.E2EEKeyID
+	if len(src.ExportedKeyMap) > 0 {
+		dst.ExportedKeyMap = make(map[string]string, len(src.ExportedKeyMap))
+		for keyID, exported := range src.ExportedKeyMap {
+			dst.ExportedKeyMap[keyID] = exported
+		}
+	}
+}
+
 func loginSecureDataID(meta *UserLoginMetadata, fallback string) string {
 	if meta.Mid != "" {
 		return meta.Mid
@@ -506,14 +535,14 @@ func loginSecureDataID(meta *UserLoginMetadata, fallback string) string {
 	return fallback
 }
 
-func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) {
+func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) bool {
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
-		return
+		return false
 	}
 	mgr, exported, err := exportLoginE2EEKeys(res, client)
 	if err != nil {
 		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to export E2EE keys")
-		return
+		return false
 	}
 	saveLoginE2EEKeyMetadata(meta, res)
 	meta.ExportedKeyMap = exported
@@ -521,6 +550,7 @@ func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginM
 		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
 	}
 	ll.User.Bridge.Log.Info().Int("keys", len(exported)).Msg("Login: E2EE keys exported successfully")
+	return true
 }
 
 func (ll *LineEmailLogin) Cancel() {}
