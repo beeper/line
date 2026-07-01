@@ -23,6 +23,8 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
+const lineDecryptFallbackText = "[Unable to decrypt message. Open an issue on GitHub.]"
+
 func (lc *LineClient) newMessageHandler() *handlers.Handler {
 	return &handlers.Handler{
 		Log:               lc.UserLogin.Bridge.Log,
@@ -208,8 +210,8 @@ func (lc *LineClient) parseMessageTimestamp(msg *line.Message) time.Time {
 func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, opType int) (bodyText, unwrappedText string) {
 	// Handle Content
 	bodyText = msg.Text
-	if bodyText == "" && len(msg.Chunks) > 0 {
-		bodyText = "[Unable to decrypt message. Open an issue on GitHub.]"
+	if len(msg.Chunks) > 0 && (bodyText == "" || isLineDecryptFallbackText(bodyText)) {
+		bodyText = ""
 		if lc.E2EE != nil {
 			// Ensure peer keys are available before attempting decryption
 			lc.ensurePeerKeyForMessage(context.Background(), msg)
@@ -302,6 +304,10 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 		}
 	}
 	return bodyText, unwrappedText
+}
+
+func isLineDecryptFallbackText(text string) bool {
+	return strings.TrimSpace(text) == lineDecryptFallbackText
 }
 
 // convertLineMessage converts an inbound LINE message into a Matrix
