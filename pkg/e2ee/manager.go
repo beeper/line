@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,11 @@ import (
 
 	gen "github.com/highesttt/matrix-line-messenger/pkg"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+)
+
+var (
+	ErrMissingOwnPrivateKey = errors.New("missing my private key")
+	ErrGroupKeyNotLoaded    = errors.New("e2ee key not loaded")
 )
 
 /*
@@ -457,7 +463,7 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 	}
 
 	if myRunnerKey == 0 {
-		return 0, fmt.Errorf("missing my private key for %d", receiverRawKeyID)
+		return 0, fmt.Errorf("%w for %d", ErrMissingOwnPrivateKey, receiverRawKeyID)
 	}
 
 	chanID, err := m.runner.ChannelCreate(myRunnerKey, creatorPubKeyB64)
@@ -624,7 +630,7 @@ func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType in
 	m.mu.Unlock()
 
 	if !ok || unwrappedKeyID == 0 {
-		return nil, fmt.Errorf("e2ee key not loaded for group %s", chatMid)
+		return nil, fmt.Errorf("%w for group %s", ErrGroupKeyNotLoaded, chatMid)
 	}
 
 	chanID, err := m.ensureGroupChannel(chatMid, groupKeyID, unwrappedKeyID, myKeyID)
