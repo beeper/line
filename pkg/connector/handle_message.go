@@ -23,6 +23,11 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
+const (
+	lineDecryptFallbackText      = "[Unable to decrypt message. Open an issue on GitHub.]"
+	lineDecryptFailureNoticeText = "[Unable to decrypt LINE message.]"
+)
+
 func (lc *LineClient) newMessageHandler() *handlers.Handler {
 	return &handlers.Handler{
 		Log:               lc.UserLogin.Bridge.Log,
@@ -121,7 +126,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 	lc.ensureGroupMessageSenderKnown(portalIDStr, msg.From, ts)
 
 	senderID := makeUserID(msg.From)
-	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr, opType)
+	bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, portalIDStr, opType)
 
 	messageEvent := &simplevent.Message[line.Message]{
 		EventMeta: simplevent.EventMeta{
@@ -138,7 +143,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 		Data: *msg,
 		ID:   networkid.MessageID(msg.ID),
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message) (*bridgev2.ConvertedMessage, error) {
-			return lc.convertLineMessage(ctx, portal, intent, data, bodyText, unwrappedText)
+			return lc.convertLineMessage(ctx, portal, intent, data, bodyText, unwrappedText, decryptionFailed)
 		},
 	}
 
@@ -205,11 +210,12 @@ func (lc *LineClient) parseMessageTimestamp(msg *line.Message) time.Time {
 // decryptMessageBody runs E2EE decryption (when needed) for an inbound message
 // and returns the plaintext body plus the JSON-unwrapped text. Shared by the
 // live message path (queueIncomingMessage) and the backfill path (FetchMessages).
-func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, opType int) (bodyText, unwrappedText string) {
+func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, opType int) (bodyText, unwrappedText string, decryptionFailed bool) {
 	// Handle Content
 	bodyText = msg.Text
-	if bodyText == "" && len(msg.Chunks) > 0 {
-		bodyText = "[Unable to decrypt message. Open an issue on GitHub.]"
+	if len(msg.Chunks) > 0 && (bodyText == "" || isLineDecryptFallbackText(bodyText)) {
+		bodyText = ""
+		decryptionFailed = true
 		if lc.E2EE != nil {
 			// Ensure peer keys are available before attempting decryption
 			lc.ensurePeerKeyForMessage(context.Background(), msg)
@@ -235,6 +241,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 				pt, keyID, err := lc.E2EE.DecryptGroupMessage(msg, portalIDStr)
 				if err == nil {
 					bodyText = pt
+					decryptionFailed = false
 				} else {
 					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
 						Msg("DecryptGroupMessage failed, trying to fetch key")
@@ -244,6 +251,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 								Msg("Failed to fetch/unwrap group key")
 						} else if ptRetry, _, errRetry := lc.E2EE.DecryptGroupMessage(msg, portalIDStr); errRetry == nil {
 							bodyText = ptRetry
+							decryptionFailed = false
 						} else {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
 								Msg("DecryptGroupMessage failed after group key refresh")
@@ -254,6 +262,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 				// 1-1 Decryption
 				if pt, err := lc.E2EE.DecryptMessageV2(msg); err == nil {
 					bodyText = pt
+					decryptionFailed = false
 				} else {
 					lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("DecryptMessageV2 failed on first attempt")
 					if _, _, errKey := lc.E2EE.MyKeyIDs(); errKey != nil {
@@ -282,6 +291,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 						}
 						if ptRetry, errRetry := lc.E2EE.DecryptMessageV2(msg); errRetry == nil {
 							bodyText = ptRetry
+							decryptionFailed = false
 						} else {
 							lc.UserLogin.Bridge.Log.Warn().Err(errRetry).Msg("DecryptMessageV2 failed on retry")
 						}
@@ -301,16 +311,38 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 			}
 		}
 	}
-	return bodyText, unwrappedText
+	return bodyText, unwrappedText, decryptionFailed
+}
+
+func isLineDecryptFallbackText(text string) bool {
+	// LINE may include this historical fallback in Text while still sending
+	// encrypted chunks. Treat it as a decrypt marker, not user-authored text.
+	return strings.TrimSpace(text) == lineDecryptFallbackText
 }
 
 // convertLineMessage converts an inbound LINE message into a Matrix
 // ConvertedMessage. bodyText/unwrappedText are the (decrypted) message text as
 // returned by decryptMessageBody. Shared by the live message path and backfill.
-func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, bodyText, unwrappedText string) (*bridgev2.ConvertedMessage, error) {
+func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, bodyText, unwrappedText string, decryptionFailed bool) (*bridgev2.ConvertedMessage, error) {
 	decryptedBody := bodyText
-	h := lc.newMessageHandler()
 	replyRelatesTo := lc.resolveReplyRelatesTo(ctx, &data)
+
+	if decryptionFailed && strings.TrimSpace(unwrappedText) == "" && ContentType(data.ContentType) == ContentText {
+		return &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{
+				{
+					Type: event.EventMessage,
+					Content: &event.MessageEventContent{
+						MsgType:   event.MsgNotice,
+						Body:      lineDecryptFailureNoticeText,
+						RelatesTo: replyRelatesTo,
+					},
+				},
+			},
+		}, nil
+	}
+
+	h := lc.newMessageHandler()
 
 	// Handle call events (ORGCONTP == "CALL")
 	if data.ContentMetadata["ORGCONTP"] == "CALL" {

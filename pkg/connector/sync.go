@@ -336,8 +336,8 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		if msg.From == lc.Mid {
 			opType = OpSendMessage
 		}
-		bodyText, unwrappedText := lc.decryptMessageBody(msg, chatMID, int(opType))
-		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText)
+		bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, chatMID, int(opType))
+		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText, decryptionFailed)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
 			continue
