@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"testing"
-	"time"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
@@ -17,7 +16,6 @@ import (
 func newPeerKeyTestClient() *LineClient {
 	return &LineClient{
 		AccessToken: "access",
-		recoverTime: time.Now(),
 		UserLogin: &bridgev2.UserLogin{
 			Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
 		},
@@ -27,9 +25,11 @@ func newPeerKeyTestClient() *LineClient {
 func TestEnsurePeerKeyRecoversAndRetriesRefreshRequired(t *testing.T) {
 	oldNewClient := newLineAPIClient
 	oldNegotiate := negotiateE2EEPublicKeyWithClient
+	oldRecover := recoverLineToken
 	t.Cleanup(func() {
 		newLineAPIClient = oldNewClient
 		negotiateE2EEPublicKeyWithClient = oldNegotiate
+		recoverLineToken = oldRecover
 	})
 
 	var newClientCalls int
@@ -50,6 +50,12 @@ func TestEnsurePeerKeyRecoversAndRetriesRefreshRequired(t *testing.T) {
 		}, nil
 	}
 
+	var recoverCalls int
+	recoverLineToken = func(*LineClient, context.Context) error {
+		recoverCalls++
+		return nil
+	}
+
 	lc := newPeerKeyTestClient()
 	keyID, publicKey, err := lc.ensurePeerKey(context.Background(), "peer-mid")
 	if err != nil {
@@ -61,6 +67,9 @@ func TestEnsurePeerKeyRecoversAndRetriesRefreshRequired(t *testing.T) {
 	if negotiateCalls != 2 {
 		t.Fatalf("negotiate calls = %d, want 2", negotiateCalls)
 	}
+	if recoverCalls != 1 {
+		t.Fatalf("recovery calls = %d, want 1", recoverCalls)
+	}
 	if newClientCalls != 2 {
 		t.Fatalf("new clients = %d, want 2", newClientCalls)
 	}
@@ -69,9 +78,11 @@ func TestEnsurePeerKeyRecoversAndRetriesRefreshRequired(t *testing.T) {
 func TestEnsurePeerKeyByIDRecoversAndRetriesRefreshRequired(t *testing.T) {
 	oldNewClient := newLineAPIClient
 	oldGetKey := getE2EEPublicKeyWithClient
+	oldRecover := recoverLineToken
 	t.Cleanup(func() {
 		newLineAPIClient = oldNewClient
 		getE2EEPublicKeyWithClient = oldGetKey
+		recoverLineToken = oldRecover
 	})
 
 	var newClientCalls int
@@ -92,6 +103,12 @@ func TestEnsurePeerKeyByIDRecoversAndRetriesRefreshRequired(t *testing.T) {
 		}, nil
 	}
 
+	var recoverCalls int
+	recoverLineToken = func(*LineClient, context.Context) error {
+		recoverCalls++
+		return nil
+	}
+
 	lc := newPeerKeyTestClient()
 	keyID, publicKey, err := lc.ensurePeerKeyByID(context.Background(), "peer-mid", 5910969)
 	if err != nil {
@@ -103,6 +120,9 @@ func TestEnsurePeerKeyByIDRecoversAndRetriesRefreshRequired(t *testing.T) {
 	if getKeyCalls != 2 {
 		t.Fatalf("get key calls = %d, want 2", getKeyCalls)
 	}
+	if recoverCalls != 1 {
+		t.Fatalf("recovery calls = %d, want 1", recoverCalls)
+	}
 	if newClientCalls != 2 {
 		t.Fatalf("new clients = %d, want 2", newClientCalls)
 	}
@@ -110,14 +130,20 @@ func TestEnsurePeerKeyByIDRecoversAndRetriesRefreshRequired(t *testing.T) {
 
 func TestEnsurePeerKeyCachesNoUsablePublicKeyWithoutRecovery(t *testing.T) {
 	oldNegotiate := negotiateE2EEPublicKeyWithClient
+	oldRecover := recoverLineToken
 	t.Cleanup(func() {
 		negotiateE2EEPublicKeyWithClient = oldNegotiate
+		recoverLineToken = oldRecover
 	})
 
 	var negotiateCalls int
 	negotiateE2EEPublicKeyWithClient = func(*line.Client, string) (*line.E2EEPublicKey, error) {
 		negotiateCalls++
 		return nil, line.ErrNoUsableE2EEPublicKey
+	}
+	recoverLineToken = func(*LineClient, context.Context) error {
+		t.Fatal("recovery should not be called for no-usable-public-key errors")
+		return nil
 	}
 
 	lc := newPeerKeyTestClient()
