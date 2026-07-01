@@ -13,6 +13,15 @@ import (
 
 const noE2EETTL = 1 * time.Hour
 
+var (
+	negotiateE2EEPublicKeyWithClient = func(client *line.Client, mid string) (*line.E2EEPublicKey, error) {
+		return client.NegotiateE2EEPublicKey(mid)
+	}
+	getE2EEPublicKeyWithClient = func(client *line.Client, mid string, keyVersion, keyID int) (*line.E2EEPublicKey, error) {
+		return client.GetE2EEPublicKey(mid, keyVersion, keyID)
+	}
+)
+
 // fetchAndUnwrapGroupKey retrieves a specific group key (or the latest when groupKeyID == 0)
 // and unwraps it so the E2EE manager can encrypt/decrypt group messages.
 // If no group key exists yet (TalkException code 5), it auto-registers one and retries.
@@ -86,7 +95,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 	return nil
 }
 
-func (lc *LineClient) ensurePeerKey(_ context.Context, mid string) (int, string, error) {
+func (lc *LineClient) ensurePeerKey(ctx context.Context, mid string) (int, string, error) {
 	lc.cacheMu.Lock()
 	if lc.peerKeys == nil {
 		lc.peerKeys = make(map[string]peerKeyInfo)
@@ -107,8 +116,9 @@ func (lc *LineClient) ensurePeerKey(_ context.Context, mid string) (int, string,
 			return cached.raw, cached.pub, nil
 		}
 	}
-	client := lc.newClient()
-	res, err := client.NegotiateE2EEPublicKey(mid)
+	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.E2EEPublicKey, error) {
+		return negotiateE2EEPublicKeyWithClient(client, mid)
+	})
 	if err != nil {
 		// Cache negative result so we don't keep hitting the API
 		if line.IsNoUsableE2EEPublicKey(err) {
@@ -305,7 +315,7 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 	return mids, nil
 }
 
-func (lc *LineClient) ensurePeerKeyByID(_ context.Context, mid string, keyID int) (int, string, error) {
+func (lc *LineClient) ensurePeerKeyByID(ctx context.Context, mid string, keyID int) (int, string, error) {
 	lc.cacheMu.Lock()
 	if lc.peerKeys == nil {
 		lc.peerKeys = make(map[string]peerKeyInfo)
@@ -319,9 +329,10 @@ func (lc *LineClient) ensurePeerKeyByID(_ context.Context, mid string, keyID int
 		return cached.raw, cached.pub, nil
 	}
 
-	client := lc.newClient()
 	// keyVersion 1
-	res, err := client.GetE2EEPublicKey(mid, 1, keyID)
+	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.E2EEPublicKey, error) {
+		return getE2EEPublicKeyWithClient(client, mid, 1, keyID)
+	})
 	if err != nil {
 		return 0, "", err
 	}

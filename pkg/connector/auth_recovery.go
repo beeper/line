@@ -14,6 +14,10 @@ type lineCallDeps[T any] struct {
 	call        func(*line.Client) (T, error)
 }
 
+var recoverLineToken = func(lc *LineClient, ctx context.Context) error {
+	return lc.recoverToken(ctx)
+}
+
 func callLineWithRecovery[T any](ctx context.Context, client *line.Client, deps lineCallDeps[T]) (*line.Client, T, error) {
 	if client == nil {
 		client = deps.newClient()
@@ -53,7 +57,7 @@ func (lc *LineClient) callLine(ctx context.Context, call func(*line.Client) erro
 func (lc *LineClient) callLineUsing(ctx context.Context, client *line.Client, call func(*line.Client) error) (*line.Client, error) {
 	client, _, err := callLineWithRecovery(ctx, client, lineCallDeps[struct{}]{
 		newClient:   func() *line.Client { return lc.newClient() },
-		recover:     lc.recoverToken,
+		recover:     func(ctx context.Context) error { return recoverLineToken(lc, ctx) },
 		isAuthError: lc.isTokenError,
 		call: func(client *line.Client) (struct{}, error) {
 			return struct{}{}, call(client)
@@ -72,7 +76,7 @@ func callLineResult[T any](lc *LineClient, ctx context.Context, call func(*line.
 func callLineResultUsing[T any](lc *LineClient, ctx context.Context, client *line.Client, call func(*line.Client) (T, error)) (*line.Client, T, error) {
 	client, res, err := callLineWithRecovery(ctx, client, lineCallDeps[T]{
 		newClient:   func() *line.Client { return lc.newClient() },
-		recover:     lc.recoverToken,
+		recover:     func(ctx context.Context) error { return recoverLineToken(lc, ctx) },
 		isAuthError: lc.isTokenError,
 		call:        call,
 	})
