@@ -21,6 +21,7 @@ import (
 var errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
 
 var newLineAPIClient = line.NewClient
+var newE2EEManager = e2ee.NewManager
 
 var loginWithCredentials = func(email, password, certificate string) (*line.LoginResult, error) {
 	return newLineAPIClient("").Login(email, password, certificate)
@@ -545,12 +546,37 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		if res.Certificate != "" {
 			meta.Certificate = res.Certificate
 		}
+		if err := lc.refreshLoginE2EEKeys(res, meta, newLineAPIClient(accessToken)); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to refresh E2EE keys after re-login")
+		}
 		if err := lc.UserLogin.Save(ctx); err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save new tokens to DB")
 		}
 	}
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Login successful!")
+	return nil
+}
+
+func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) error {
+	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
+		return nil
+	}
+	saveLoginE2EEKeyMetadata(meta, res)
+	mgr, exported, err := exportLoginE2EEKeys(res, client)
+	if err != nil {
+		return err
+	}
+	meta.ExportedKeyMap = exported
+	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")
+	}
+	if lc.E2EE != nil {
+		if err := lc.E2EE.LoadMyKeyFromExportedMap(exported); err != nil {
+			return fmt.Errorf("load exported keys into active E2EE manager: %w", err)
+		}
+	}
+	lc.UserLogin.Bridge.Log.Info().Int("keys", len(exported)).Msg("Refreshed E2EE keys after re-login")
 	return nil
 }
 

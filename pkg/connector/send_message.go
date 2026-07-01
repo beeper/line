@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -18,6 +19,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
@@ -29,6 +31,20 @@ type mentionEntry struct {
 }
 
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
+
+const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
+
+func lineGroupE2EEReconnectRequiredError(err error) error {
+	if !errors.Is(err, e2ee.ErrMissingOwnPrivateKey) {
+		return nil
+	}
+	return bridgev2.WrapErrorInStatus(fmt.Errorf("%s: %w", lineGroupE2EEReconnectNotice, err)).
+		WithStatus(event.MessageStatusFail).
+		WithIsCertain(true).
+		WithMessage(lineGroupE2EEReconnectNotice).
+		WithSendNotice(true).
+		WithErrorReason(event.MessageStatusGenericError)
+}
 
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	client := lc.newClient()
@@ -556,6 +572,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if isGroup {
 			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
+				if errStatus := lineGroupE2EEReconnectRequiredError(errFetch); errStatus != nil {
+					return nil, errStatus
+				}
 			}
 			if contentType != int(ContentText) {
 				chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
@@ -569,6 +588,8 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					} else {
 						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 					}
+				} else if errStatus := lineGroupE2EEReconnectRequiredError(errFetch); errStatus != nil {
+					return nil, errStatus
 				}
 				if err != nil {
 					// E2EE setup failed — fall back to plain text

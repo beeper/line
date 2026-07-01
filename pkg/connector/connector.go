@@ -470,35 +470,56 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}, nil
 }
 
-func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) {
+func exportLoginE2EEKeys(res *line.LoginResult, client *line.Client) (*e2ee.Manager, map[string]string, error) {
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
-		return
+		return nil, nil, nil
 	}
+	mgr, err := newE2EEManager()
+	if err != nil {
+		return nil, nil, fmt.Errorf("create E2EE manager: %w", err)
+	}
+	ei3, err := client.GetEncryptedIdentityV3()
+	if err != nil {
+		return nil, nil, fmt.Errorf("get EncryptedIdentityV3: %w", err)
+	}
+	if err := mgr.InitStorage(ei3.WrappedNonce, ei3.KDFParameter1, ei3.KDFParameter2); err != nil {
+		return nil, nil, fmt.Errorf("init storage: %w", err)
+	}
+	exported, err := mgr.InitFromLoginKeyChain(res.E2EEPublicKey, res.EncryptedKeyChain)
+	if err != nil {
+		return nil, nil, fmt.Errorf("init from login keychain: %w", err)
+	}
+	return mgr, exported, nil
+}
+
+func saveLoginE2EEKeyMetadata(meta *UserLoginMetadata, res *line.LoginResult) {
 	meta.EncryptedKeyChain = res.EncryptedKeyChain
 	meta.E2EEPublicKey = res.E2EEPublicKey
 	meta.E2EEVersion = res.E2EEVersion
 	meta.E2EEKeyID = res.E2EEKeyID
-	mgr, err := e2ee.NewManager()
-	if err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to create E2EE manager")
+}
+
+func loginSecureDataID(meta *UserLoginMetadata, fallback string) string {
+	if meta.Mid != "" {
+		return meta.Mid
+	}
+	return fallback
+}
+
+func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) {
+	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
 		return
 	}
-	ei3, err := client.GetEncryptedIdentityV3()
+	saveLoginE2EEKeyMetadata(meta, res)
+	mgr, exported, err := exportLoginE2EEKeys(res, client)
 	if err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to get EncryptedIdentityV3")
-		return
-	}
-	if err := mgr.InitStorage(ei3.WrappedNonce, ei3.KDFParameter1, ei3.KDFParameter2); err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: InitStorage failed")
-		return
-	}
-	exported, err := mgr.InitFromLoginKeyChain(res.E2EEPublicKey, res.EncryptedKeyChain)
-	if err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: InitFromLoginKeyChain failed")
+		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to export E2EE keys")
 		return
 	}
 	meta.ExportedKeyMap = exported
-	_ = mgr.SaveSecureDataToFile(string(ll.User.MXID), map[string]any{"exportedKeyMap": exported})
+	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(ll.User.MXID)), map[string]any{"exportedKeyMap": exported}); err != nil {
+		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
+	}
 	ll.User.Bridge.Log.Info().Int("keys", len(exported)).Msg("Login: E2EE keys exported successfully")
 }
 
