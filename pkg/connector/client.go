@@ -562,11 +562,11 @@ func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLogi
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
 		return nil
 	}
-	saveLoginE2EEKeyMetadata(meta, res)
 	mgr, exported, err := exportLoginE2EEKeys(res, client)
 	if err != nil {
 		return err
 	}
+	saveLoginE2EEKeyMetadata(meta, res)
 	meta.ExportedKeyMap = exported
 	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")

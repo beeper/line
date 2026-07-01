@@ -510,12 +510,12 @@ func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginM
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
 		return
 	}
-	saveLoginE2EEKeyMetadata(meta, res)
 	mgr, exported, err := exportLoginE2EEKeys(res, client)
 	if err != nil {
 		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to export E2EE keys")
 		return
 	}
+	saveLoginE2EEKeyMetadata(meta, res)
 	meta.ExportedKeyMap = exported
 	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(ll.User.MXID)), map[string]any{"exportedKeyMap": exported}); err != nil {
 		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
