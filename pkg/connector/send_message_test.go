@@ -42,3 +42,28 @@ func TestLineGroupE2EEReconnectRequiredErrorIgnoresNoUsableGroupKey(t *testing.T
 		t.Fatalf("err = %v, want nil", err)
 	}
 }
+
+func TestLineGroupE2EEFetchFailureErrorReturnsAuthErrors(t *testing.T) {
+	err := lineGroupE2EEFetchFailureError(errLoggedOut)
+	if !errors.Is(err, errLoggedOut) {
+		t.Fatalf("err = %v, want logged-out error", err)
+	}
+}
+
+func TestLineGroupE2EEFetchFailureErrorAllowsNoUsableGroupKeyFallback(t *testing.T) {
+	err := lineGroupE2EEFetchFailureError(line.ErrNoUsableE2EEGroupKey)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+}
+
+func TestLineGroupE2EEFetchFailureErrorWrapsMissingPrivateKeyStatus(t *testing.T) {
+	err := lineGroupE2EEFetchFailureError(fmt.Errorf("failed to unwrap group key: %w", e2ee.ErrMissingOwnPrivateKey))
+	var status bridgev2.MessageStatus
+	if !errors.As(err, &status) {
+		t.Fatalf("error %T does not wrap bridgev2.MessageStatus", err)
+	}
+	if status.Message != lineGroupE2EEReconnectNotice || status.Status != event.MessageStatusFail {
+		t.Fatalf("status = %#v, want reconnect failure notice", status)
+	}
+}

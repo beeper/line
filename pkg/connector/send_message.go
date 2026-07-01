@@ -46,6 +46,16 @@ func lineGroupE2EEReconnectRequiredError(err error) error {
 		WithErrorReason(event.MessageStatusGenericError)
 }
 
+func lineGroupE2EEFetchFailureError(err error) error {
+	if err == nil || line.IsNoUsableE2EEGroupKey(err) {
+		return nil
+	}
+	if errStatus := lineGroupE2EEReconnectRequiredError(err); errStatus != nil {
+		return errStatus
+	}
+	return err
+}
+
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
@@ -572,8 +582,8 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if isGroup {
 			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
-				if errStatus := lineGroupE2EEReconnectRequiredError(errFetch); errStatus != nil {
-					return nil, errStatus
+				if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
+					return nil, errFetch
 				}
 			}
 			if contentType != int(ContentText) {
@@ -588,8 +598,8 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					} else {
 						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 					}
-				} else if errStatus := lineGroupE2EEReconnectRequiredError(errFetch); errStatus != nil {
-					return nil, errStatus
+				} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
+					return nil, errFetch
 				}
 				if err != nil {
 					// E2EE setup failed — fall back to plain text

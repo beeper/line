@@ -65,6 +65,9 @@ func TestStartWithOverrideUsesStoredCredentials(t *testing.T) {
 				Email:       "stored@example.com",
 				Password:    "stored-password",
 				Certificate: "stored-cert",
+				ExportedKeyMap: map[string]string{
+					"5625926": "exported-key",
+				},
 			},
 		},
 	}

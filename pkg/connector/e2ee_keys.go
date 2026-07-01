@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -66,33 +67,54 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 		return fmt.Errorf("no group shared key returned for %s", chatMid)
 	}
 
-	lc.UserLogin.Bridge.Log.Debug().
-		Str("chat_mid", chatMid).
-		Int("group_key_id", sharedKey.GroupKeyID).
-		Int("creator_key_id", sharedKey.CreatorKeyID).
-		Int("receiver_key_id", sharedKey.ReceiverKeyID).
-		Msg("Fetched group shared key")
+	unwrap := func(sharedKey *line.E2EEGroupSharedKey) error {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("chat_mid", chatMid).
+			Int("group_key_id", sharedKey.GroupKeyID).
+			Int("creator_key_id", sharedKey.CreatorKeyID).
+			Int("receiver_key_id", sharedKey.ReceiverKeyID).
+			Msg("Fetched group shared key")
 
-	if _, _, err := lc.ensurePeerKey(ctx, sharedKey.Creator); err != nil {
-		return fmt.Errorf("failed to ensure creator key: %w", err)
+		if _, _, err := lc.ensurePeerKey(ctx, sharedKey.Creator); err != nil {
+			return fmt.Errorf("failed to ensure creator key: %w", err)
+		}
+		if _, _, err := lc.ensurePeerKeyByID(ctx, sharedKey.Creator, sharedKey.CreatorKeyID); err != nil {
+			return fmt.Errorf("failed to ensure creator key id %d: %w", sharedKey.CreatorKeyID, err)
+		}
+
+		unwrappedID, err := lc.E2EE.UnwrapGroupSharedKey(chatMid, sharedKey)
+		if err != nil {
+			return fmt.Errorf("failed to unwrap group key: %w", err)
+		}
+
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("chat_mid", chatMid).
+			Int("group_key_id", sharedKey.GroupKeyID).
+			Int("receiver_key_id", sharedKey.ReceiverKeyID).
+			Int("unwrapped_id", unwrappedID).
+			Msg("Unwrapped group shared key")
+
+		return nil
 	}
-	if _, _, err := lc.ensurePeerKeyByID(ctx, sharedKey.Creator, sharedKey.CreatorKeyID); err != nil {
-		return fmt.Errorf("failed to ensure creator key id %d: %w", sharedKey.CreatorKeyID, err)
+
+	err = unwrap(sharedKey)
+	if groupKeyID == 0 && errors.Is(err, e2ee.ErrMissingOwnPrivateKey) {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
+			Msg("Latest group key targets a missing private key, registering a fresh group key")
+		if registerErr := lc.autoRegisterGroupKey(ctx, chatMid); registerErr != nil {
+			return fmt.Errorf("%w (fresh group key registration failed: %v)", err, registerErr)
+		}
+		sharedKey, err = fetch()
+		if err != nil {
+			return fmt.Errorf("failed to fetch fresh group key after registration: %w", err)
+		}
+		if sharedKey == nil {
+			return fmt.Errorf("no fresh group shared key returned for %s", chatMid)
+		}
+		err = unwrap(sharedKey)
 	}
 
-	unwrappedID, err := lc.E2EE.UnwrapGroupSharedKey(chatMid, sharedKey)
-	if err != nil {
-		return fmt.Errorf("failed to unwrap group key: %w", err)
-	}
-
-	lc.UserLogin.Bridge.Log.Debug().
-		Str("chat_mid", chatMid).
-		Int("group_key_id", sharedKey.GroupKeyID).
-		Int("receiver_key_id", sharedKey.ReceiverKeyID).
-		Int("unwrapped_id", unwrappedID).
-		Msg("Unwrapped group shared key")
-
-	return nil
+	return err
 }
 
 func (lc *LineClient) ensurePeerKey(ctx context.Context, mid string) (int, string, error) {
