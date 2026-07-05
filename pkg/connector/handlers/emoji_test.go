@@ -7,7 +7,7 @@ import (
 
 func TestSticonResourceByteRangeUsesUTF16Offsets(t *testing.T) {
 	prefix := "\u30d6\u30e9\u30b8\u30eb "
-	placeholder := "\U000f0084"
+	placeholder := "\U00100084"
 	text := prefix + placeholder + " \u3064\u307e\u3089\u306a\u304b\u3063\u305f"
 	start := utf16Units(prefix)
 	end := start + utf16Units(placeholder)
@@ -21,9 +21,27 @@ func TestSticonResourceByteRangeUsesUTF16Offsets(t *testing.T) {
 	}
 }
 
+func TestSticonResourceByteRangeRejectsInvalidOffsets(t *testing.T) {
+	text := "abc"
+	tests := map[string]SticonResource{
+		"empty":        {Start: 1, End: 1},
+		"reversed":     {Start: 2, End: 1},
+		"negative":     {Start: -1, End: 1},
+		"unresolvable": {Start: 0, End: 100},
+	}
+
+	for name, resource := range tests {
+		t.Run(name, func(t *testing.T) {
+			if start, end, ok := sticonResourceByteRange(text, resource); ok {
+				t.Fatalf("sticonResourceByteRange = %d/%d/true, want false", start, end)
+			}
+		})
+	}
+}
+
 func TestBuildSticonMessageBodiesRemovesLinePlaceholders(t *testing.T) {
-	first := "\U000f0084"
-	second := "\U000f0085"
+	first := "\U00100084"
+	second := "\U00100085"
 	text := "\u30d6\u30e9\u30b8\u30eb " + first + " \u3064\u307e\u3089\u306a\u304b\u3063\u305f\n\n\u6226\u3048 " + second + " \u7b11"
 	firstStart := strings.Index(text, first)
 	secondStart := strings.Index(text, second)
@@ -54,10 +72,55 @@ func TestBuildSticonMessageBodiesRemovesLinePlaceholders(t *testing.T) {
 	}
 }
 
+func TestBuildSticonMessageBodiesSkipsInvalidReplacements(t *testing.T) {
+	placeholder := "\U00100084"
+	text := "a" + placeholder + "def"
+	start := strings.Index(text, placeholder)
+	end := start + len(placeholder)
+
+	body, formatted := buildSticonMessageBodies(text, []sticonReplacement{
+		{start: start, end: end, mxc: "mxc://line/emoji1"},
+		{start: start + 1, end: end + 1, mxc: "mxc://line/overlap"},
+		{start: end, end: end, mxc: "mxc://line/empty"},
+		{start: end, end: start, mxc: "mxc://line/reversed"},
+		{start: 99, end: 100, mxc: "mxc://line/out-of-range"},
+	})
+
+	if want := "a[Emoji]def"; body != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+	if strings.Contains(formatted, "overlap") || strings.Contains(formatted, "empty") ||
+		strings.Contains(formatted, "reversed") || strings.Contains(formatted, "out-of-range") {
+		t.Fatalf("formatted body included skipped replacement: %q", formatted)
+	}
+	if !strings.Contains(formatted, "mxc://line/emoji1") {
+		t.Fatalf("formatted body missing valid replacement: %q", formatted)
+	}
+
+	body, formatted = buildSticonMessageBodies("abcdef", []sticonReplacement{
+		{start: 3, end: 3, mxc: "mxc://line/empty"},
+		{start: 99, end: 100, mxc: "mxc://line/out-of-range"},
+	})
+	if body != "abcdef" || formatted != "abcdef" {
+		t.Fatalf("invalid-only replacements = %q/%q, want original text", body, formatted)
+	}
+}
+
 func TestCleanInlineSticonPlaceholders(t *testing.T) {
-	text := "a\U000f0084\U000f0085b"
+	text := "a\U00100084\U00100085b"
 	if got, want := cleanInlineSticonPlaceholders(text), "a[Emoji]b"; got != want {
 		t.Fatalf("cleanInlineSticonPlaceholders = %q, want %q", got, want)
+	}
+}
+
+func TestLineSticonPlaceholderDetectionIsNarrow(t *testing.T) {
+	if !ContainsLineSticonPlaceholder("\U00100084") {
+		t.Fatal("expected LINE sticon placeholder to be detected")
+	}
+	for _, text := range []string{"\uf8ff", "\U000f0084"} {
+		if ContainsLineSticonPlaceholder(text) {
+			t.Fatalf("unexpected placeholder match for %U", []rune(text)[0])
+		}
 	}
 }
 

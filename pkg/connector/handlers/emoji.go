@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -70,7 +69,13 @@ func (h *Handler) tryUploadEmoji(ctx context.Context, portal *bridgev2.Portal, i
 	return string(mxc)
 }
 
-const inlineSticonFallbackText = "[Emoji]"
+const (
+	inlineSticonFallbackText = "[Emoji]"
+	// LINE uses supplementary private-use placeholders for inline sticons in
+	// decrypted text bodies, while REPLACE.sticon carries the actual image IDs.
+	lineSticonPlaceholderRuneStart = 0x100000
+	lineSticonPlaceholderRuneEnd   = 0x100fff
+)
 
 // sticonRefRegex matches inline sticon references embedded in the text body.
 // LINE embeds stamps as $STK:productId:emojiId$ in the text.
@@ -363,7 +368,7 @@ func cleanInlineSticonPlaceholders(text string) string {
 }
 
 func isLineSticonPlaceholderRune(r rune) bool {
-	return unicode.Is(unicode.Co, r)
+	return r >= lineSticonPlaceholderRuneStart && r <= lineSticonPlaceholderRuneEnd
 }
 
 // parseSticonBody extracts sticon resources from the REPLACE.sticon.resources
