@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
@@ -67,12 +70,14 @@ func (h *Handler) tryUploadEmoji(ctx context.Context, portal *bridgev2.Portal, i
 	return string(mxc)
 }
 
+const inlineSticonFallbackText = "[Emoji]"
+
 // sticonRefRegex matches inline sticon references embedded in the text body.
 // LINE embeds stamps as $STK:productId:emojiId$ in the text.
-var sticonRefRegex = regexp.MustCompile(`\$STK:(\d+):(\d+)\$`)
+var sticonRefRegex = regexp.MustCompile(`\$STK:([[:alnum:]]+):([[:alnum:]]+)\$`)
 
 // SticonResource describes one inline sticon embedded in a text message.
-// S and E are byte positions in the text body that the sticon replaces.
+// S and E are UTF-16 code unit positions in the text body that the sticon replaces.
 type SticonResource struct {
 	Start        int    `json:"S"`
 	End          int    `json:"E"`
@@ -104,15 +109,7 @@ func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Porta
 		stkTxt = data.ContentMetadata["STKTXT"]
 	}
 	if stkTxt == "" {
-		stkTxt = "[Emoji]"
-	}
-
-	// Try the direct STKID/STKPKGID path first (standalone sticker metadata).
-	if stkID != "" && stkPkgID != "" {
-		if msg := h.tryDownloadSticon(ctx, portal, intent, stkPkgID, stkID, relatesTo); msg != nil {
-			return msg, nil
-		}
-		return h.ConvertText(stkTxt, relatesTo)
+		stkTxt = inlineSticonFallbackText
 	}
 
 	// Try parsing the full bodyText as JSON — LINE embeds sticon resources
@@ -123,6 +120,16 @@ func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Porta
 				return msg, nil
 			}
 		}
+	}
+
+	// Try the direct STKID/STKPKGID path after body parsing. Inline sticons may
+	// also include sticker metadata, but REPLACE.sticon is the source of truth
+	// for preserving surrounding text.
+	if stkID != "" && stkPkgID != "" {
+		if msg := h.tryDownloadSticon(ctx, portal, intent, stkPkgID, stkID, relatesTo); msg != nil {
+			return msg, nil
+		}
+		return h.ConvertText(cleanInlineSticonPlaceholders(stkTxt), relatesTo)
 	}
 
 	// Try parsing the text body for inline sticon references ($STK:productId:emojiId$).
@@ -166,73 +173,44 @@ func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Porta
 	}
 
 	h.Log.Debug().Str("text_body", stkTxt).Str("raw_body", bodyText).Interface("content_metadata", data.ContentMetadata).Msg("Falling back to text for inline emoji")
-	return h.ConvertText(stkTxt, relatesTo)
+	return h.ConvertText(cleanInlineSticonPlaceholders(stkTxt), relatesTo)
+}
+
+type sticonReplacement struct {
+	start int
+	end   int
+	mxc   string
 }
 
 // convertSticonParts builds a single formatted text message with sticon images
 // embedded inline via <img> tags (like Discord bridge custom emoji).
 func (h *Handler) convertSticonParts(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, stkTxt string, resources []SticonResource, relatesTo *event.RelatesTo) *bridgev2.ConvertedMessage {
-	var plainBuf, htmlBuf bytes.Buffer
-	pos := 0
-
-	// First pass: download all sticons, build maps of pos->mxc
-	type replacement struct {
-		start, end int
-		mxc        string
-	}
-	var replacements []replacement
+	var replacements []sticonReplacement
 
 	for _, r := range resources {
-		if r.Start < pos {
-			r.Start = pos
-		}
-		if r.End <= r.Start || r.Start > len(stkTxt) {
-			continue
-		}
-		if r.End > len(stkTxt) {
-			r.End = len(stkTxt)
-		}
 		if r.ProductID == "" || r.SticonID == "" {
 			continue
 		}
+		start, end, ok := sticonResourceByteRange(stkTxt, r)
+		if !ok {
+			h.Log.Debug().
+				Int("start", r.Start).
+				Int("end", r.End).
+				Str("text_body", stkTxt).
+				Msg("Skipping inline sticon with invalid text offsets")
+			continue
+		}
 		mxc := h.tryUploadEmoji(ctx, portal, intent, r.ProductID, r.SticonID)
-		replacements = append(replacements, replacement{r.Start, r.End, mxc})
+		replacements = append(replacements, sticonReplacement{start: start, end: end, mxc: mxc})
 	}
-
-	// Second pass: build plain text and HTML body
-	for _, r := range replacements {
-		// Leading text before this sticon
-		if r.start > pos {
-			seg := stkTxt[pos:r.start]
-			plainBuf.WriteString(seg)
-			htmlBuf.WriteString(htmlEscape(seg))
-		}
-
-		// Sticon placeholder / image
-		placeholder := stkTxt[r.start:r.end]
-		if r.mxc != "" {
-			htmlBuf.WriteString(fmt.Sprintf(`<img data-mx-emoticon src="%s" alt="%s" title="%s" height="32" />`, r.mxc, htmlEscape(placeholder), htmlEscape(placeholder)))
-		} else {
-			htmlBuf.WriteString(htmlEscape(placeholder))
-		}
-		plainBuf.WriteString(placeholder)
-
-		pos = r.end
-	}
-
-	// Trailing text after last sticon
-	if pos < len(stkTxt) {
-		seg := stkTxt[pos:]
-		plainBuf.WriteString(seg)
-		htmlBuf.WriteString(htmlEscape(seg))
-	}
-
-	if plainBuf.Len() == 0 {
+	if len(replacements) == 0 {
 		return nil
 	}
 
-	body := plainBuf.String()
-	formattedBody := htmlBuf.String()
+	body, formattedBody := buildSticonMessageBodies(stkTxt, replacements)
+	if body == "" {
+		return nil
+	}
 
 	h.Log.Debug().
 		Str("body", body).
@@ -255,6 +233,86 @@ func (h *Handler) convertSticonParts(ctx context.Context, portal *bridgev2.Porta
 	}
 }
 
+func buildSticonMessageBodies(stkTxt string, replacements []sticonReplacement) (string, string) {
+	var plainBuf, htmlBuf bytes.Buffer
+	pos := 0
+
+	sort.SliceStable(replacements, func(i, j int) bool {
+		return replacements[i].start < replacements[j].start
+	})
+
+	for _, r := range replacements {
+		if r.start < pos || r.end <= r.start || r.start > len(stkTxt) || r.end > len(stkTxt) {
+			continue
+		}
+
+		if r.start > pos {
+			seg := stkTxt[pos:r.start]
+			plainBuf.WriteString(seg)
+			htmlBuf.WriteString(htmlEscape(seg))
+		}
+
+		placeholder := stkTxt[r.start:r.end]
+		fallback := inlineSticonFallback(placeholder)
+		if r.mxc != "" {
+			escapedFallback := htmlEscape(fallback)
+			htmlBuf.WriteString(fmt.Sprintf(`<img data-mx-emoticon src="%s" alt="%s" title="%s" height="32" />`, htmlEscape(r.mxc), escapedFallback, escapedFallback))
+		} else {
+			htmlBuf.WriteString(htmlEscape(fallback))
+		}
+		plainBuf.WriteString(fallback)
+
+		pos = r.end
+	}
+
+	if pos < len(stkTxt) {
+		seg := stkTxt[pos:]
+		plainBuf.WriteString(seg)
+		htmlBuf.WriteString(htmlEscape(seg))
+	}
+
+	return plainBuf.String(), htmlBuf.String()
+}
+
+func sticonResourceByteRange(text string, r SticonResource) (int, int, bool) {
+	if r.End <= r.Start {
+		return 0, 0, false
+	}
+	if start, ok := utf16OffsetToByteIndex(text, r.Start); ok {
+		if end, ok := utf16OffsetToByteIndex(text, r.End); ok && end > start {
+			return start, end, true
+		}
+	}
+	if r.Start >= 0 && r.End <= len(text) && utf8.ValidString(text[r.Start:r.End]) {
+		return r.Start, r.End, true
+	}
+	return 0, 0, false
+}
+
+func utf16OffsetToByteIndex(text string, offset int) (int, bool) {
+	if offset < 0 {
+		return 0, false
+	}
+	codeUnits := 0
+	for i, r := range text {
+		if codeUnits == offset {
+			return i, true
+		}
+		if r <= 0xFFFF {
+			codeUnits++
+		} else {
+			codeUnits += 2
+		}
+		if codeUnits == offset {
+			return i + utf8.RuneLen(r), true
+		}
+	}
+	if codeUnits == offset {
+		return len(text), true
+	}
+	return 0, false
+}
+
 // htmlEscape escapes special HTML characters.
 func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
@@ -262,6 +320,50 @@ func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, "\"", "&quot;")
 	return s
+}
+
+func inlineSticonFallback(placeholder string) string {
+	if placeholder == "" || containsLineSticonPlaceholder(placeholder) {
+		return inlineSticonFallbackText
+	}
+	return placeholder
+}
+
+// ContainsLineSticonPlaceholder reports whether text contains LINE's hidden
+// inline-sticon placeholder glyphs. They are private-use characters that Matrix
+// clients commonly render as replacement boxes.
+func ContainsLineSticonPlaceholder(text string) bool {
+	return containsLineSticonPlaceholder(text)
+}
+
+func containsLineSticonPlaceholder(text string) bool {
+	for _, r := range text {
+		if isLineSticonPlaceholderRune(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanInlineSticonPlaceholders(text string) string {
+	var b strings.Builder
+	replaced := false
+	for _, r := range text {
+		if isLineSticonPlaceholderRune(r) {
+			if !replaced {
+				b.WriteString(inlineSticonFallbackText)
+				replaced = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		replaced = false
+	}
+	return b.String()
+}
+
+func isLineSticonPlaceholderRune(r rune) bool {
+	return unicode.Is(unicode.Co, r)
 }
 
 // parseSticonBody extracts sticon resources from the REPLACE.sticon.resources
@@ -280,6 +382,16 @@ func parseSticonBody(body string) ([]SticonResource, error) {
 		}
 	}
 	return rb.Replace.Sticon.Resources, nil
+}
+
+// HasSticonBody reports whether a decrypted LINE JSON text body contains
+// inline sticon replacement metadata.
+func HasSticonBody(body string) bool {
+	if !strings.HasPrefix(body, "{") {
+		return false
+	}
+	resources, err := parseSticonBody(body)
+	return err == nil && len(resources) > 0
 }
 
 // tryDownloadSticon attempts to download a sticon/stamp image from the LINE CDN
