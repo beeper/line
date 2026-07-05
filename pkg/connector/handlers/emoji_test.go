@@ -5,19 +5,23 @@ import (
 	"testing"
 )
 
+const (
+	testLineSticonPlaceholder1 = "\U00100084"
+	testLineSticonPlaceholder2 = "\U00100085"
+)
+
 func TestSticonResourceByteRangeUsesUTF16Offsets(t *testing.T) {
 	prefix := "\u30d6\u30e9\u30b8\u30eb "
-	placeholder := "\U00100084"
-	text := prefix + placeholder + " \u3064\u307e\u3089\u306a\u304b\u3063\u305f"
+	text := prefix + testLineSticonPlaceholder1 + " \u3064\u307e\u3089\u306a\u304b\u3063\u305f"
 	start := utf16Units(prefix)
-	end := start + utf16Units(placeholder)
+	end := start + utf16Units(testLineSticonPlaceholder1)
 
 	startByte, endByte, ok := sticonResourceByteRange(text, SticonResource{Start: start, End: end})
 	if !ok {
 		t.Fatal("expected UTF-16 sticon offsets to resolve")
 	}
-	if got := text[startByte:endByte]; got != placeholder {
-		t.Fatalf("resolved substring = %q, want %q", got, placeholder)
+	if got := text[startByte:endByte]; got != testLineSticonPlaceholder1 {
+		t.Fatalf("resolved substring = %q, want %q", got, testLineSticonPlaceholder1)
 	}
 }
 
@@ -40,21 +44,19 @@ func TestSticonResourceByteRangeRejectsInvalidOffsets(t *testing.T) {
 }
 
 func TestBuildSticonMessageBodiesRemovesLinePlaceholders(t *testing.T) {
-	first := "\U00100084"
-	second := "\U00100085"
-	text := "\u30d6\u30e9\u30b8\u30eb " + first + " \u3064\u307e\u3089\u306a\u304b\u3063\u305f\n\n\u6226\u3048 " + second + " \u7b11"
-	firstStart := strings.Index(text, first)
-	secondStart := strings.Index(text, second)
+	text := "\u30d6\u30e9\u30b8\u30eb " + testLineSticonPlaceholder1 + " \u3064\u307e\u3089\u306a\u304b\u3063\u305f\n\n\u6226\u3048 " + testLineSticonPlaceholder2 + " \u7b11"
+	firstStart := strings.Index(text, testLineSticonPlaceholder1)
+	secondStart := strings.Index(text, testLineSticonPlaceholder2)
 
 	body, formatted := buildSticonMessageBodies(text, []sticonReplacement{
-		{start: secondStart, end: secondStart + len(second), mxc: "mxc://line/emoji2"},
-		{start: firstStart, end: firstStart + len(first), mxc: "mxc://line/emoji1"},
+		{start: secondStart, end: secondStart + len(testLineSticonPlaceholder2), mxc: "mxc://line/emoji2"},
+		{start: firstStart, end: firstStart + len(testLineSticonPlaceholder1), mxc: "mxc://line/emoji1"},
 	})
 
-	if strings.Contains(body, first) || strings.Contains(body, second) {
+	if strings.Contains(body, testLineSticonPlaceholder1) || strings.Contains(body, testLineSticonPlaceholder2) {
 		t.Fatalf("body still contains LINE placeholders: %q", body)
 	}
-	if strings.Contains(formatted, first) || strings.Contains(formatted, second) {
+	if strings.Contains(formatted, testLineSticonPlaceholder1) || strings.Contains(formatted, testLineSticonPlaceholder2) {
 		t.Fatalf("formatted body still contains LINE placeholders: %q", formatted)
 	}
 
@@ -73,10 +75,9 @@ func TestBuildSticonMessageBodiesRemovesLinePlaceholders(t *testing.T) {
 }
 
 func TestBuildSticonMessageBodiesSkipsInvalidReplacements(t *testing.T) {
-	placeholder := "\U00100084"
-	text := "a" + placeholder + "def"
-	start := strings.Index(text, placeholder)
-	end := start + len(placeholder)
+	text := "a" + testLineSticonPlaceholder1 + "def"
+	start := strings.Index(text, testLineSticonPlaceholder1)
+	end := start + len(testLineSticonPlaceholder1)
 
 	body, formatted := buildSticonMessageBodies(text, []sticonReplacement{
 		{start: start, end: end, mxc: "mxc://line/emoji1"},
@@ -107,14 +108,14 @@ func TestBuildSticonMessageBodiesSkipsInvalidReplacements(t *testing.T) {
 }
 
 func TestCleanInlineSticonPlaceholders(t *testing.T) {
-	text := "a\U00100084\U00100085b"
+	text := "a" + testLineSticonPlaceholder1 + testLineSticonPlaceholder2 + "b"
 	if got, want := cleanInlineSticonPlaceholders(text), "a[Emoji]b"; got != want {
 		t.Fatalf("cleanInlineSticonPlaceholders = %q, want %q", got, want)
 	}
 }
 
 func TestLineSticonPlaceholderDetectionIsNarrow(t *testing.T) {
-	if !ContainsLineSticonPlaceholder("\U00100084") {
+	if !ContainsLineSticonPlaceholder(testLineSticonPlaceholder1) {
 		t.Fatal("expected LINE sticon placeholder to be detected")
 	}
 	for _, text := range []string{"\uf8ff", "\U000f0084"} {
