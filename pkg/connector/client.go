@@ -20,6 +20,8 @@ import (
 
 var errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
 
+const lineMissingE2EEKeyMessage = "LINE encryption keys are unavailable. Reconnect LINE in Beeper to restore message decryption."
+
 var newLineAPIClient = line.NewClient
 var newE2EEManager = e2ee.NewManager
 
@@ -301,6 +303,31 @@ func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
 	if err := lc.UserLogin.Save(ctx); err != nil && lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save LINE session invalidation")
 	}
+}
+
+func (lc *LineClient) markMissingE2EEKey(ctx context.Context, err error) {
+	if !errors.Is(err, e2ee.ErrMissingOwnPrivateKey) || lc.UserLogin == nil {
+		return
+	}
+	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		needsSave := !meta.ForceFullE2EELogin || meta.Certificate != ""
+		meta.ForceFullE2EELogin = true
+		meta.Certificate = ""
+		if needsSave {
+			if errSave := lc.UserLogin.Save(ctx); errSave != nil && lc.UserLogin.Bridge != nil {
+				lc.UserLogin.Bridge.Log.Warn().Err(errSave).Msg("Failed to save LINE E2EE reconnect requirement")
+			}
+		}
+	}
+	if lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE E2EE private key missing; marking login for full reconnect")
+	}
+	lc.UserLogin.BridgeState.Send(status.BridgeState{
+		StateEvent: status.StateBadCredentials,
+		Error:      "line-e2ee-key-missing",
+		Message:    lineMissingE2EEKeyMessage,
+		UserAction: status.UserActionRelogin,
+	})
 }
 
 // recoverToken attempts to restore a valid session by refreshing, then re-logging in.

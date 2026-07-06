@@ -724,6 +724,12 @@ func (m *Manager) channelFromKeyIDs(senderKeyID, receiverKeyID int) (int, error)
 		privRaw, pubRaw = receiverKeyID, senderKeyID
 		privKeyID = id
 	} else {
+		if _, ok := peerPub[senderKeyID]; ok {
+			return 0, fmt.Errorf("%w for %d", ErrMissingOwnPrivateKey, receiverKeyID)
+		}
+		if _, ok := peerPub[receiverKeyID]; ok {
+			return 0, fmt.Errorf("%w for %d", ErrMissingOwnPrivateKey, senderKeyID)
+		}
 		return 0, fmt.Errorf("no matching private key for senderKeyID=%d receiverKeyID=%d", senderKeyID, receiverKeyID)
 	}
 

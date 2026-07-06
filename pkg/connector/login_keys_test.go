@@ -133,6 +133,53 @@ func TestStartWithOverrideKeepsCertificateWithStoredE2EEKeys(t *testing.T) {
 	}
 }
 
+func TestStartWithOverrideForcesFullReconnectWhenE2EEKeyMissing(t *testing.T) {
+	oldLogin := loginWithCredentials
+	var gotCertificate string
+	loginWithCredentials = func(_, _, certificate string) (*line.LoginResult, error) {
+		gotCertificate = certificate
+		return nil, errors.New("login failed")
+	}
+	t.Cleanup(func() {
+		loginWithCredentials = oldLogin
+	})
+
+	ll := &LineEmailLogin{}
+	override := &bridgev2.UserLogin{
+		Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
+		UserLogin: &database.UserLogin{
+			Metadata: &UserLoginMetadata{
+				Email:              "user@example.com",
+				Password:           "password",
+				Certificate:        "stored-certificate",
+				ExportedKeyMap:     map[string]string{"old-key-id": "old-export"},
+				ForceFullE2EELogin: true,
+			},
+		},
+	}
+
+	if _, err := ll.StartWithOverride(context.Background(), override); err != nil {
+		t.Fatalf("StartWithOverride returned error: %v", err)
+	}
+	if gotCertificate != "" {
+		t.Fatalf("certificate = %q, want empty to force full E2EE reconnect", gotCertificate)
+	}
+}
+
+func TestShouldPreserveExistingE2EEKeys(t *testing.T) {
+	existing := &UserLoginMetadata{ExportedKeyMap: map[string]string{"old-key-id": "old-export"}}
+	if !shouldPreserveExistingE2EEKeys(false, existing) {
+		t.Fatal("expected existing keys to be preserved when no new keys were exported")
+	}
+	if shouldPreserveExistingE2EEKeys(true, existing) {
+		t.Fatal("must not preserve existing keys when new keys were exported")
+	}
+	existing.ForceFullE2EELogin = true
+	if shouldPreserveExistingE2EEKeys(false, existing) {
+		t.Fatal("must not preserve stale keys after missing-key forced full reconnect")
+	}
+}
+
 func TestRefreshLoginE2EEKeysKeepsMetadataOnExportFailure(t *testing.T) {
 	oldManager := newE2EEManager
 	exportErr := errors.New("manager unavailable")

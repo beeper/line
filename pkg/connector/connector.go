@@ -116,6 +116,7 @@ type UserLoginMetadata struct {
 	E2EEVersion        string            `json:"e2ee_version,omitempty"`
 	E2EEKeyID          string            `json:"e2ee_key_id,omitempty"`
 	ExportedKeyMap     map[string]string `json:"exported_key_map,omitempty"`
+	ForceFullE2EELogin bool              `json:"force_full_e2ee_login,omitempty"`
 	BlockedMIDs        []string          `json:"blocked_mids,omitempty"`
 }
 
@@ -204,10 +205,13 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 	if ll.Email == "" || ll.Password == "" {
 		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
 	}
-	if len(meta.ExportedKeyMap) == 0 {
+	if meta.ForceFullE2EELogin || len(meta.ExportedKeyMap) == 0 {
 		ll.Certificate = ""
 		if override.Bridge != nil {
-			override.Bridge.Log.Info().Msg("No stored LINE E2EE keys, forcing full reconnect")
+			override.Bridge.Log.Info().
+				Bool("missing_e2ee_key", meta.ForceFullE2EELogin).
+				Bool("has_exported_keys", len(meta.ExportedKeyMap) > 0).
+				Msg("Forcing full LINE reconnect to refresh E2EE keys")
 		}
 	}
 
@@ -445,7 +449,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
 
 	exportedKeys := ll.fetchLoginKeys(res, meta, client)
-	if !exportedKeys && ll.ExistingMetadata != nil && len(ll.ExistingMetadata.ExportedKeyMap) > 0 {
+	if shouldPreserveExistingE2EEKeys(exportedKeys, ll.ExistingMetadata) {
 		copyLoginE2EEKeyMetadata(meta, ll.ExistingMetadata)
 		ll.User.Bridge.Log.Info().Int("keys", len(meta.ExportedKeyMap)).Msg("Preserved existing E2EE keys after re-login")
 	}
@@ -528,6 +532,10 @@ func copyLoginE2EEKeyMetadata(dst, src *UserLoginMetadata) {
 	}
 }
 
+func shouldPreserveExistingE2EEKeys(exportedKeys bool, existing *UserLoginMetadata) bool {
+	return !exportedKeys && existing != nil && len(existing.ExportedKeyMap) > 0 && !existing.ForceFullE2EELogin
+}
+
 func loginSecureDataID(meta *UserLoginMetadata, fallback string) string {
 	if meta.Mid != "" {
 		return meta.Mid
@@ -546,6 +554,7 @@ func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginM
 	}
 	saveLoginE2EEKeyMetadata(meta, res)
 	meta.ExportedKeyMap = exported
+	meta.ForceFullE2EELogin = false
 	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(ll.User.MXID)), map[string]any{"exportedKeyMap": exported}); err != nil {
 		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
 	}

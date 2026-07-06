@@ -2,6 +2,7 @@ package e2ee
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
@@ -19,6 +20,21 @@ func TestUnwrapGroupSharedKeyReturnsMissingOwnPrivateKey(t *testing.T) {
 	})
 	if !errors.Is(err, ErrMissingOwnPrivateKey) {
 		t.Fatalf("err = %v, want ErrMissingOwnPrivateKey", err)
+	}
+}
+
+func TestChannelFromKeyIDsReturnsMissingOwnPrivateKeyWhenPeerKeyKnown(t *testing.T) {
+	manager := &Manager{
+		peerPublic: map[int]string{1513671: "peer-public-key"},
+		keyByRawID: map[int]int{},
+	}
+
+	_, err := manager.channelFromKeyIDs(1513671, 5920082)
+	if !errors.Is(err, ErrMissingOwnPrivateKey) {
+		t.Fatalf("err = %v, want ErrMissingOwnPrivateKey", err)
+	}
+	if !strings.Contains(err.Error(), "5920082") {
+		t.Fatalf("err = %v, want missing key ID in error", err)
 	}
 }
 
