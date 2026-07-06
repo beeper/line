@@ -34,6 +34,16 @@ const (
 	beeperExcludeFromTimelineKey = "com.beeper.exclude_from_timeline"
 )
 
+var (
+	getLastOpRevisionWithClient = func(client *line.Client) (int64, error) {
+		return client.GetLastOpRevision()
+	}
+	listenSSEWithClient = func(client *line.Client, ctx context.Context, localRev int64, handler func(eventType, data string)) error {
+		return client.ListenSSE(ctx, localRev, handler)
+	}
+	sseReconnectDelay = 3 * time.Second
+)
+
 func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
 	client := lc.newClient()
 	res, err := client.GetMessageBoxes(opts)
@@ -1150,7 +1160,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	client := lc.newClient()
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
-	rev, err := client.GetLastOpRevision()
+	rev, err := getLastOpRevisionWithClient(client)
 	if err != nil && lc.isLoggedOut(err) {
 		lc.markLoggedOutByOtherClient(ctx, err)
 		return
@@ -1158,7 +1168,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
-			rev, err = client.GetLastOpRevision()
+			rev, err = getLastOpRevisionWithClient(client)
 		} else {
 			lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token for getLastOpRevision")
 		}
@@ -1223,7 +1233,8 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	}
 
 	for {
-		err := client.ListenSSE(ctx, localRev, handler)
+		client = lc.newClient()
+		err := listenSSEWithClient(client, ctx, localRev, handler)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
@@ -1251,10 +1262,9 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 						})
 						return
 					}
-					client = lc.newClient()
 				}
 			}
-			time.Sleep(3 * time.Second)
+			time.Sleep(sseReconnectDelay)
 		}
 	}
 }

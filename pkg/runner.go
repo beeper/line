@@ -481,20 +481,13 @@ func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (int, error) {
 
 	id := r.putChannel(chanPtr)
 
-	// If we have raw key material, also create a pure Go channel
+	// If we have raw key material, also create a pure Go channel. This cache is
+	// best-effort; the WASM channel above is the authoritative channel.
 	if goKey, ok := r.goKeys[keyID]; ok && goKey.privKey != nil {
 		goChan, err := ltsm.NewChannel(goKey.privKey, peerPubBytes)
 		if err == nil {
 			r.goChannels[id] = goChan
-		} else {
-			fmt.Printf("DEBUG ChannelCreate: NewChannel failed: %v (keyID=%d len(privKey)=%d)\n", err, keyID, len(goKey.privKey))
 		}
-	} else {
-		fmt.Printf("DEBUG ChannelCreate: no goKey for keyID=%d (goKeys has keys: ", keyID)
-		for k := range r.goKeys {
-			fmt.Printf("%d ", k)
-		}
-		fmt.Printf(")\n")
 	}
 
 	return id, nil
