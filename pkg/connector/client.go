@@ -20,6 +20,8 @@ import (
 
 var errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
 
+const lineMissingE2EEKeyMessage = "LINE encryption keys are unavailable. Reconnect LINE in Beeper to restore message decryption."
+
 var newLineAPIClient = line.NewClient
 var newE2EEManager = e2ee.NewManager
 
@@ -44,9 +46,11 @@ type LineClient struct {
 	sentReqSeqs map[int]time.Time
 	lastReqSeq  int
 
-	tokenMu     sync.RWMutex
-	recoverMu   sync.Mutex
-	recoverTime time.Time
+	tokenMu              sync.RWMutex
+	recoverMu            sync.Mutex
+	recoverTime          time.Time
+	missingE2EEKeyMu     sync.Mutex
+	missingE2EEKeyMarked bool
 	// sessionInvalidated is set when LINE forcefully logs out this Chrome-style
 	// session. It prevents background calls from re-logging in before the user
 	// clicks Reconnect.
@@ -301,6 +305,49 @@ func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
 	if err := lc.UserLogin.Save(ctx); err != nil && lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save LINE session invalidation")
 	}
+}
+
+func (lc *LineClient) markMissingE2EEKey(ctx context.Context, err error) {
+	if !errors.Is(err, e2ee.ErrMissingOwnPrivateKey) || lc.UserLogin == nil {
+		return
+	}
+	lc.missingE2EEKeyMu.Lock()
+	if lc.missingE2EEKeyMarked {
+		lc.missingE2EEKeyMu.Unlock()
+		return
+	}
+	lc.missingE2EEKeyMarked = true
+	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		needsSave := !meta.ForceFullE2EELogin || meta.Certificate != ""
+		meta.ForceFullE2EELogin = true
+		meta.Certificate = ""
+		if !needsSave {
+			lc.missingE2EEKeyMu.Unlock()
+			return
+		}
+		lc.missingE2EEKeyMu.Unlock()
+		if errSave := lc.UserLogin.Save(ctx); errSave != nil && lc.UserLogin.Bridge != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(errSave).Msg("Failed to save LINE E2EE reconnect requirement")
+		}
+	} else {
+		lc.missingE2EEKeyMu.Unlock()
+	}
+	if lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE E2EE private key missing; marking login for full reconnect")
+	}
+	lc.UserLogin.BridgeState.Send(status.BridgeState{
+		StateEvent: status.StateBadCredentials,
+		Error:      "line-e2ee-key-missing",
+		Message:    lineMissingE2EEKeyMessage,
+		UserAction: status.UserActionRelogin,
+	})
+}
+
+func (lc *LineClient) applyRefreshedLoginE2EEKeys(meta *UserLoginMetadata, res *line.LoginResult, exported map[string]string) {
+	lc.missingE2EEKeyMu.Lock()
+	defer lc.missingE2EEKeyMu.Unlock()
+	applyExportedLoginE2EEKeys(meta, res, exported)
+	lc.missingE2EEKeyMarked = false
 }
 
 // recoverToken attempts to restore a valid session by refreshing, then re-logging in.
@@ -566,15 +613,14 @@ func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLogi
 	if err != nil {
 		return err
 	}
-	saveLoginE2EEKeyMetadata(meta, res)
-	meta.ExportedKeyMap = exported
-	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")
-	}
 	if lc.E2EE != nil {
 		if err := lc.E2EE.LoadMyKeyFromExportedMap(exported); err != nil {
 			return fmt.Errorf("load exported keys into active E2EE manager: %w", err)
 		}
+	}
+	lc.applyRefreshedLoginE2EEKeys(meta, res, exported)
+	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")
 	}
 	lc.UserLogin.Bridge.Log.Info().Int("keys", len(exported)).Msg("Refreshed E2EE keys after re-login")
 	return nil

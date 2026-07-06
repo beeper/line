@@ -50,7 +50,7 @@ func e2eeChunkLengths(chunks []string) []int {
 	return lengths
 }
 
-func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+func messageDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int, finalKeyIDField string) *zerolog.Event {
 	evt = evt.
 		Str("msg_id", msg.ID).
 		Str("chat_mid", chatMID).
@@ -71,14 +71,22 @@ func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID strin
 		} else {
 			evt = evt.Str("sender_key_id_error", err.Error())
 		}
-		if groupKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
-			evt = evt.Int("group_key_id", groupKeyID)
+		if finalKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
+			evt = evt.Int(finalKeyIDField, finalKeyID)
 		} else {
-			evt = evt.Str("group_key_id_error", err.Error())
+			evt = evt.Str(finalKeyIDField+"_error", err.Error())
 		}
 	}
 
 	return evt
+}
+
+func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+	return messageDecryptLogContext(evt, msg, chatMID, opType, "group_key_id")
+}
+
+func directDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+	return messageDecryptLogContext(evt, msg, chatMID, opType, "receiver_key_id")
 }
 
 type messageWithChatInfo struct {
@@ -264,36 +272,56 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 					bodyText = pt
 					decryptionFailed = false
 				} else {
-					lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("DecryptMessageV2 failed on first attempt")
+					directDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
+						Msg("DecryptMessageV2 failed on first attempt")
 					if _, _, errKey := lc.E2EE.MyKeyIDs(); errKey != nil {
-						lc.UserLogin.Bridge.Log.Error().Msg("E2EE own key not loaded — cannot decrypt any messages. Re-login required.")
+						directDecryptLogContext(lc.UserLogin.Bridge.Log.Error().Err(errKey), msg, portalIDStr, opType).
+							Msg("E2EE own key not loaded; cannot decrypt any messages. Re-login required")
+						lc.markMissingE2EEKey(context.Background(), fmt.Errorf("%w: %v", e2ee.ErrMissingOwnPrivateKey, errKey))
 					} else {
 						peerMid := msg.From
-						if peerMid == lc.Mid || peerMid == string(lc.UserLogin.ID) {
+						peerKeyID := 0
+						messageFromMe := peerMid == lc.Mid || peerMid == string(lc.UserLogin.ID)
+						if messageFromMe {
 							peerMid = msg.To
 						}
 						// Fetch the EXACT keyID the message used (handles peer key rotation)
 						// before falling back to negotiating the peer's current key.
 						fetched := false
 						if len(msg.Chunks) >= 5 {
-							if receiverKeyID, errKID := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); errKID == nil && receiverKeyID != 0 {
-								if _, _, errPeer := lc.ensurePeerKeyByID(context.Background(), peerMid, receiverKeyID); errPeer == nil {
+							senderKeyID, errSender := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-2])
+							receiverKeyID, errReceiver := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1])
+							if errSender == nil {
+								peerKeyID = senderKeyID
+							}
+							if messageFromMe && errReceiver == nil {
+								peerKeyID = receiverKeyID
+							}
+							if peerKeyID != 0 {
+								if _, _, errPeer := lc.ensurePeerKeyByID(context.Background(), peerMid, peerKeyID); errPeer == nil {
 									fetched = true
 								} else {
-									lc.UserLogin.Bridge.Log.Debug().Err(errPeer).Str("peer", peerMid).Int("key_id", receiverKeyID).Msg("ensurePeerKeyByID failed on retry, falling back to NegotiateE2EEPublicKey")
+									directDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(errPeer), msg, portalIDStr, opType).
+										Str("peer", peerMid).
+										Int("key_id", peerKeyID).
+										Msg("ensurePeerKeyByID failed on retry, falling back to NegotiateE2EEPublicKey")
 								}
 							}
 						}
 						if !fetched {
 							if _, _, errPeer := lc.ensurePeerKey(context.Background(), peerMid); errPeer != nil {
-								lc.UserLogin.Bridge.Log.Warn().Err(errPeer).Str("peer", peerMid).Msg("Failed to force-fetch peer key for retry")
+								directDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errPeer), msg, portalIDStr, opType).
+									Str("peer", peerMid).
+									Msg("Failed to force-fetch peer key for retry")
 							}
 						}
 						if ptRetry, errRetry := lc.E2EE.DecryptMessageV2(msg); errRetry == nil {
 							bodyText = ptRetry
 							decryptionFailed = false
 						} else {
-							lc.UserLogin.Bridge.Log.Warn().Err(errRetry).Msg("DecryptMessageV2 failed on retry")
+							directDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
+								Msg("DecryptMessageV2 failed on retry")
+							lc.markMissingE2EEKey(context.Background(), errRetry)
 						}
 					}
 				}
