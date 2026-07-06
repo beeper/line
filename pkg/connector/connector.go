@@ -519,6 +519,12 @@ func saveLoginE2EEKeyMetadata(meta *UserLoginMetadata, res *line.LoginResult) {
 	meta.E2EEKeyID = res.E2EEKeyID
 }
 
+func applyExportedLoginE2EEKeys(meta *UserLoginMetadata, res *line.LoginResult, exported map[string]string) {
+	saveLoginE2EEKeyMetadata(meta, res)
+	meta.ExportedKeyMap = exported
+	meta.ForceFullE2EELogin = false
+}
+
 func copyLoginE2EEKeyMetadata(dst, src *UserLoginMetadata) {
 	dst.EncryptedKeyChain = src.EncryptedKeyChain
 	dst.E2EEPublicKey = src.E2EEPublicKey
@@ -552,9 +558,7 @@ func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginM
 		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to export E2EE keys")
 		return false
 	}
-	saveLoginE2EEKeyMetadata(meta, res)
-	meta.ExportedKeyMap = exported
-	meta.ForceFullE2EELogin = false
+	applyExportedLoginE2EEKeys(meta, res, exported)
 	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(ll.User.MXID)), map[string]any{"exportedKeyMap": exported}); err != nil {
 		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
 	}

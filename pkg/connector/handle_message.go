@@ -50,7 +50,7 @@ func e2eeChunkLengths(chunks []string) []int {
 	return lengths
 }
 
-func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+func messageDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int, finalKeyIDField string) *zerolog.Event {
 	evt = evt.
 		Str("msg_id", msg.ID).
 		Str("chat_mid", chatMID).
@@ -71,45 +71,22 @@ func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID strin
 		} else {
 			evt = evt.Str("sender_key_id_error", err.Error())
 		}
-		if groupKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
-			evt = evt.Int("group_key_id", groupKeyID)
+		if finalKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
+			evt = evt.Int(finalKeyIDField, finalKeyID)
 		} else {
-			evt = evt.Str("group_key_id_error", err.Error())
+			evt = evt.Str(finalKeyIDField+"_error", err.Error())
 		}
 	}
 
 	return evt
 }
 
+func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+	return messageDecryptLogContext(evt, msg, chatMID, opType, "group_key_id")
+}
+
 func directDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
-	evt = evt.
-		Str("msg_id", msg.ID).
-		Str("chat_mid", chatMID).
-		Str("from", msg.From).
-		Str("to", msg.To).
-		Int("to_type", msg.ToType).
-		Int("op_type", opType).
-		Int("content_type", msg.ContentType).
-		Int("chunk_count", len(msg.Chunks)).
-		Ints("chunk_lengths", e2eeChunkLengths(msg.Chunks))
-
-	if version := msg.ContentMetadata["e2eeVersion"]; version != "" {
-		evt = evt.Str("e2ee_version", version)
-	}
-	if len(msg.Chunks) >= 5 {
-		if senderKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-2]); err == nil {
-			evt = evt.Int("sender_key_id", senderKeyID)
-		} else {
-			evt = evt.Str("sender_key_id_error", err.Error())
-		}
-		if receiverKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
-			evt = evt.Int("receiver_key_id", receiverKeyID)
-		} else {
-			evt = evt.Str("receiver_key_id_error", err.Error())
-		}
-	}
-
-	return evt
+	return messageDecryptLogContext(evt, msg, chatMID, opType, "receiver_key_id")
 }
 
 type messageWithChatInfo struct {
@@ -298,7 +275,9 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 					directDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
 						Msg("DecryptMessageV2 failed on first attempt")
 					if _, _, errKey := lc.E2EE.MyKeyIDs(); errKey != nil {
-						lc.UserLogin.Bridge.Log.Error().Msg("E2EE own key not loaded — cannot decrypt any messages. Re-login required.")
+						directDecryptLogContext(lc.UserLogin.Bridge.Log.Error().Err(errKey), msg, portalIDStr, opType).
+							Msg("E2EE own key not loaded; cannot decrypt any messages. Re-login required")
+						lc.markMissingE2EEKey(context.Background(), fmt.Errorf("%w: %v", e2ee.ErrMissingOwnPrivateKey, errKey))
 					} else {
 						peerMid := msg.From
 						peerKeyID := 0

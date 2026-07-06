@@ -33,6 +33,37 @@ func TestSaveLoginE2EEKeyMetadata(t *testing.T) {
 	}
 }
 
+func TestApplyExportedLoginE2EEKeysClearsForcedReconnect(t *testing.T) {
+	meta := &UserLoginMetadata{
+		EncryptedKeyChain:  "old-keychain",
+		E2EEPublicKey:      "old-public-key",
+		E2EEVersion:        "1",
+		E2EEKeyID:          "old-key-id",
+		ExportedKeyMap:     map[string]string{"old-key-id": "old-export"},
+		ForceFullE2EELogin: true,
+	}
+	res := &line.LoginResult{
+		EncryptedKeyChain: "new-keychain",
+		E2EEPublicKey:     "new-public-key",
+		E2EEVersion:       "2",
+		E2EEKeyID:         "new-key-id",
+	}
+	exported := map[string]string{"new-key-id": "new-export"}
+
+	applyExportedLoginE2EEKeys(meta, res, exported)
+
+	if meta.EncryptedKeyChain != res.EncryptedKeyChain ||
+		meta.E2EEPublicKey != res.E2EEPublicKey ||
+		meta.E2EEVersion != res.E2EEVersion ||
+		meta.E2EEKeyID != res.E2EEKeyID ||
+		meta.ExportedKeyMap["new-key-id"] != "new-export" {
+		t.Fatalf("metadata = %#v, want refreshed E2EE fields", meta)
+	}
+	if meta.ForceFullE2EELogin {
+		t.Fatal("successful key refresh must clear ForceFullE2EELogin")
+	}
+}
+
 func TestCopyLoginE2EEKeyMetadataClonesExportedKeyMap(t *testing.T) {
 	src := &UserLoginMetadata{
 		EncryptedKeyChain: "encrypted-keychain",
