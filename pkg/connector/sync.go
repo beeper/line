@@ -1267,9 +1267,13 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, err error) boo
 		return true
 	}
 
-	if _, profileErr := getProfileWithToken(lc.getAccessToken()); lc.isLoggedOut(profileErr) {
+	_, profileErr := getProfileWithToken(lc.getAccessToken())
+	if lc.isLoggedOut(profileErr) {
 		lc.markLoggedOutByOtherClient(ctx, profileErr)
 		return true
+	}
+	if profileErr == nil {
+		return false
 	}
 
 	if !lc.shouldAttemptTokenRecovery(ctx, err) {
@@ -1281,8 +1285,10 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, err error) boo
 			lc.markLoggedOutByOtherClient(ctx, errRecover)
 			return true
 		}
-		lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
-		if lc.UserLogin.BridgeState != nil {
+		if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+			lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
+		}
+		if lc.UserLogin != nil && lc.UserLogin.BridgeState != nil {
 			lc.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      "line-logged-out",

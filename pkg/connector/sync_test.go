@@ -138,3 +138,35 @@ func TestReceiveRequestNeedLoginMarksLoggedOutImmediately(t *testing.T) {
 		t.Fatal("session was not marked invalidated")
 	}
 }
+
+func TestReceiveAuthErrorWithValidProfileDoesNotRecover(t *testing.T) {
+	oldGetProfile := getProfileWithToken
+	t.Cleanup(func() {
+		getProfileWithToken = oldGetProfile
+	})
+
+	var profileCalls int
+	getProfileWithToken = func(token string) (*line.Profile, error) {
+		profileCalls++
+		if token != "valid" {
+			t.Fatalf("profile token = %q, want valid", token)
+		}
+		return &line.Profile{}, nil
+	}
+
+	lc := &LineClient{AccessToken: "valid"}
+	stopped := lc.handleReceiveAuthError(context.Background(), errors.New("SSE error: 401"))
+
+	if stopped {
+		t.Fatal("receive auth handler should reconnect without stopping when the profile probe succeeds")
+	}
+	if profileCalls != 1 {
+		t.Fatalf("profile calls = %d, want 1", profileCalls)
+	}
+	if !lc.hasAccessToken() {
+		t.Fatal("valid access token was invalidated")
+	}
+	if lc.isSessionInvalidated() {
+		t.Fatal("valid session was marked invalidated")
+	}
+}

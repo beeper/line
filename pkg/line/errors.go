@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -50,8 +51,7 @@ func IsRequestNeedLogin(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "request_need_login") ||
-		strings.Contains(msg, "\"code\":10004") ||
-		strings.Contains(msg, "\"code\": 10004")
+		hasJSONCode(msg, 10004)
 }
 
 func IsUnauthorizedStatus(err error) bool {
@@ -199,6 +199,19 @@ func hasResponseErrorCode(msg string) bool {
 	return strings.Contains(msg, "\"code\":10051") ||
 		strings.Contains(msg, "\"code\": 10051") ||
 		strings.Contains(msg, "code 10051")
+}
+
+func hasJSONCode(msg string, code int) bool {
+	value := strconv.Itoa(code)
+	for _, prefix := range []string{`"code":`, `"code": `} {
+		codeStart := prefix + value
+		for _, suffix := range []string{",", "}", " ", "\t", "\r", "\n"} {
+			if strings.Contains(msg, codeStart+suffix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isNoUsableE2EEGroupKeyTalkException(message string, data talkExceptionData) bool {
