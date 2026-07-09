@@ -94,3 +94,19 @@ func TestIsUnauthorizedStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestIsTalkExceptionNotFound(t *testing.T) {
+	err := errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":5,"reason":"not found","parameterMap":null}}`)
+	if !IsTalkExceptionNotFound(err) {
+		t.Fatal("expected TalkException code 5 not found to be detected")
+	}
+	if IsTalkExceptionNotFound(errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":10,"reason":"not a member","parameterMap":null}}`)) {
+		t.Fatal("not-a-member should not be classified as not-found")
+	}
+	if IsTalkExceptionNotFound(errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":5,"reason":"different","parameterMap":null}}`)) {
+		t.Fatal("code 5 with a different reason should not be classified as not-found")
+	}
+	if IsTalkExceptionNotFound(nil) {
+		t.Fatal("nil should not be classified as not-found")
+	}
+}

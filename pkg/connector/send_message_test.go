@@ -67,3 +67,48 @@ func TestLineGroupE2EEFetchFailureErrorWrapsMissingPrivateKeyStatus(t *testing.T
 		t.Fatalf("status = %#v, want reconnect failure notice", status)
 	}
 }
+
+func TestShouldRetrySendWithoutReplyRelation(t *testing.T) {
+	err := errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":5,"reason":"not found","parameterMap":null}}`)
+	msg := &line.Message{RelatedMessageID: "1234567890"}
+
+	if !shouldRetrySendWithoutReplyRelation(msg, err) {
+		t.Fatal("expected related-message not found error to trigger retry")
+	}
+
+	msg.RelatedMessageID = ""
+	if shouldRetrySendWithoutReplyRelation(msg, err) {
+		t.Fatal("message without reply relation should not retry")
+	}
+
+	msg.RelatedMessageID = "1234567890"
+	if shouldRetrySendWithoutReplyRelation(msg, errors.New("other error")) {
+		t.Fatal("non-LINE not found error should not retry")
+	}
+}
+
+func TestClearReplyRelation(t *testing.T) {
+	msg := &line.Message{
+		RelatedMessageID:          "1234567890",
+		MessageRelationType:       3,
+		RelatedMessageServiceCode: 1,
+		ContentMetadata: map[string]string{
+			"message_relation_server_message_id": "1234567890",
+			"message_relation_type":              "3",
+			"message_relation_service_code":      "1",
+			"keep":                               "value",
+		},
+	}
+
+	clearReplyRelation(msg)
+
+	if msg.RelatedMessageID != "" || msg.MessageRelationType != 0 || msg.RelatedMessageServiceCode != 0 {
+		t.Fatalf("reply relation was not cleared: %#v", msg)
+	}
+	if _, ok := msg.ContentMetadata["message_relation_server_message_id"]; ok {
+		t.Fatal("content metadata relation ID was not cleared")
+	}
+	if got := msg.ContentMetadata["keep"]; got != "value" {
+		t.Fatalf("unrelated content metadata = %q, want value", got)
+	}
+}
