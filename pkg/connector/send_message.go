@@ -783,6 +783,20 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
+	if shouldRetrySendWithoutReplyRelation(lineMsg, err) {
+		relatedMessageID := lineMsg.RelatedMessageID
+		clearReplyRelation(lineMsg)
+		lc.UserLogin.Bridge.Log.Warn().
+			Err(err).
+			Str("chat_mid", portalMid).
+			Str("related_message_id", relatedMessageID).
+			Msg("SendMessage failed because LINE could not find reply target, retrying without reply relation")
+
+		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
+		lc.trackReqSeq(retryReqSeq)
+		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -859,6 +873,21 @@ func contentTypeForMsgType(msgType event.MessageType) int {
 		return int(ContentFile)
 	default:
 		return int(ContentText)
+	}
+}
+
+func shouldRetrySendWithoutReplyRelation(msg *line.Message, err error) bool {
+	return msg != nil && msg.RelatedMessageID != "" && line.IsTalkExceptionNotFound(err)
+}
+
+func clearReplyRelation(msg *line.Message) {
+	msg.RelatedMessageID = ""
+	msg.MessageRelationType = 0
+	msg.RelatedMessageServiceCode = 0
+	if msg.ContentMetadata != nil {
+		delete(msg.ContentMetadata, "message_relation_server_message_id")
+		delete(msg.ContentMetadata, "message_relation_type")
+		delete(msg.ContentMetadata, "message_relation_service_code")
 	}
 }
 

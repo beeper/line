@@ -145,6 +145,23 @@ func IsGroupKeyNotRegisteredError(err error) bool {
 		strings.Contains(msg, "group key is not registered")
 }
 
+// IsTalkExceptionNotFound returns true when LINE wraps a TalkException code 5
+// "not found" response. Callers must interpret the method context themselves:
+// the same code can mean different missing resources for different Talk APIs.
+func IsTalkExceptionNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return hasResponseErrorCode(msg) &&
+		strings.Contains(msg, "talkexception") &&
+		(strings.Contains(msg, "\"code\":5,") ||
+			strings.Contains(msg, "\"code\":5}") ||
+			strings.Contains(msg, "\"code\": 5,")) &&
+		(strings.Contains(msg, "\"reason\":\"not found\"") ||
+			strings.Contains(msg, "\"reason\": \"not found\""))
+}
+
 // IsNotAMemberError returns true when the API reports the user is not a member of a chat.
 func IsNotAMemberError(err error) bool {
 	if err == nil {
@@ -167,7 +184,9 @@ func IsInvalidPaidReactionType(err error) bool {
 }
 
 func hasResponseErrorCode(msg string) bool {
-	return strings.Contains(msg, "\"code\":10051") || strings.Contains(msg, "code 10051")
+	return strings.Contains(msg, "\"code\":10051") ||
+		strings.Contains(msg, "\"code\": 10051") ||
+		strings.Contains(msg, "code 10051")
 }
 
 func isNoUsableE2EEGroupKeyTalkException(message string, data talkExceptionData) bool {
