@@ -2,10 +2,12 @@ package line
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestListenSSENonOKIncludesResponseBody(t *testing.T) {
@@ -35,5 +37,38 @@ func TestListenSSENonOKIncludesResponseBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") {
 		t.Fatalf("err = %v, want response body detail", err)
+	}
+}
+
+func TestListenSSEIdleTimeout(t *testing.T) {
+	oldClient := sseHTTPClient
+	oldTimeout := sseIdleTimeout
+	t.Cleanup(func() {
+		sseHTTPClient = oldClient
+		sseIdleTimeout = oldTimeout
+	})
+
+	sseIdleTimeout = 10 * time.Millisecond
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pw.Close()
+	})
+
+	sseHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       pr,
+			}, nil
+		}),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := NewClient("stale-token").ListenSSE(ctx, 0, func(event, data string) {})
+	if !errors.Is(err, ErrSSEIdleTimeout) {
+		t.Fatalf("err = %v, want ErrSSEIdleTimeout", err)
 	}
 }

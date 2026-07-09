@@ -114,6 +114,125 @@ func TestPollLoopMarksLoggedOutWhenReceiveAuthFails(t *testing.T) {
 	}
 }
 
+func TestPollLoopMarksLoggedOutWhenReceiveIdleProbeFailsLoggedOut(t *testing.T) {
+	oldGetLastOpRevision := getLastOpRevisionWithClient
+	oldListenSSE := listenSSEWithClient
+	t.Cleanup(func() {
+		getLastOpRevisionWithClient = oldGetLastOpRevision
+		listenSSEWithClient = oldListenSSE
+	})
+
+	var revisionCalls int
+	getLastOpRevisionWithClient = func(client *line.Client) (int64, error) {
+		if client.AccessToken != "stale" {
+			t.Fatalf("revision probe token = %q, want stale", client.AccessToken)
+		}
+		revisionCalls++
+		if revisionCalls == 1 {
+			return 1234, nil
+		}
+		return 0, errLoggedOut
+	}
+
+	listenSSEWithClient = func(client *line.Client, ctx context.Context, localRev int64, handler func(eventType, data string)) error {
+		if client.AccessToken != "stale" {
+			t.Fatalf("SSE client token = %q, want stale", client.AccessToken)
+		}
+		if localRev != 1234 {
+			t.Fatalf("localRev = %d, want 1234", localRev)
+		}
+		return line.ErrSSEIdleTimeout
+	}
+
+	lc := &LineClient{
+		AccessToken: "stale",
+		UserLogin: &bridgev2.UserLogin{
+			Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
+		},
+	}
+
+	lc.wg.Add(1)
+	lc.pollLoop(context.Background())
+
+	if revisionCalls != 2 {
+		t.Fatalf("revision calls = %d, want 2", revisionCalls)
+	}
+	if lc.hasAccessToken() {
+		t.Fatal("access token was not invalidated after receive idle logout")
+	}
+	if !lc.isSessionInvalidated() {
+		t.Fatal("session was not marked invalidated after receive idle logout")
+	}
+}
+
+func TestPollLoopReconnectsWhenReceiveIdleProbeSucceeds(t *testing.T) {
+	oldGetLastOpRevision := getLastOpRevisionWithClient
+	oldListenSSE := listenSSEWithClient
+	oldReconnectDelay := sseReconnectDelay
+	t.Cleanup(func() {
+		getLastOpRevisionWithClient = oldGetLastOpRevision
+		listenSSEWithClient = oldListenSSE
+		sseReconnectDelay = oldReconnectDelay
+	})
+
+	var revisionCalls int
+	getLastOpRevisionWithClient = func(client *line.Client) (int64, error) {
+		if client.AccessToken != "valid" {
+			t.Fatalf("revision probe token = %q, want valid", client.AccessToken)
+		}
+		revisionCalls++
+		if revisionCalls == 1 {
+			return 1234, nil
+		}
+		// The health probe sees a newer server revision, but reconnecting from it
+		// would skip operations that arrived while the SSE stream was stalled.
+		return 5678, nil
+	}
+	sseReconnectDelay = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var listenCalls int
+	listenSSEWithClient = func(client *line.Client, ctx context.Context, localRev int64, handler func(eventType, data string)) error {
+		if client.AccessToken != "valid" {
+			t.Fatalf("SSE client token = %q, want valid", client.AccessToken)
+		}
+		if localRev != 1234 {
+			t.Fatalf("localRev = %d, want 1234", localRev)
+		}
+		listenCalls++
+		if listenCalls == 1 {
+			return line.ErrSSEIdleTimeout
+		}
+		cancel()
+		return context.Canceled
+	}
+
+	lc := &LineClient{
+		AccessToken: "valid",
+		UserLogin: &bridgev2.UserLogin{
+			Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
+		},
+	}
+
+	lc.wg.Add(1)
+	lc.pollLoop(ctx)
+
+	if revisionCalls != 2 {
+		t.Fatalf("revision calls = %d, want 2", revisionCalls)
+	}
+	if listenCalls != 2 {
+		t.Fatalf("SSE attempts = %d, want 2", listenCalls)
+	}
+	if !lc.hasAccessToken() {
+		t.Fatal("valid access token was invalidated")
+	}
+	if lc.isSessionInvalidated() {
+		t.Fatal("valid session was marked invalidated")
+	}
+}
+
 func TestReceiveRequestNeedLoginMarksLoggedOutImmediately(t *testing.T) {
 	oldGetProfile := getProfileWithToken
 	t.Cleanup(func() {

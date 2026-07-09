@@ -1242,6 +1242,14 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			if err.Error() != "EOF" {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
 
+				if line.IsSSEIdleTimeout(err) {
+					if lc.handleReceiveIdleTimeout(ctx) {
+						return
+					}
+					time.Sleep(sseReconnectDelay)
+					continue
+				}
+
 				if lc.isLoggedOut(err) {
 					lc.markLoggedOutByOtherClient(ctx, err)
 					return
@@ -1256,6 +1264,45 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			time.Sleep(sseReconnectDelay)
 		}
 	}
+}
+
+// handleReceiveIdleTimeout handles /operation/receive streams that stop
+// producing ping/event bytes. Probe Talk auth immediately so forced logouts
+// surface before the next send/read receipt.
+func (lc *LineClient) handleReceiveIdleTimeout(ctx context.Context) bool {
+	// This is only a health probe. Keep localRev unchanged so the reconnected
+	// stream replays operations that arrived while the old stream was stalled.
+	_, probeErr := getLastOpRevisionWithClient(lc.newClient())
+	if probeErr == nil {
+		return false
+	}
+
+	if lc.isLoggedOut(probeErr) {
+		lc.markLoggedOutByOtherClient(ctx, probeErr)
+		return true
+	}
+
+	if line.IsUnauthorizedStatus(probeErr) {
+		return lc.handleReceiveAuthError(ctx, probeErr)
+	}
+
+	if lc.shouldAttemptTokenRecovery(ctx, probeErr) {
+		if errRecover := lc.recoverToken(ctx); errRecover != nil {
+			if errors.Is(errRecover, errLineSessionInvalidated) || lc.isLoggedOut(errRecover) {
+				lc.markLoggedOutByOtherClient(ctx, errRecover)
+				return true
+			}
+			if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+				lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token after receive idle probe")
+			}
+		}
+		return false
+	}
+
+	if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(probeErr).Msg("Receive idle auth probe failed; reconnecting SSE")
+	}
+	return false
 }
 
 // handleReceiveAuthError handles auth failures from /operation/receive. The
