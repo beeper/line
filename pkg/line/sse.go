@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,10 +20,11 @@ var sseHTTPClient = &http.Client{}
 
 var ErrSSEIdleTimeout = errors.New("SSE idle timeout")
 
-const (
-	maxSSEErrorBodyBytes  = 4096
-	defaultSSEIdleTimeout = 150 * time.Second
-)
+const maxSSEErrorBodyBytes = 4096
+
+// LINE advertises a 140s polling timeout. The extra 10s lets a normal
+// server-driven close arrive before the bridge declares the stream idle.
+const defaultSSEIdleTimeout = 150 * time.Second
 
 var sseIdleTimeout = defaultSSEIdleTimeout
 
@@ -69,6 +71,20 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 	}
 
 	reader := bufio.NewReader(resp.Body)
+	idleTimeout := sseIdleTimeout
+	var idleTimedOut atomic.Bool
+	var idleTimer *time.Timer
+	if idleTimeout > 0 {
+		idleTimer = time.AfterFunc(idleTimeout, func() {
+			idleTimedOut.Store(true)
+			_ = resp.Body.Close()
+		})
+		defer idleTimer.Stop()
+	}
+	stopContextClose := context.AfterFunc(ctx, func() {
+		_ = resp.Body.Close()
+	})
+	defer stopContextClose()
 
 	var currentEvent string
 	var dataLines []string
@@ -90,9 +106,18 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 	}
 
 	for {
-		lineBytes, err := readSSELine(ctx, resp.Body, reader)
+		lineBytes, err := reader.ReadBytes('\n')
 		if err != nil {
+			if idleTimedOut.Load() {
+				return fmt.Errorf("%w after %s", ErrSSEIdleTimeout, idleTimeout)
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
+		}
+		if idleTimer != nil {
+			idleTimer.Reset(idleTimeout)
 		}
 
 		line := strings.TrimRight(string(lineBytes), "\r\n")
@@ -117,36 +142,5 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 		default:
 			// ignore other fields for now
 		}
-	}
-}
-
-type sseReadResult struct {
-	line []byte
-	err  error
-}
-
-func readSSELine(ctx context.Context, body io.Closer, reader *bufio.Reader) ([]byte, error) {
-	if sseIdleTimeout <= 0 {
-		return reader.ReadBytes('\n')
-	}
-
-	resultCh := make(chan sseReadResult, 1)
-	go func() {
-		lineBytes, err := reader.ReadBytes('\n')
-		resultCh <- sseReadResult{line: lineBytes, err: err}
-	}()
-
-	timer := time.NewTimer(sseIdleTimeout)
-	defer timer.Stop()
-
-	select {
-	case result := <-resultCh:
-		return result.line, result.err
-	case <-timer.C:
-		_ = body.Close()
-		return nil, fmt.Errorf("%w after %s", ErrSSEIdleTimeout, sseIdleTimeout)
-	case <-ctx.Done():
-		_ = body.Close()
-		return nil, ctx.Err()
 	}
 }

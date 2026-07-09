@@ -181,7 +181,12 @@ func TestPollLoopReconnectsWhenReceiveIdleProbeSucceeds(t *testing.T) {
 			t.Fatalf("revision probe token = %q, want valid", client.AccessToken)
 		}
 		revisionCalls++
-		return 1234, nil
+		if revisionCalls == 1 {
+			return 1234, nil
+		}
+		// The health probe sees a newer server revision, but reconnecting from it
+		// would skip operations that arrived while the SSE stream was stalled.
+		return 5678, nil
 	}
 	sseReconnectDelay = time.Millisecond
 

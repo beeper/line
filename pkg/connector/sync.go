@@ -1243,7 +1243,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
 
 				if line.IsSSEIdleTimeout(err) {
-					if lc.handleReceiveIdleTimeout(ctx, err) {
+					if lc.handleReceiveIdleTimeout(ctx) {
 						return
 					}
 					time.Sleep(sseReconnectDelay)
@@ -1267,10 +1267,11 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 }
 
 // handleReceiveIdleTimeout handles /operation/receive streams that stop
-// producing ping/event bytes. Chrome advertises a 140s polling timeout, so an
-// idle timeout here means the receive path is no longer healthy. Probe Talk
-// auth immediately so forced logouts surface before the next send/read receipt.
-func (lc *LineClient) handleReceiveIdleTimeout(ctx context.Context, _ error) bool {
+// producing ping/event bytes. Probe Talk auth immediately so forced logouts
+// surface before the next send/read receipt.
+func (lc *LineClient) handleReceiveIdleTimeout(ctx context.Context) bool {
+	// This is only a health probe. Keep localRev unchanged so the reconnected
+	// stream replays operations that arrived while the old stream was stalled.
 	_, probeErr := getLastOpRevisionWithClient(lc.newClient())
 	if probeErr == nil {
 		return false
