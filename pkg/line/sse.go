@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 // sseHTTPClient is a dedicated HTTP client for SSE connections with no timeout.
 // Reused across reconnects to avoid allocating a new transport pool each time.
 var sseHTTPClient = &http.Client{}
+
+const maxSSEErrorBodyBytes = 4096
 
 // ListenSSE connects to the Event Stream and blocks
 func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(event, data string)) error {
@@ -45,6 +48,10 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSEErrorBodyBytes))
+		if bodyText := strings.TrimSpace(string(body)); bodyText != "" {
+			return fmt.Errorf("SSE error: %d: %s", resp.StatusCode, bodyText)
+		}
 		return fmt.Errorf("SSE error: %d", resp.StatusCode)
 	}
 

@@ -54,6 +54,15 @@ func TestIsLoggedOut(t *testing.T) {
 	if !IsLoggedOut(errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":83,"reason":"invalid sender key","parameterMap":null}}`)) {
 		t.Fatal("expected invalid sender key to be detected as logged out")
 	}
+	if !IsLoggedOut(errors.New(`SSE error: 401: {"code":10004,"message":"REQUEST_NEED_LOGIN"}`)) {
+		t.Fatal("expected request-need-login to be detected as logged out")
+	}
+	if !IsLoggedOut(errors.New(`SSE error: 401: {"code":10004}`)) {
+		t.Fatal("expected request-need-login code to be detected as logged out")
+	}
+	if IsLoggedOut(errors.New(`SSE error: 401: {"code":100040}`)) {
+		t.Fatal("similar longer numeric code should not be classified as logged out")
+	}
 	if IsLoggedOut(errors.New("Access token refresh required")) {
 		t.Fatal("refresh-required error should not be classified as logged out")
 	}
