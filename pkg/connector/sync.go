@@ -1247,19 +1247,8 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 					return
 				}
 
-				if strings.Contains(err.Error(), "SSE error: 401") ||
-					strings.Contains(err.Error(), "SSE error: 403") {
-					if !lc.shouldAttemptTokenRecovery(ctx, err) {
-						return
-					}
-					if errRecover := lc.recoverToken(ctx); errRecover != nil {
-						lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
-						lc.UserLogin.BridgeState.Send(status.BridgeState{
-							StateEvent: status.StateBadCredentials,
-							Error:      "line-logged-out",
-							Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
-							UserAction: status.UserActionRelogin,
-						})
+				if line.IsUnauthorizedStatus(err) {
+					if lc.handleReceiveAuthError(ctx, err) {
 						return
 					}
 				}
@@ -1267,6 +1256,43 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			time.Sleep(sseReconnectDelay)
 		}
 	}
+}
+
+// handleReceiveAuthError handles auth failures from /operation/receive. The
+// receive endpoint may return only a bare 401/403, so probe getProfile to reveal
+// the detailed forced-logout envelope before deciding whether recovery is safe.
+func (lc *LineClient) handleReceiveAuthError(ctx context.Context, err error) bool {
+	if lc.isLoggedOut(err) {
+		lc.markLoggedOutByOtherClient(ctx, err)
+		return true
+	}
+
+	if _, profileErr := getProfileWithToken(lc.getAccessToken()); lc.isLoggedOut(profileErr) {
+		lc.markLoggedOutByOtherClient(ctx, profileErr)
+		return true
+	}
+
+	if !lc.shouldAttemptTokenRecovery(ctx, err) {
+		return true
+	}
+
+	if errRecover := lc.recoverToken(ctx); errRecover != nil {
+		if errors.Is(errRecover, errLineSessionInvalidated) || lc.isLoggedOut(errRecover) {
+			lc.markLoggedOutByOtherClient(ctx, errRecover)
+			return true
+		}
+		lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
+		if lc.UserLogin.BridgeState != nil {
+			lc.UserLogin.BridgeState.Send(status.BridgeState{
+				StateEvent: status.StateBadCredentials,
+				Error:      "line-logged-out",
+				Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
+				UserAction: status.UserActionRelogin,
+			})
+		}
+		return true
+	}
+	return false
 }
 
 func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {

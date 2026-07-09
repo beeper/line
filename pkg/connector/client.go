@@ -287,15 +287,20 @@ func (lc *LineClient) markLoggedOutByOtherClient(ctx context.Context, err error)
 	if lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated by another client; marking login bad credentials")
 	}
-	lc.UserLogin.BridgeState.Send(status.BridgeState{
-		StateEvent: status.StateBadCredentials,
-		Error:      "line-logged-out",
-		Message:    "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE.",
-		UserAction: status.UserActionRelogin,
-	})
+	if lc.UserLogin.BridgeState != nil {
+		lc.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      "line-logged-out",
+			Message:    "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE.",
+			UserAction: status.UserActionRelogin,
+		})
+	}
 }
 
 func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
+	if lc.UserLogin == nil || lc.UserLogin.UserLogin == nil {
+		return
+	}
 	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	if !ok {
 		return
