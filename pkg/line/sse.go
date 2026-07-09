@@ -3,19 +3,32 @@ package line
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // sseHTTPClient is a dedicated HTTP client for SSE connections with no timeout.
 // Reused across reconnects to avoid allocating a new transport pool each time.
 var sseHTTPClient = &http.Client{}
 
-const maxSSEErrorBodyBytes = 4096
+var ErrSSEIdleTimeout = errors.New("SSE idle timeout")
+
+const (
+	maxSSEErrorBodyBytes  = 4096
+	defaultSSEIdleTimeout = 150 * time.Second
+)
+
+var sseIdleTimeout = defaultSSEIdleTimeout
+
+func IsSSEIdleTimeout(err error) bool {
+	return errors.Is(err, ErrSSEIdleTimeout)
+}
 
 // ListenSSE connects to the Event Stream and blocks
 func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(event, data string)) error {
@@ -77,7 +90,7 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 	}
 
 	for {
-		lineBytes, err := reader.ReadBytes('\n')
+		lineBytes, err := readSSELine(ctx, resp.Body, reader)
 		if err != nil {
 			return err
 		}
@@ -104,5 +117,36 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 		default:
 			// ignore other fields for now
 		}
+	}
+}
+
+type sseReadResult struct {
+	line []byte
+	err  error
+}
+
+func readSSELine(ctx context.Context, body io.Closer, reader *bufio.Reader) ([]byte, error) {
+	if sseIdleTimeout <= 0 {
+		return reader.ReadBytes('\n')
+	}
+
+	resultCh := make(chan sseReadResult, 1)
+	go func() {
+		lineBytes, err := reader.ReadBytes('\n')
+		resultCh <- sseReadResult{line: lineBytes, err: err}
+	}()
+
+	timer := time.NewTimer(sseIdleTimeout)
+	defer timer.Stop()
+
+	select {
+	case result := <-resultCh:
+		return result.line, result.err
+	case <-timer.C:
+		_ = body.Close()
+		return nil, fmt.Errorf("%w after %s", ErrSSEIdleTimeout, sseIdleTimeout)
+	case <-ctx.Done():
+		_ = body.Close()
+		return nil, ctx.Err()
 	}
 }
