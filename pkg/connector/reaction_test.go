@@ -1,7 +1,9 @@
 package connector
 
 import (
+	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -9,6 +11,53 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 )
+
+func TestCapabilitiesAdvertiseSupportedReactions(t *testing.T) {
+	infoVersion, capabilityVersion := (&LineConnector{}).GetBridgeInfoVersion()
+	if infoVersion != 1 || capabilityVersion != 2 {
+		t.Fatalf("bridge info/capability versions = %d/%d, want 1/2", infoVersion, capabilityVersion)
+	}
+
+	caps := (&LineClient{}).GetCapabilities(context.Background(), nil)
+	if caps.Reaction != event.CapLevelPartialSupport {
+		t.Fatalf("Reaction = %d, want partial support", caps.Reaction)
+	}
+	if caps.ReactionCount != 1 {
+		t.Fatalf("ReactionCount = %d, want 1", caps.ReactionCount)
+	}
+	if len(caps.AllowedReactions) != len(lineEmojiReactionURLs) {
+		t.Fatalf("AllowedReactions has %d entries, want %d", len(caps.AllowedReactions), len(lineEmojiReactionURLs))
+	}
+	if !slices.IsSorted(caps.AllowedReactions) {
+		t.Fatal("AllowedReactions must be sorted so room capability IDs are stable")
+	}
+
+	seen := make(map[string]struct{}, len(caps.AllowedReactions))
+	for _, reaction := range caps.AllowedReactions {
+		if _, duplicate := seen[reaction]; duplicate {
+			t.Fatalf("AllowedReactions contains duplicate %q", reaction)
+		}
+		seen[reaction] = struct{}{}
+		if _, ok := linePaidReactionForMatrixEmoji(reaction); !ok {
+			t.Fatalf("advertised reaction %q is not accepted by the LINE reaction mapper", reaction)
+		}
+	}
+
+	for _, supported := range []string{"\U0001F44D\uFE0F", "9\uFE0F\u20E3"} {
+		if !slices.Contains(caps.AllowedReactions, supported) {
+			t.Fatalf("supported reaction %q is not advertised", supported)
+		}
+	}
+	if slices.Contains(caps.AllowedReactions, "\U0001F625") {
+		t.Fatal("unsupported reaction 😥 must not be advertised")
+	}
+
+	caps.AllowedReactions[0] = "mutated"
+	freshCaps := (&LineClient{}).GetCapabilities(context.Background(), nil)
+	if freshCaps.AllowedReactions[0] == "mutated" {
+		t.Fatal("GetCapabilities returned a shared mutable reaction list")
+	}
+}
 
 func TestNormalizeMatrixReactionKey(t *testing.T) {
 	tests := map[string]string{
