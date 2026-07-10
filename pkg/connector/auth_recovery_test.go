@@ -245,6 +245,102 @@ func TestRunTokenRecoveryRejectsInvalidatedSessionBeforeRecentRecovery(t *testin
 	}
 }
 
+func TestRunTokenRecoveryRejectsSupersededClient(t *testing.T) {
+	lc := &LineClient{}
+	lc.retire()
+	var calls int
+	err := lc.runTokenRecovery(context.Background(), func(context.Context) error {
+		calls++
+		return nil
+	})
+	if !errors.Is(err, errLineClientSuperseded) {
+		t.Fatalf("err = %v, want errLineClientSuperseded", err)
+	}
+	if calls != 0 {
+		t.Fatalf("recovery calls = %d, want 0", calls)
+	}
+}
+
+func TestRecoverTokenDoesNotReloginAfterForcedLogoutRefresh(t *testing.T) {
+	lc := &LineClient{}
+	var reloginCalls int
+	err := lc.recoverTokenWith(
+		context.Background(),
+		func(context.Context) error { return errLoggedOut },
+		func(context.Context) error {
+			reloginCalls++
+			return nil
+		},
+	)
+	if !line.IsLoggedOut(err) {
+		t.Fatalf("recoverTokenWith error = %v, want logged-out error", err)
+	}
+	if reloginCalls != 0 {
+		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
+	}
+}
+
+func TestRecoverTokenDoesNotReloginAfterCancellation(t *testing.T) {
+	lc := &LineClient{}
+	ctx, cancel := context.WithCancel(context.Background())
+	var reloginCalls int
+	err := lc.recoverTokenWith(
+		ctx,
+		func(context.Context) error {
+			cancel()
+			return context.Canceled
+		},
+		func(context.Context) error {
+			reloginCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("recoverTokenWith error = %v, want context.Canceled", err)
+	}
+	if reloginCalls != 0 {
+		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
+	}
+}
+
+func TestForcedLogoutWinsOverInFlightRecovery(t *testing.T) {
+	lc := &LineClient{AccessToken: "old-token"}
+	recoveryStarted := make(chan struct{})
+	allowRecovery := make(chan struct{})
+	recoveryDone := make(chan error, 1)
+	go func() {
+		recoveryDone <- lc.runTokenRecovery(context.Background(), func(context.Context) error {
+			close(recoveryStarted)
+			<-allowRecovery
+			lc.setTokens("recovered-token", "")
+			return nil
+		})
+	}()
+	<-recoveryStarted
+
+	logoutDone := make(chan struct{})
+	go func() {
+		lc.markLoggedOutByOtherClient(context.Background(), errLoggedOut)
+		close(logoutDone)
+	}()
+	close(allowRecovery)
+
+	if err := <-recoveryDone; err != nil {
+		t.Fatalf("recovery returned error: %v", err)
+	}
+	select {
+	case <-logoutDone:
+	case <-time.After(time.Second):
+		t.Fatal("forced logout did not complete after recovery")
+	}
+	if lc.hasAccessToken() {
+		t.Fatal("in-flight recovery resurrected the invalidated session")
+	}
+	if !lc.isSessionInvalidated() {
+		t.Fatal("session was not invalidated after in-flight recovery")
+	}
+}
+
 func TestRunTokenRecoverySerializesConcurrentRecovery(t *testing.T) {
 	var lc LineClient
 	var calls int32

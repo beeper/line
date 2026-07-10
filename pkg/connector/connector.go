@@ -163,6 +163,7 @@ type LineEmailLogin struct {
 	NoE2EE      bool // True when login fell back to non-E2EE (LSOFF account)
 
 	ExistingMetadata *UserLoginMetadata
+	ExistingLogin    *bridgev2.UserLogin
 
 	pollResult chan *line.LoginResult
 	pollErr    chan error
@@ -205,6 +206,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 	ll.Password = meta.Password
 	ll.Certificate = meta.Certificate
 	ll.ExistingMetadata = meta
+	ll.ExistingLogin = override
 
 	if ll.Email == "" || ll.Password == "" {
 		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
@@ -462,6 +464,14 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}
 
 	detectedLineID := networkid.UserLoginID(mid)
+	if ll.ExistingLogin != nil {
+		if oldClient, ok := ll.ExistingLogin.Client.(*LineClient); ok {
+			// Stop and join the old client before NewLogin copies the newly-authenticated
+			// metadata into the reused UserLogin. An old in-flight logout must never
+			// clear the replacement session.
+			oldClient.retire()
+		}
+	}
 
 	ul, err := ll.User.NewLogin(ctx, &database.UserLogin{
 		ID:         detectedLineID,
@@ -484,7 +494,6 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}
 
 	go ul.Client.Connect(context.Background())
-	ul.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
 	return &bridgev2.LoginStep{
 		Type:           bridgev2.LoginStepTypeComplete,

@@ -1,6 +1,7 @@
 package line
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -100,7 +101,11 @@ func (c *Client) LoginV2WithVerifier(verifier string) (*LoginResult, error) {
 
 // GetProfile fetches the user's profile information
 func (c *Client) GetProfile() (*Profile, error) {
-	resp, err := c.callRPC("TalkService", "getProfile", 2)
+	return c.GetProfileContext(context.Background())
+}
+
+func (c *Client) GetProfileContext(ctx context.Context) (*Profile, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "getProfile", 2)
 	if err != nil {
 		return nil, err
 	}
@@ -611,7 +616,11 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 }
 
 func (c *Client) GetLastOpRevision() (int64, error) {
-	resp, err := c.callRPC("TalkService", "getLastOpRevision")
+	return c.GetLastOpRevisionContext(context.Background())
+}
+
+func (c *Client) GetLastOpRevisionContext(ctx context.Context) (int64, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "getLastOpRevision")
 	if err != nil {
 		return 0, err
 	}
