@@ -32,6 +32,10 @@ type LineConnector struct {
 var _ bridgev2.NetworkConnector = (*LineConnector)(nil)
 
 func (lc *LineConnector) Init(bridge *bridgev2.Bridge) {
+	// Keep connection state in Beeper's bridge status API only. Framework status
+	// notices call GetManagementRoom, which creates the LINE bot room when the
+	// user doesn't already have one.
+	bridge.Config.BridgeStatusNotices = "none"
 	lc.br = bridge
 }
 
