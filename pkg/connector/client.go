@@ -53,6 +53,7 @@ type LineClient struct {
 	tokenMu              sync.RWMutex
 	recoverMu            sync.Mutex
 	recoverTime          time.Time
+	recoveryStopped      bool
 	missingE2EEKeyMu     sync.Mutex
 	missingE2EEKeyMarked bool
 	// sessionInvalidated is set when LINE forcefully logs out this Chrome-style
@@ -340,7 +341,9 @@ func (lc *LineClient) markLoggedOutByOtherClient(ctx context.Context, err error)
 		lc.cancelActiveRun()
 		return
 	}
-	if lc.superseded.Load() {
+	// superseded covers connector-ordered retirement. The identity check is a
+	// final guard for bridgev2 client swaps that happen outside that lifecycle.
+	if lc.superseded.Load() || (lc.UserLogin.Client != nil && lc.UserLogin.Client != lc) {
 		if lc.UserLogin.Bridge != nil {
 			lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Ignoring forced logout from stale LINE client")
 		}
@@ -477,7 +480,7 @@ func (lc *LineClient) runTokenRecovery(ctx context.Context, recover func(context
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if lc.superseded.Load() {
+	if lc.recoveryStopped || lc.superseded.Load() {
 		return errLineClientSuperseded
 	}
 	if lc.isSessionInvalidated() {
@@ -828,6 +831,7 @@ func (lc *LineClient) Disconnect() {
 	// applying/persisting session state. Drain any call that began before the
 	// superseded flag was visible before a replacement installs new metadata.
 	lc.recoverMu.Lock()
+	lc.recoveryStopped = true
 	lc.recoverMu.Unlock()
 }
 

@@ -11,6 +11,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 func TestLineClientDisconnectCancelsActiveRun(t *testing.T) {
@@ -58,6 +60,12 @@ func TestLineClientDisconnectCancelsActiveRun(t *testing.T) {
 func TestLineClientDisconnectBeforeConnectRejectsStartup(t *testing.T) {
 	lc := &LineClient{}
 	lc.Disconnect()
+	lc.recoverMu.Lock()
+	recoveryStopped := lc.recoveryStopped
+	lc.recoverMu.Unlock()
+	if !recoveryStopped {
+		t.Fatal("Disconnect did not stop token recovery")
+	}
 	runCtx, _, started := lc.beginRun(context.Background())
 	if started {
 		lc.wg.Done()
@@ -65,6 +73,112 @@ func TestLineClientDisconnectBeforeConnectRejectsStartup(t *testing.T) {
 	}
 	if !errors.Is(runCtx.Err(), context.Canceled) {
 		t.Fatalf("rejected run context error = %v, want context.Canceled", runCtx.Err())
+	}
+}
+
+func TestCreateLoginSharesFinalizationLock(t *testing.T) {
+	connector := &LineConnector{}
+	firstProcess, err := connector.CreateLogin(context.Background(), nil, "")
+	if err != nil {
+		t.Fatalf("first CreateLogin returned error: %v", err)
+	}
+	secondProcess, err := connector.CreateLogin(context.Background(), nil, "")
+	if err != nil {
+		t.Fatalf("second CreateLogin returned error: %v", err)
+	}
+	first := firstProcess.(*LineEmailLogin)
+	second := secondProcess.(*LineEmailLogin)
+	if first.finalizeMu == nil || first.finalizeMu != second.finalizeMu || first.finalizeMu != &connector.loginFinalizeMu {
+		t.Fatal("login processes do not share the connector finalization lock")
+	}
+}
+
+func TestFindReusedLineLogin(t *testing.T) {
+	logins := make(map[string]*bridgev2.UserLogin, 3)
+	for _, loginID := range []string{"override", "target", "unrelated"} {
+		logins[loginID] = &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{ID: networkid.UserLoginID(loginID)},
+		}
+	}
+	tests := []struct {
+		name       string
+		overrideID string
+		detectedID string
+		wantID     string
+	}{
+		{
+			name:       "ordinary same-ID login",
+			detectedID: "target",
+			wantID:     "target",
+		},
+		{
+			name:       "ordinary new account",
+			detectedID: "new-account",
+		},
+		{
+			name:       "same-ID override",
+			overrideID: "target",
+			detectedID: "target",
+			wantID:     "target",
+		},
+		{
+			name:       "override resolves to another existing account",
+			overrideID: "override",
+			detectedID: "target",
+			wantID:     "target",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var override *bridgev2.UserLogin
+			if tc.overrideID != "" {
+				override = logins[tc.overrideID]
+			}
+			got := findReusedLineLogin(
+				override,
+				[]*bridgev2.UserLogin{logins["override"], logins["target"], logins["unrelated"]},
+				networkid.UserLoginID(tc.detectedID),
+			)
+			if tc.wantID == "" {
+				if got != nil {
+					t.Fatalf("reused login = %s, want nil", got.ID)
+				}
+			} else if got != logins[tc.wantID] {
+				t.Fatalf("reused login = %p, want %p (%s)", got, logins[tc.wantID], tc.wantID)
+			}
+		})
+	}
+}
+
+func TestSameIDReplacementRetiresOldClientBeforeMetadataChange(t *testing.T) {
+	oldMeta := &UserLoginMetadata{AccessToken: "old-token", Mid: "target"}
+	login := &bridgev2.UserLogin{
+		UserLogin: &database.UserLogin{
+			ID:       "target",
+			Metadata: oldMeta,
+		},
+		Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
+	}
+	stale := &LineClient{AccessToken: "old-token", UserLogin: login}
+	login.Client = stale
+
+	retireLineLogin(login)
+	if !stale.superseded.Load() {
+		t.Fatal("same-ID client was not retired before metadata replacement")
+	}
+	freshMeta := &UserLoginMetadata{AccessToken: "fresh-token", Mid: "target"}
+	login.Metadata = freshMeta
+	fresh := &LineClient{AccessToken: "fresh-token", UserLogin: login}
+	login.Client = fresh
+	if login.Client != fresh {
+		t.Fatal("replacement client was not published")
+	}
+
+	stale.markLoggedOutByOtherClient(context.Background(), errLoggedOut)
+
+	if freshMeta.AccessToken != "fresh-token" || freshMeta.SessionInvalidated {
+		t.Fatalf("retired client changed replacement metadata: %#v", freshMeta)
 	}
 }
 
@@ -97,7 +211,7 @@ func TestStaleForcedLogoutCancelsOnlyStaleClient(t *testing.T) {
 	}
 	stale := &LineClient{AccessToken: "stale-token", UserLogin: login}
 	current := &LineClient{AccessToken: "current-token", UserLogin: login}
-	stale.superseded.Store(true)
+	login.Client = current
 	staleCtx, _, staleStarted := stale.beginRun(context.Background())
 	currentCtx, _, currentStarted := current.beginRun(context.Background())
 	if !staleStarted || !currentStarted {
@@ -121,6 +235,9 @@ func TestStaleForcedLogoutCancelsOnlyStaleClient(t *testing.T) {
 	}
 	if current.getAccessToken() != "current-token" || current.isSessionInvalidated() {
 		t.Fatal("stale client logout changed replacement session state")
+	}
+	if stale.getAccessToken() != "stale-token" || stale.isSessionInvalidated() {
+		t.Fatal("stale client logout was not rejected by client ownership")
 	}
 }
 
