@@ -48,6 +48,8 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 		MaxTextLength:         5000,
 		Reply:                 event.CapLevelFullySupported,
 		Reaction:              event.CapLevelPartialSupport,
+		ReactionCount:         1,
+		AllowedReactions:      getLineAllowedReactions(),
 		ReadReceipts:          true,
 		Delete:                event.CapLevelFullySupported,
 		DeleteMaxAge:          &jsontime.Seconds{Duration: 24 * time.Hour},

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"go.mau.fi/util/variationselector"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -172,6 +175,26 @@ var lineEmojiReactionURLs = map[string]string{
 	"7":          lineSticonURL(lineOriginalEmojiProductID, "209"),
 	"8":          lineSticonURL(lineOriginalEmojiProductID, "210"),
 	"9":          lineSticonURL(lineOriginalEmojiProductID, "211"),
+}
+
+// lineAllowedReactions is the Matrix-facing form of the outbound LINE reaction
+// map. Room capability hashes depend on slice order, so keep this list sorted.
+var lineAllowedReactions = func() []string {
+	reactions := make([]string, 0, len(lineEmojiReactionURLs))
+	for reaction := range lineEmojiReactionURLs {
+		// The send lookup normalizes keycaps to bare digits. Restore their emoji
+		// form before advertising them to clients.
+		if len(reaction) == 1 && reaction[0] >= '0' && reaction[0] <= '9' {
+			reaction += "\u20E3"
+		}
+		reactions = append(reactions, variationselector.Add(reaction))
+	}
+	slices.Sort(reactions)
+	return reactions
+}()
+
+func getLineAllowedReactions() []string {
+	return slices.Clone(lineAllowedReactions)
 }
 
 func lineSticonURL(productID, emojiID string) string {
