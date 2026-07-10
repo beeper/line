@@ -311,7 +311,11 @@ func (c *Client) GetRSAKeyInfo() (*RSAKeyInfo, error) {
 }
 
 func (c *Client) callRPC(service, method string, args ...interface{}) ([]byte, error) {
-	return c.callRPCWithBaseURL(BaseURL, service, method, args...)
+	return c.callRPCContext(context.Background(), service, method, args...)
+}
+
+func (c *Client) callRPCContext(ctx context.Context, service, method string, args ...interface{}) ([]byte, error) {
+	return c.callRPCWithBaseURLContext(ctx, BaseURL, service, method, args...)
 }
 
 func (c *Client) callShopRPC(service, method string, args ...interface{}) ([]byte, error) {
@@ -319,6 +323,10 @@ func (c *Client) callShopRPC(service, method string, args ...interface{}) ([]byt
 }
 
 func (c *Client) callRPCWithBaseURL(baseURL, service, method string, args ...interface{}) ([]byte, error) {
+	return c.callRPCWithBaseURLContext(context.Background(), baseURL, service, method, args...)
+}
+
+func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service, method string, args ...interface{}) ([]byte, error) {
 	url := fmt.Sprintf("%s/%s/%s", baseURL, service, method)
 
 	var bodyBytes []byte
@@ -332,7 +340,7 @@ func (c *Client) callRPCWithBaseURL(baseURL, service, method string, args ...int
 		}
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}

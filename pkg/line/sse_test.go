@@ -72,3 +72,66 @@ func TestListenSSEIdleTimeout(t *testing.T) {
 		t.Fatalf("err = %v, want ErrSSEIdleTimeout", err)
 	}
 }
+
+func TestListenSSEContextCancellationWithContinuousHeartbeats(t *testing.T) {
+	oldClient := sseHTTPClient
+	oldTimeout := sseIdleTimeout
+	t.Cleanup(func() {
+		sseHTTPClient = oldClient
+		sseIdleTimeout = oldTimeout
+	})
+
+	sseIdleTimeout = time.Second
+	pr, pw := io.Pipe()
+	sseHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       pr,
+			}, nil
+		}),
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	listenResult := make(chan error, 1)
+	go func() {
+		listenResult <- NewClient("stale-token").ListenSSE(ctx, 0, func(event, data string) {})
+	}()
+
+	heartbeatsWritten := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for range 5 {
+			if _, err := io.WriteString(pw, "event: ping\ndata: null\n\n"); err != nil {
+				return
+			}
+		}
+		close(heartbeatsWritten)
+		<-ctx.Done()
+		_ = pw.Close()
+	}()
+
+	select {
+	case <-heartbeatsWritten:
+	case <-time.After(time.Second):
+		t.Fatal("SSE reader did not consume heartbeat frames")
+	}
+	cancel(errors.New("receive auth probe due"))
+
+	select {
+	case err := <-listenResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ListenSSE did not stop after context cancellation")
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat writer did not stop after context cancellation")
+	}
+}

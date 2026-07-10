@@ -26,22 +26,30 @@ import (
 )
 
 const (
-	prefetchMessagesConcurrency  = 4
-	messageBoxPageLimit          = 100
-	startupBackfillMessageLimit  = 50
-	unblockBackfillFallbackDelay = 10 * time.Second
-	groupPortalCreateWait        = 30 * time.Second
-	beeperExcludeFromTimelineKey = "com.beeper.exclude_from_timeline"
+	prefetchMessagesConcurrency     = 4
+	messageBoxPageLimit             = 100
+	startupBackfillMessageLimit     = 50
+	unblockBackfillFallbackDelay    = 10 * time.Second
+	groupPortalCreateWait           = 30 * time.Second
+	beeperExcludeFromTimelineKey    = "com.beeper.exclude_from_timeline"
+	defaultReceiveAuthProbeInterval = 150 * time.Second
 )
 
+var errReceiveAuthProbeDue = errors.New("receive auth probe due")
+
 var (
-	getLastOpRevisionWithClient = func(client *line.Client) (int64, error) {
-		return client.GetLastOpRevision()
+	getLastOpRevisionWithClient = func(ctx context.Context, client *line.Client) (int64, error) {
+		return client.GetLastOpRevisionContext(ctx)
 	}
 	listenSSEWithClient = func(client *line.Client, ctx context.Context, localRev int64, handler func(eventType, data string)) error {
 		return client.ListenSSE(ctx, localRev, handler)
 	}
-	sseReconnectDelay = 3 * time.Second
+	sseReconnectDelay          = 3 * time.Second
+	receiveAuthProbeInterval   = defaultReceiveAuthProbeInterval
+	receiveAuthProbeNow        = time.Now
+	newReceiveAuthProbeContext = func(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+		return context.WithDeadlineCause(parent, deadline, errReceiveAuthProbeDue)
+	}
 )
 
 func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
@@ -1153,6 +1161,40 @@ func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
 	}
 }
 
+func startReceiveAuthProbeContext(parent context.Context, startedAt time.Time) (context.Context, context.CancelFunc, time.Time) {
+	if receiveAuthProbeInterval <= 0 {
+		return parent, func() {}, time.Time{}
+	}
+
+	nextProbeAt := startedAt.Add(receiveAuthProbeInterval)
+	if now := receiveAuthProbeNow(); !nextProbeAt.After(now) {
+		nextProbeAt = now.Add(receiveAuthProbeInterval)
+	}
+	receiveCtx, cancel := newReceiveAuthProbeContext(parent, nextProbeAt)
+	return receiveCtx, cancel, nextProbeAt
+}
+
+func isReceiveAuthProbeDue(receiveCtx context.Context, nextProbeAt time.Time) bool {
+	if receiveAuthProbeInterval <= 0 {
+		return false
+	}
+	return errors.Is(context.Cause(receiveCtx), errReceiveAuthProbeDue) || !receiveAuthProbeNow().Before(nextProbeAt)
+}
+
+func waitForSSEReconnect(ctx context.Context) bool {
+	if sseReconnectDelay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(sseReconnectDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (lc *LineClient) pollLoop(ctx context.Context) {
 	defer lc.wg.Done()
 
@@ -1160,7 +1202,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	client := lc.newClient()
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
-	rev, err := getLastOpRevisionWithClient(client)
+	rev, err := getLastOpRevisionWithClient(ctx, client)
 	if err != nil && lc.isLoggedOut(err) {
 		lc.markLoggedOutByOtherClient(ctx, err)
 		return
@@ -1168,7 +1210,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
 		if errRecover := lc.recoverToken(ctx); errRecover == nil {
 			client = lc.newClient()
-			rev, err = getLastOpRevisionWithClient(client)
+			rev, err = getLastOpRevisionWithClient(ctx, client)
 		} else {
 			lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token for getLastOpRevision")
 		}
@@ -1178,6 +1220,20 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	} else {
 		localRev = rev
 		lc.UserLogin.Bridge.Log.Info().Int64("local_rev", localRev).Msg("Seeded local revision from getLastOpRevision")
+	}
+
+	receiveCtx, cancelReceive, nextProbeAt := startReceiveAuthProbeContext(ctx, receiveAuthProbeNow())
+	defer func() {
+		cancelReceive()
+	}()
+	probeAndReschedule := func() bool {
+		probeStartedAt := receiveAuthProbeNow()
+		if lc.handleReceiveAuthProbe(ctx) || ctx.Err() != nil {
+			return true
+		}
+		cancelReceive()
+		receiveCtx, cancelReceive, nextProbeAt = startReceiveAuthProbeContext(ctx, probeStartedAt)
+		return false
 	}
 
 	handler := func(eventType, data string) {
@@ -1233,20 +1289,41 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	}
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
+			if probeAndReschedule() {
+				return
+			}
+			continue
+		}
+
 		client = lc.newClient()
-		err := listenSSEWithClient(client, ctx, localRev, handler)
+		err := listenSSEWithClient(client, receiveCtx, localRev, handler)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
+				if probeAndReschedule() {
+					return
+				}
+				continue
+			}
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			if err.Error() != "EOF" {
+			if !errors.Is(err, io.EOF) {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
 
 				if line.IsSSEIdleTimeout(err) {
-					if lc.handleReceiveIdleTimeout(ctx) {
+					if probeAndReschedule() {
 						return
 					}
-					time.Sleep(sseReconnectDelay)
+					if !waitForSSEReconnect(receiveCtx) {
+						continue
+					}
 					continue
 				}
 
@@ -1261,20 +1338,32 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 					}
 				}
 			}
-			time.Sleep(sseReconnectDelay)
+			if !waitForSSEReconnect(receiveCtx) {
+				continue
+			}
 		}
 	}
 }
 
-// handleReceiveIdleTimeout handles /operation/receive streams that stop
-// producing ping/event bytes. Probe Talk auth immediately so forced logouts
-// surface before the next send/read receipt.
-func (lc *LineClient) handleReceiveIdleTimeout(ctx context.Context) bool {
+// handleReceiveAuthProbe checks Talk auth independently of SSE activity. The
+// caller reconnects from the existing localRev after every probe so operations
+// that arrived during the check are replayed rather than skipped.
+func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
+	if ctx.Err() != nil || lc.isSessionInvalidated() {
+		return true
+	}
+	if lc.superseded.Load() {
+		return true
+	}
+
 	// This is only a health probe. Keep localRev unchanged so the reconnected
 	// stream replays operations that arrived while the old stream was stalled.
-	_, probeErr := getLastOpRevisionWithClient(lc.newClient())
+	_, probeErr := getLastOpRevisionWithClient(ctx, lc.newClient())
 	if probeErr == nil {
 		return false
+	}
+	if ctx.Err() != nil {
+		return true
 	}
 
 	if lc.isLoggedOut(probeErr) {
@@ -1293,14 +1382,14 @@ func (lc *LineClient) handleReceiveIdleTimeout(ctx context.Context) bool {
 				return true
 			}
 			if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token after receive idle probe")
+				lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token after receive auth probe")
 			}
 		}
 		return false
 	}
 
 	if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(probeErr).Msg("Receive idle auth probe failed; reconnecting SSE")
+		lc.UserLogin.Bridge.Log.Warn().Err(probeErr).Msg("Receive auth probe failed; reconnecting SSE")
 	}
 	return false
 }
@@ -1314,7 +1403,10 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, err error) boo
 		return true
 	}
 
-	_, profileErr := getProfileWithToken(lc.getAccessToken())
+	_, profileErr := getProfileWithToken(ctx, lc.getAccessToken())
+	if ctx.Err() != nil {
+		return true
+	}
 	if lc.isLoggedOut(profileErr) {
 		lc.markLoggedOutByOtherClient(ctx, profileErr)
 		return true
@@ -1328,6 +1420,9 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, err error) boo
 	}
 
 	if errRecover := lc.recoverToken(ctx); errRecover != nil {
+		if ctx.Err() != nil {
+			return true
+		}
 		if errors.Is(errRecover, errLineSessionInvalidated) || lc.isLoggedOut(errRecover) {
 			lc.markLoggedOutByOtherClient(ctx, errRecover)
 			return true

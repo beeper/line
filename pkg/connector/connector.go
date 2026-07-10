@@ -26,12 +26,17 @@ const (
 )
 
 type LineConnector struct {
-	br *bridgev2.Bridge
+	br              *bridgev2.Bridge
+	loginFinalizeMu sync.Mutex
 }
 
 var _ bridgev2.NetworkConnector = (*LineConnector)(nil)
 
 func (lc *LineConnector) Init(bridge *bridgev2.Bridge) {
+	// Keep connection state in Beeper's bridge status API only. Framework status
+	// notices call GetManagementRoom, which creates the LINE bot room when the
+	// user doesn't already have one.
+	bridge.Config.BridgeStatusNotices = "none"
 	lc.br = bridge
 }
 
@@ -146,7 +151,7 @@ func (lc *LineConnector) GetLoginFlows() []bridgev2.LoginFlow {
 }
 
 func (lc *LineConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	return &LineEmailLogin{User: user}, nil
+	return &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu}, nil
 }
 
 type LineEmailLogin struct {
@@ -159,11 +164,13 @@ type LineEmailLogin struct {
 	NoE2EE      bool // True when login fell back to non-E2EE (LSOFF account)
 
 	ExistingMetadata *UserLoginMetadata
+	ExistingLogin    *bridgev2.UserLogin
 
 	pollResult chan *line.LoginResult
 	pollErr    chan error
 	polling    bool
 	mu         sync.Mutex
+	finalizeMu *sync.Mutex
 }
 
 var _ bridgev2.LoginProcessUserInput = (*LineEmailLogin)(nil)
@@ -201,6 +208,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 	ll.Password = meta.Password
 	ll.Certificate = meta.Certificate
 	ll.ExistingMetadata = meta
+	ll.ExistingLogin = override
 
 	if ll.Email == "" || ll.Password == "" {
 		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
@@ -458,29 +466,50 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}
 
 	detectedLineID := networkid.UserLoginID(mid)
+	// bridgev2 reuses same-ID UserLogin objects and replaces their metadata
+	// before replacing Client. Serialize that handoff so concurrent login
+	// completions cannot orphan each other's clients.
+	if ll.finalizeMu != nil {
+		ll.finalizeMu.Lock()
+		defer ll.finalizeMu.Unlock()
+	}
+	targetLogin := findReusedLineLogin(ll.ExistingLogin, ll.User.GetUserLogins(), detectedLineID)
+	retireLineLogin(targetLogin)
 
+	var newClient *LineClient
 	ul, err := ll.User.NewLogin(ctx, &database.UserLogin{
 		ID:         detectedLineID,
 		RemoteName: displayName,
 		Metadata:   meta,
 	}, &bridgev2.NewLoginParams{
 		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {
-			login.Client = &LineClient{
+			newClient = &LineClient{
 				UserLogin:    login,
 				AccessToken:  token,
 				RefreshToken: refreshToken,
 				Mid:          mid,
 				HTTPClient:   &http.Client{Timeout: 10 * time.Second},
 			}
+			login.Client = newClient
 			return nil
 		},
 	})
 	if err != nil {
+		if newClient != nil {
+			newClient.Disconnect()
+		}
 		return nil, fmt.Errorf("failed to create user login: %w", err)
 	}
+	if newClient == nil {
+		return nil, fmt.Errorf("failed to create LINE client")
+	}
+	if ll.ExistingLogin != nil && ll.ExistingLogin.UserLogin != nil && ll.ExistingLogin.ID != ul.ID {
+		// A different-ID override remains valid until the new login is safely
+		// installed. Retire it only after NewLogin succeeds.
+		retireLineLogin(ll.ExistingLogin)
+	}
 
-	go ul.Client.Connect(context.Background())
-	ul.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+	go newClient.Connect(context.Background())
 
 	return &bridgev2.LoginStep{
 		Type:           bridgev2.LoginStepTypeComplete,
@@ -488,6 +517,31 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		Instructions:   "Successfully logged in",
 		CompleteParams: &bridgev2.LoginCompleteParams{UserLoginID: ul.ID, UserLogin: ul},
 	}, nil
+}
+
+func retireLineLogin(login *bridgev2.UserLogin) {
+	if login == nil {
+		return
+	}
+	if client, ok := login.Client.(*LineClient); ok {
+		client.retire()
+	}
+}
+
+func findReusedLineLogin(
+	override *bridgev2.UserLogin,
+	current []*bridgev2.UserLogin,
+	detectedID networkid.UserLoginID,
+) *bridgev2.UserLogin {
+	if override != nil && override.UserLogin != nil && override.ID == detectedID {
+		return override
+	}
+	for _, login := range current {
+		if login != nil && login.UserLogin != nil && login.ID == detectedID {
+			return login
+		}
+	}
+	return nil
 }
 
 func exportLoginE2EEKeys(res *line.LoginResult, client *line.Client) (*e2ee.Manager, map[string]string, error) {
