@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"strings"
 	"time"
 
+	_ "golang.org/x/image/webp"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
 
@@ -105,8 +109,22 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	// Upload to Matrix
+	imageMedia := lineImageMediaInfo(imgData)
+	if imageMedia.usedMimeFallback {
+		h.Log.Debug().
+			Int("size_bytes", len(imgData)).
+			Msg("Falling back to JPEG MIME type for LINE image")
+	}
+	if imageMedia.decodeErr != nil {
+		h.Log.Debug().
+			Err(imageMedia.decodeErr).
+			Str("mime_type", imageMedia.mimeType).
+			Int("size_bytes", len(imgData)).
+			Msg("Could not decode LINE image dimensions")
+	}
+
 	uploadStart := time.Now()
-	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, "image.jpg", "image/jpeg")
+	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, imageMedia.fileName, imageMedia.mimeType)
 	uploadDuration := time.Since(uploadStart)
 	if err != nil {
 		h.Log.Error().
@@ -126,7 +144,11 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 
 	h.Log.Info().
 		Str("matrix_media_url", matrixMediaURL).
+		Str("file_name", imageMedia.fileName).
+		Str("mime_type", imageMedia.mimeType).
 		Int("size", len(imgData)).
+		Int("width", imageMedia.info.Width).
+		Int("height", imageMedia.info.Height).
 		Dur("download_duration", downloadDuration).
 		Dur("decrypt_duration", decryptDuration).
 		Dur("upload_duration", uploadDuration).
@@ -135,40 +157,9 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{
 			{
-				Type: event.EventMessage,
-				Content: &event.MessageEventContent{
-					MsgType:   event.MsgImage,
-					Body:      "image.jpg",
-					URL:       mxc,
-					File:      file,
-					RelatesTo: relatesTo,
-				},
+				Type:    event.EventMessage,
+				Content: lineImageEventContent(mxc, file, imageMedia.fileName, imageMedia.info, relatesTo),
 			},
 		},
 	}, nil
-}
-
-func lineMediaCategory(metadata map[string]string) string {
-	if metadata == nil || metadata["MEDIA_CONTENT_INFO"] == "" {
-		return ""
-	}
-
-	var info struct {
-		Category string `json:"category"`
-	}
-	if err := json.Unmarshal([]byte(metadata["MEDIA_CONTENT_INFO"]), &info); err != nil {
-		return ""
-	}
-
-	return info.Category
-}
-
-func lineOBSDownloadOptions(metadata map[string]string, isPlainMedia bool) line.OBSDownloadOptions {
-	opts := line.OBSDownloadOptions{
-		OBSPop: metadata["OBS_POP"],
-	}
-	if isPlainMedia && lineMediaCategory(metadata) == "original" {
-		opts.TID = "original"
-	}
-	return opts
 }
