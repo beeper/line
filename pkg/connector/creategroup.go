@@ -184,17 +184,20 @@ func (lc *LineClient) resolveGroupMemberPublicKeys(ctx context.Context, client *
 			return negotiateE2EEPublicKeyWithClient(client, mid)
 		})
 		if err != nil {
+			if ctx.Err() != nil || lc.isSessionInvalidated() || line.IsAuthError(err) {
+				return client, nil, fmt.Errorf("negotiate E2EE key for member %s: %w", mid, err)
+			}
 			if line.IsNoUsableE2EEPublicKey(err) {
 				return client, nil, fmt.Errorf("%w: member %s has Letter Sealing disabled", line.ErrNoUsableE2EEGroupKey, mid)
 			}
-			return client, nil, fmt.Errorf("negotiate E2EE key for member %s: %w", mid, err)
+			return client, nil, fmt.Errorf("%w: negotiate E2EE key for member %s: %w", line.ErrNoUsableE2EEGroupKey, mid, err)
 		}
 		if res == nil || res.PublicKey == "" {
 			return client, nil, fmt.Errorf("%w: member %s returned no public key", line.ErrNoUsableE2EEGroupKey, mid)
 		}
 		keyID, err := res.KeyID.Int64()
 		if err != nil {
-			return client, nil, fmt.Errorf("parse E2EE key ID for member %s: %w", mid, err)
+			return client, nil, fmt.Errorf("%w: parse E2EE key ID for member %s: %w", line.ErrNoUsableE2EEGroupKey, mid, err)
 		}
 		if keyID <= 0 {
 			return client, nil, fmt.Errorf("%w: member %s returned invalid key ID %d", line.ErrNoUsableE2EEGroupKey, mid, keyID)
@@ -239,7 +242,7 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	for _, mid := range members {
 		pk, ok := pubKeys[mid]
 		if !ok || pk.KeyID <= 0 || pk.KeyData == "" {
-			return fmt.Errorf("incomplete E2EE public key for member %s", mid)
+			return fmt.Errorf("%w: incomplete E2EE public key for member %s", line.ErrNoUsableE2EEGroupKey, mid)
 		}
 
 		encryptedKey, err := lc.E2EE.WrapGroupKeyForMember(pk.KeyData, groupKeyID)

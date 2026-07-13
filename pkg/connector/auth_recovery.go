@@ -29,7 +29,7 @@ func callLineWithRecovery[T any](ctx context.Context, client *line.Client, deps 
 
 	if errRecover := deps.recover(ctx); errRecover != nil {
 		var zero T
-		return client, zero, fmt.Errorf("failed to recover token after LINE auth error: %w", errRecover)
+		return client, zero, fmt.Errorf("failed to recover token after LINE auth error (%w): %w", err, errRecover)
 	}
 
 	client = deps.newClient()

@@ -171,12 +171,29 @@ func TestGroupKeyMemberMIDsKeepsOnlyUniqueUsers(t *testing.T) {
 		"R-room",
 		"U-peer",
 		"U-peer",
+		"u-lowercase-peer",
 		"",
 		"not-a-mid",
 	})
 
-	if len(got) != 1 || got[0] != "U-peer" {
-		t.Fatalf("groupKeyMemberMIDs = %v, want [U-peer]", got)
+	if len(got) != 2 || got[0] != "U-peer" || got[1] != "u-lowercase-peer" {
+		t.Fatalf("groupKeyMemberMIDs = %v, want [U-peer u-lowercase-peer]", got)
+	}
+}
+
+func TestIsUserMIDAcceptsWirePrefixCasing(t *testing.T) {
+	tests := map[string]bool{
+		"U-peer": true,
+		"u-peer": true,
+		"C-chat": false,
+		"R-room": false,
+		"":       false,
+		"U":      false,
+	}
+	for mid, want := range tests {
+		if got := isUserMID(mid); got != want {
+			t.Errorf("isUserMID(%q) = %t, want %t", mid, got, want)
+		}
 	}
 }
 
@@ -290,5 +307,72 @@ func TestResolveGroupMemberPublicKeysReturnsNoUsableGroupKey(t *testing.T) {
 	)
 	if !errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
 		t.Fatalf("error = %v, want ErrNoUsableE2EEGroupKey", err)
+	}
+}
+
+func TestResolveGroupMemberPublicKeysAllowsFallbackAfterMemberError(t *testing.T) {
+	oldGetLast := getLastE2EEPublicKeysWithClient
+	oldNegotiate := negotiateE2EEPublicKeyWithClient
+	t.Cleanup(func() {
+		getLastE2EEPublicKeysWithClient = oldGetLast
+		negotiateE2EEPublicKeyWithClient = oldNegotiate
+	})
+
+	getLastE2EEPublicKeysWithClient = func(*line.Client, line.GetLastE2EEPublicKeysRequest) (map[string]line.E2EEPeerPublicKey, error) {
+		return nil, nil
+	}
+	memberErr := errors.New("temporary member key failure")
+	negotiateE2EEPublicKeyWithClient = func(*line.Client, string) (*line.E2EEPublicKey, error) {
+		return nil, memberErr
+	}
+
+	lc := newPeerKeyTestClient()
+	_, _, err := lc.resolveGroupMemberPublicKeys(
+		context.Background(),
+		line.NewClient("access"),
+		"C-group",
+		[]string{"U-peer"},
+	)
+	if !errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
+		t.Fatalf("error = %v, want ErrNoUsableE2EEGroupKey", err)
+	}
+	if !errors.Is(err, memberErr) {
+		t.Fatalf("error = %v, want member error to remain wrapped", err)
+	}
+}
+
+func TestResolveGroupMemberPublicKeysPreservesAuthRecoveryFailure(t *testing.T) {
+	oldGetLast := getLastE2EEPublicKeysWithClient
+	oldNegotiate := negotiateE2EEPublicKeyWithClient
+	oldRecover := recoverLineToken
+	t.Cleanup(func() {
+		getLastE2EEPublicKeysWithClient = oldGetLast
+		negotiateE2EEPublicKeyWithClient = oldNegotiate
+		recoverLineToken = oldRecover
+	})
+
+	getLastE2EEPublicKeysWithClient = func(*line.Client, line.GetLastE2EEPublicKeysRequest) (map[string]line.E2EEPeerPublicKey, error) {
+		return nil, nil
+	}
+	negotiateE2EEPublicKeyWithClient = func(*line.Client, string) (*line.E2EEPublicKey, error) {
+		return nil, errAuthRequired
+	}
+	recoveryErr := errors.New("token recovery failed")
+	recoverLineToken = func(*LineClient, context.Context) error {
+		return recoveryErr
+	}
+
+	lc := newPeerKeyTestClient()
+	_, _, err := lc.resolveGroupMemberPublicKeys(
+		context.Background(),
+		line.NewClient("access"),
+		"C-group",
+		[]string{"U-peer"},
+	)
+	if !errors.Is(err, errAuthRequired) || !errors.Is(err, recoveryErr) {
+		t.Fatalf("error = %v, want auth and recovery failures", err)
+	}
+	if errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
+		t.Fatalf("error = %v, auth failure must not allow plaintext fallback", err)
 	}
 }

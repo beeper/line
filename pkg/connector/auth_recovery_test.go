@@ -29,6 +29,7 @@ func TestCallLineWithRecovery(t *testing.T) {
 		wantRecover   int
 		wantErr       error
 		wantErrPrefix string
+		wantAuthError bool
 	}{
 		{
 			name:       "success without recovery",
@@ -62,6 +63,7 @@ func TestCallLineWithRecovery(t *testing.T) {
 			wantCalls:     1,
 			wantRecover:   1,
 			wantErrPrefix: "failed to recover token after LINE auth error",
+			wantAuthError: true,
 		},
 		{
 			name:        "retry auth error is not retried again",
@@ -113,6 +115,9 @@ func TestCallLineWithRecovery(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErrPrefix) {
 					t.Fatalf("err = %v, want containing %q", err, tt.wantErrPrefix)
 				}
+			}
+			if tt.wantAuthError && (!errors.Is(err, errAuthRequired) || !line.IsAuthError(err)) {
+				t.Fatalf("err = %v, want original auth error to remain detectable", err)
 			}
 			if tt.wantErr == nil && tt.wantErrPrefix == "" && err != nil {
 				t.Fatalf("unexpected err: %v", err)

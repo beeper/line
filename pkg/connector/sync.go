@@ -914,7 +914,7 @@ func midsFromSystemLocArgs(locArgs string) []string {
 }
 
 func isUserMID(mid string) bool {
-	return len(mid) > 1 && strings.HasPrefix(mid, "U")
+	return len(mid) > 1 && (mid[0] == 'U' || mid[0] == 'u')
 }
 
 func isChatMID(mid string) bool {

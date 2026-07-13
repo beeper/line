@@ -242,7 +242,7 @@ func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]
 			seen[mid] = struct{}{}
 		}
 	}
-	// Always include the bridge user's own MID since we're definitely a member
+	// Include the bridge user's MID when it has a valid user prefix.
 	if isUserMID(lc.Mid) {
 		seen[lc.Mid] = struct{}{}
 	}
@@ -346,7 +346,7 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 		return nil, fmt.Errorf("no LINE members found via Matrix")
 	}
 
-	// Always include the bridge user's own MID.
+	// Include the bridge user's MID when it has a valid user prefix.
 	if isUserMID(lc.Mid) {
 		mids = append(mids, lc.Mid)
 	}
