@@ -684,7 +684,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		// returns empty MemberMids (known LINE API issue).
 		allMemberMids := make([]string, 0, len(chat.Extra.GroupExtra.MemberMids))
 		for m := range chat.Extra.GroupExtra.MemberMids {
-			if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+			if !isUserMID(m) || lc.isOwnMID(m) {
 				continue
 			}
 			allMemberMids = append(allMemberMids, m)
@@ -697,7 +697,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 			})
 		}
 		for m := range chat.Extra.GroupExtra.InviteeMids {
-			if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+			if !isUserMID(m) || lc.isOwnMID(m) {
 				continue
 			}
 			allMemberMids = append(allMemberMids, m)
@@ -716,7 +716,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		if len(allMemberMids) == 0 {
 			lc.cacheGroupMembersFromRecentMessages(ctx, chat.ChatMid)
 			for _, m := range lc.getCachedGroupMembers(chat.ChatMid) {
-				if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+				if !isUserMID(m) || lc.isOwnMID(m) {
 					continue
 				}
 				allMemberMids = append(allMemberMids, m)
@@ -733,14 +733,11 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		groupMemberMids = make([]string, 0, len(allMemberMids)+1)
 		groupMemberMids = append(groupMemberMids, lc.Mid)
 		groupMemberMids = append(groupMemberMids, allMemberMids...)
+		lc.cacheGroupMemberMIDs(chat.ChatMid, groupMemberMids)
 		lc.cacheMu.Lock()
-		if lc.groupMemberCache == nil {
-			lc.groupMemberCache = make(map[string][]string)
-		}
 		if lc.generatedGroupNameCache == nil {
 			lc.generatedGroupNameCache = make(map[string]bool)
 		}
-		lc.groupMemberCache[chat.ChatMid] = groupMemberMids
 		lc.cacheMu.Unlock()
 	}
 
@@ -917,7 +914,7 @@ func midsFromSystemLocArgs(locArgs string) []string {
 }
 
 func isUserMID(mid string) bool {
-	return len(mid) > 1 && strings.HasPrefix(mid, "U")
+	return len(mid) > 1 && (mid[0] == 'U' || mid[0] == 'u')
 }
 
 func isChatMID(mid string) bool {
@@ -935,7 +932,7 @@ func (lc *LineClient) isOwnMID(mid string) bool {
 	if mid == lc.Mid {
 		return true
 	}
-	if lc.UserLogin != nil && mid == string(lc.UserLogin.ID) {
+	if lc.UserLogin != nil && lc.UserLogin.UserLogin != nil && mid == string(lc.UserLogin.ID) {
 		return true
 	}
 	return false
