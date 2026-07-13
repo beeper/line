@@ -51,7 +51,7 @@ func TestLineGroupE2EEFetchFailureErrorReturnsAuthErrors(t *testing.T) {
 }
 
 func TestLineGroupE2EEFetchFailureErrorAllowsNoUsableGroupKeyFallback(t *testing.T) {
-	err := lineGroupE2EEFetchFailureError(line.ErrNoUsableE2EEGroupKey)
+	err := lineGroupE2EEFetchFailureError(fmt.Errorf("auto-register group key: %w", line.ErrNoUsableE2EEGroupKey))
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}

@@ -160,3 +160,135 @@ func TestEnsurePeerKeyCachesNoUsablePublicKeyWithoutRecovery(t *testing.T) {
 		t.Fatalf("negotiate calls = %d, want cached negative lookup", negotiateCalls)
 	}
 }
+
+func TestGroupKeyMemberMIDsKeepsOnlyUniqueUsers(t *testing.T) {
+	lc := newPeerKeyTestClient()
+	lc.Mid = "U-self"
+
+	got := lc.groupKeyMemberMIDs("C-group", []string{
+		"U-self",
+		"C-group",
+		"R-room",
+		"U-peer",
+		"U-peer",
+		"",
+		"not-a-mid",
+	})
+
+	if len(got) != 1 || got[0] != "U-peer" {
+		t.Fatalf("groupKeyMemberMIDs = %v, want [U-peer]", got)
+	}
+}
+
+func TestCacheGroupMemberMIDsPreservesRicherList(t *testing.T) {
+	lc := newPeerKeyTestClient()
+	lc.groupMemberCache = map[string][]string{
+		"C-group": {"U-self", "U-peer"},
+	}
+
+	lc.cacheGroupMemberMIDs("C-group", []string{"U-self"})
+
+	got := lc.groupMemberCache["C-group"]
+	if len(got) != 2 || got[0] != "U-self" || got[1] != "U-peer" {
+		t.Fatalf("cached members = %v, want richer prior list", got)
+	}
+}
+
+func TestResolveGroupMemberPublicKeysFillsPartialBatchResponse(t *testing.T) {
+	oldGetLast := getLastE2EEPublicKeysWithClient
+	oldNegotiate := negotiateE2EEPublicKeyWithClient
+	t.Cleanup(func() {
+		getLastE2EEPublicKeysWithClient = oldGetLast
+		negotiateE2EEPublicKeyWithClient = oldNegotiate
+	})
+
+	getLastE2EEPublicKeysWithClient = func(*line.Client, line.GetLastE2EEPublicKeysRequest) (map[string]line.E2EEPeerPublicKey, error) {
+		return map[string]line.E2EEPeerPublicKey{
+			"U-batch": {KeyID: 10, KeyData: "batch-public-key"},
+		}, nil
+	}
+	var negotiated []string
+	negotiateE2EEPublicKeyWithClient = func(_ *line.Client, mid string) (*line.E2EEPublicKey, error) {
+		negotiated = append(negotiated, mid)
+		return &line.E2EEPublicKey{KeyID: json.Number("20"), PublicKey: "negotiated-public-key"}, nil
+	}
+
+	lc := newPeerKeyTestClient()
+	_, got, err := lc.resolveGroupMemberPublicKeys(
+		context.Background(),
+		line.NewClient("access"),
+		"C-group",
+		[]string{"U-batch", "U-missing"},
+	)
+	if err != nil {
+		t.Fatalf("resolveGroupMemberPublicKeys returned error: %v", err)
+	}
+	if len(negotiated) != 1 || negotiated[0] != "U-missing" {
+		t.Fatalf("negotiated members = %v, want [U-missing]", negotiated)
+	}
+	if got["U-batch"].KeyID != 10 || got["U-missing"].KeyID != 20 {
+		t.Fatalf("resolved keys = %#v, want batch and negotiated entries", got)
+	}
+}
+
+func TestResolveGroupMemberPublicKeysFallsBackAfterBatchError(t *testing.T) {
+	oldGetLast := getLastE2EEPublicKeysWithClient
+	oldNegotiate := negotiateE2EEPublicKeyWithClient
+	t.Cleanup(func() {
+		getLastE2EEPublicKeysWithClient = oldGetLast
+		negotiateE2EEPublicKeyWithClient = oldNegotiate
+	})
+
+	getLastE2EEPublicKeysWithClient = func(*line.Client, line.GetLastE2EEPublicKeysRequest) (map[string]line.E2EEPeerPublicKey, error) {
+		return nil, errors.New("batch unavailable")
+	}
+	var negotiated []string
+	negotiateE2EEPublicKeyWithClient = func(_ *line.Client, mid string) (*line.E2EEPublicKey, error) {
+		negotiated = append(negotiated, mid)
+		return &line.E2EEPublicKey{KeyID: json.Number("30"), PublicKey: "fallback-public-key"}, nil
+	}
+
+	lc := newPeerKeyTestClient()
+	_, got, err := lc.resolveGroupMemberPublicKeys(
+		context.Background(),
+		line.NewClient("access"),
+		"C-group",
+		[]string{"U-peer"},
+	)
+	if err != nil {
+		t.Fatalf("resolveGroupMemberPublicKeys returned error: %v", err)
+	}
+	if len(negotiated) != 1 || negotiated[0] != "U-peer" {
+		t.Fatalf("negotiated members = %v, want [U-peer]", negotiated)
+	}
+	if got["U-peer"].KeyID != 30 {
+		t.Fatalf("resolved key = %#v, want fallback key", got["U-peer"])
+	}
+}
+
+func TestResolveGroupMemberPublicKeysReturnsNoUsableGroupKey(t *testing.T) {
+	oldGetLast := getLastE2EEPublicKeysWithClient
+	oldNegotiate := negotiateE2EEPublicKeyWithClient
+	t.Cleanup(func() {
+		getLastE2EEPublicKeysWithClient = oldGetLast
+		negotiateE2EEPublicKeyWithClient = oldNegotiate
+	})
+
+	getLastE2EEPublicKeysWithClient = func(*line.Client, line.GetLastE2EEPublicKeysRequest) (map[string]line.E2EEPeerPublicKey, error) {
+		return nil, nil
+	}
+	negotiateE2EEPublicKeyWithClient = func(*line.Client, string) (*line.E2EEPublicKey, error) {
+		return nil, line.ErrNoUsableE2EEPublicKey
+	}
+
+	lc := newPeerKeyTestClient()
+	_, _, err := lc.resolveGroupMemberPublicKeys(
+		context.Background(),
+		line.NewClient("access"),
+		"C-group",
+		[]string{"U-peer"},
+	)
+	if !errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
+		t.Fatalf("error = %v, want ErrNoUsableE2EEGroupKey", err)
+	}
+}

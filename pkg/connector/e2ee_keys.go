@@ -46,8 +46,8 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 			Msg("No group key found, auto-registering")
 		if registerErr := lc.autoRegisterGroupKey(ctx, chatMid); registerErr != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(registerErr).Str("chat_mid", chatMid).
-				Msg("Auto-register group key failed, returning original error")
-			return err
+				Msg("Auto-register group key failed")
+			return fmt.Errorf("auto-register group key: %w", registerErr)
 		}
 		sharedKey, err = fetch()
 	}
@@ -193,6 +193,20 @@ func (lc *LineClient) clearGroupNoE2EE(chatMid string) {
 	delete(lc.noE2EEGroups, chatMid)
 }
 
+func (lc *LineClient) cacheGroupMemberMIDs(chatMid string, mids []string) {
+	// A self-only result is ambiguous: LINE sometimes returns an empty member
+	// map for active groups. Keep a previously complete list for fallback.
+	if len(mids) <= 1 {
+		return
+	}
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	if lc.groupMemberCache == nil {
+		lc.groupMemberCache = make(map[string][]string)
+	}
+	lc.groupMemberCache[chatMid] = append([]string(nil), mids...)
+}
+
 // getChatMemberMIDs fetches the member and invitee MIDs for a group chat via GetChats.
 // Invitees are included because group key registration must happen before they accept,
 // otherwise the key won't be available when they start sending messages.
@@ -219,13 +233,17 @@ func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]
 	}
 	seen := make(map[string]struct{})
 	for mid := range chat.Extra.GroupExtra.MemberMids {
-		seen[mid] = struct{}{}
+		if isUserMID(mid) {
+			seen[mid] = struct{}{}
+		}
 	}
 	for mid := range chat.Extra.GroupExtra.InviteeMids {
-		seen[mid] = struct{}{}
+		if isUserMID(mid) {
+			seen[mid] = struct{}{}
+		}
 	}
 	// Always include the bridge user's own MID since we're definitely a member
-	if _, ok := seen[lc.Mid]; !ok {
+	if isUserMID(lc.Mid) {
 		seen[lc.Mid] = struct{}{}
 	}
 	mids := make([]string, 0, len(seen))
@@ -236,13 +254,9 @@ func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]
 		return nil, fmt.Errorf("chat %s has no members or invitees", chatMid)
 	}
 
-	// Cache the successful result for fallback use.
-	lc.cacheMu.Lock()
-	if lc.groupMemberCache == nil {
-		lc.groupMemberCache = make(map[string][]string)
-	}
-	lc.groupMemberCache[chatMid] = mids
-	lc.cacheMu.Unlock()
+	// Cache complete results for fallback use. Do not replace a richer cached
+	// list when LINE returns only the caller.
+	lc.cacheGroupMemberMIDs(chatMid, mids)
 
 	return mids, nil
 }
@@ -261,6 +275,7 @@ func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) 
 	if len(members) == 1 && members[0] == lc.Mid {
 		lc.cacheMu.Lock()
 		cached, ok := lc.groupMemberCache[chatMid]
+		cached = append([]string(nil), cached...)
 		lc.cacheMu.Unlock()
 		if ok && len(cached) > 1 {
 			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", chatMid).
@@ -308,6 +323,7 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 	}
 
 	mids := make([]string, 0, len(matrixMembers))
+	seen := make(map[string]struct{}, len(matrixMembers)+1)
 	for mxid := range matrixMembers {
 		// Skip the bridge user's own Matrix account if present.
 		if mxid == lc.UserLogin.UserMXID {
@@ -316,7 +332,11 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 		// Parse the ghost MXID back to a network ID (LINE MID).
 		if netID, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(mxid); ok {
 			mid := string(netID)
-			if mid != lc.Mid && mid != string(lc.UserLogin.ID) {
+			if isUserMID(mid) && !lc.isOwnMID(mid) {
+				if _, exists := seen[mid]; exists {
+					continue
+				}
+				seen[mid] = struct{}{}
 				mids = append(mids, mid)
 			}
 		}
@@ -327,7 +347,9 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 	}
 
 	// Always include the bridge user's own MID.
-	mids = append(mids, lc.Mid)
+	if isUserMID(lc.Mid) {
+		mids = append(mids, lc.Mid)
+	}
 
 	lc.UserLogin.Bridge.Log.Debug().Str("chat_mid", chatMid).
 		Int("matrix_members", len(matrixMembers)).
