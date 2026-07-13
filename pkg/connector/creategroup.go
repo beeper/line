@@ -70,9 +70,8 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	lc.generatedGroupNameCache[chat.ChatMid] = name == ""
 	lc.cacheMu.Unlock()
 
-	// Register E2EE group key so members can decrypt group messages.
-	// This is best-effort: if E2EE isn't available for a member we skip them,
-	// and if the entire registration fails we log a warning without aborting.
+	// Registration is best-effort: an incomplete E2EE member list leaves the
+	// chat on its plaintext fallback without aborting group creation.
 	if lc.E2EE != nil && len(participantMids) > 0 {
 		if err := lc.registerGroupKey(ctx, chat.ChatMid, participantMids); err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).
@@ -213,8 +212,8 @@ func (lc *LineClient) resolveGroupMemberPublicKeys(ctx context.Context, client *
 // can decrypt group messages.
 func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, members []string) error {
 	members = lc.groupKeyMemberMIDs(chatMid, members)
-	if len(members) == 0 {
-		return fmt.Errorf("no other members to register group key for")
+	if lc.E2EE == nil {
+		return fmt.Errorf("%w: E2EE manager not initialized", line.ErrNoUsableE2EEGroupKey)
 	}
 
 	client := lc.newClient()
@@ -222,9 +221,13 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	// Batch responses can be partial without returning an error. Resolve every
 	// missing member individually so registration arrays retain the server's
 	// expected member count.
-	client, pubKeys, err := lc.resolveGroupMemberPublicKeys(ctx, client, chatMid, members)
-	if err != nil {
-		return err
+	pubKeys := make(map[string]line.E2EEPeerPublicKey, len(members))
+	if len(members) > 0 {
+		var err error
+		client, pubKeys, err = lc.resolveGroupMemberPublicKeys(ctx, client, chatMid, members)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Generate group key in WASM (same approach as LINE Chrome Extension).
@@ -253,10 +256,6 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 		apiMembers = append(apiMembers, mid)
 		keyIds = append(keyIds, pk.KeyID)
 		encryptedKeys = append(encryptedKeys, encryptedKey)
-	}
-
-	if len(apiMembers) == 0 {
-		return fmt.Errorf("no members with valid E2EE keys")
 	}
 
 	// LINE's registerE2EEGroupKey requires the caller's own key entry as well — without it the
