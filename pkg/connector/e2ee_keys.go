@@ -23,6 +23,13 @@ var (
 	}
 )
 
+func groupKeyFetchError(groupKeyID int, err error) error {
+	if groupKeyID == 0 && line.IsNotAMemberError(err) {
+		return fmt.Errorf("%w: latest group key lookup reported not a member: %w", line.ErrNoUsableE2EEGroupKey, err)
+	}
+	return err
+}
+
 // fetchAndUnwrapGroupKey retrieves a specific group key (or the latest when groupKeyID == 0)
 // and unwraps it so the E2EE manager can encrypt/decrypt group messages.
 // If no group key exists yet (TalkException code 5), it auto-registers one and retries.
@@ -33,10 +40,14 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 
 	client := lc.newClient()
 	fetch := func() (*line.E2EEGroupSharedKey, error) {
+		var sharedKey *line.E2EEGroupSharedKey
+		var err error
 		if groupKeyID > 0 {
-			return client.GetE2EEGroupSharedKey(chatMid, groupKeyID)
+			sharedKey, err = client.GetE2EEGroupSharedKey(chatMid, groupKeyID)
+		} else {
+			sharedKey, err = client.GetLastE2EEGroupSharedKey(chatMid)
 		}
-		return client.GetLastE2EEGroupSharedKey(chatMid)
+		return sharedKey, groupKeyFetchError(groupKeyID, err)
 	}
 
 	sharedKey, err := fetch()
@@ -207,10 +218,30 @@ func (lc *LineClient) cacheGroupMemberMIDs(chatMid string, mids []string) {
 	lc.groupMemberCache[chatMid] = append([]string(nil), mids...)
 }
 
-// getChatMemberMIDs fetches the member and invitee MIDs for a group chat via GetChats.
-// Invitees are included because group key registration must happen before they accept,
-// otherwise the key won't be available when they start sending messages.
-func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]string, error) {
+func joinedGroupMemberMIDs(group *line.GroupExtra, ownMID string) ([]string, bool) {
+	seen := make(map[string]struct{})
+	if group != nil {
+		for mid := range group.MemberMids {
+			if isUserMID(mid) {
+				seen[mid] = struct{}{}
+			}
+		}
+	}
+	if isUserMID(ownMID) {
+		seen[ownMID] = struct{}{}
+	}
+
+	mids := make([]string, 0, len(seen))
+	for mid := range seen {
+		mids = append(mids, mid)
+	}
+	return mids, group != nil && len(group.InviteeMids) > 0
+}
+
+// getChatMemberMIDs fetches joined member MIDs for a group chat via GetChats.
+// Pending invitees are deliberately excluded: LINE validates group keys against the
+// current joined-member set and rejects keys that include invitees.
+func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]string, bool, error) {
 	client := lc.newClient()
 	chats, err := client.GetChats([]string{chatMid}, true, true)
 	if err != nil {
@@ -221,50 +252,33 @@ func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]
 			}
 		}
 		if err != nil {
-			return nil, fmt.Errorf("getChats failed for %s: %w", chatMid, err)
+			return nil, false, fmt.Errorf("getChats failed for %s: %w", chatMid, err)
 		}
 	}
 	if len(chats.Chats) == 0 {
-		return nil, fmt.Errorf("chat %s not found", chatMid)
+		return nil, false, fmt.Errorf("chat %s not found", chatMid)
 	}
 	chat := chats.Chats[0]
 	if chat.Extra.GroupExtra == nil {
-		return nil, fmt.Errorf("chat %s has no group extra", chatMid)
+		return nil, false, fmt.Errorf("chat %s has no group extra", chatMid)
 	}
-	seen := make(map[string]struct{})
-	for mid := range chat.Extra.GroupExtra.MemberMids {
-		if isUserMID(mid) {
-			seen[mid] = struct{}{}
-		}
-	}
-	for mid := range chat.Extra.GroupExtra.InviteeMids {
-		if isUserMID(mid) {
-			seen[mid] = struct{}{}
-		}
-	}
-	// Include the bridge user's MID when it has a valid user prefix.
-	if isUserMID(lc.Mid) {
-		seen[lc.Mid] = struct{}{}
-	}
-	mids := make([]string, 0, len(seen))
-	for mid := range seen {
-		mids = append(mids, mid)
-	}
+	group := chat.Extra.GroupExtra
+	mids, hasPendingInvitees := joinedGroupMemberMIDs(group, lc.Mid)
 	if len(mids) == 0 {
-		return nil, fmt.Errorf("chat %s has no members or invitees", chatMid)
+		return nil, hasPendingInvitees, fmt.Errorf("chat %s has no joined members", chatMid)
 	}
 
 	// Cache complete results for fallback use. Do not replace a richer cached
 	// list when LINE returns only the caller.
 	lc.cacheGroupMemberMIDs(chatMid, mids)
 
-	return mids, nil
+	return mids, hasPendingInvitees, nil
 }
 
 // autoRegisterGroupKey fetches group members, then registers a new E2EE group key
 // for the chat. This is called when fetchAndUnwrapGroupKey finds no key exists.
 func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) error {
-	members, err := lc.getChatMemberMIDs(ctx, chatMid)
+	members, hasPendingInvitees, err := lc.getChatMemberMIDs(ctx, chatMid)
 	if err != nil {
 		return fmt.Errorf("getChatMemberMIDs: %w", err)
 	}
@@ -272,7 +286,7 @@ func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) 
 	// If getChatMemberMIDs returned only ourself, the server likely returned
 	// an empty MemberMids map (known LINE API issue). Fall back to cached
 	// member list from CreateGroup or a prior successful fetch.
-	if len(members) == 1 && members[0] == lc.Mid {
+	if len(members) == 1 && members[0] == lc.Mid && !hasPendingInvitees {
 		lc.cacheMu.Lock()
 		cached, ok := lc.groupMemberCache[chatMid]
 		cached = append([]string(nil), cached...)
@@ -285,7 +299,7 @@ func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) 
 	}
 
 	// Last resort: query Matrix room members via the bridge API.
-	if len(members) == 1 && members[0] == lc.Mid {
+	if len(members) == 1 && members[0] == lc.Mid && !hasPendingInvitees {
 		matrixMembers, err := lc.getGroupMemberMIDsViaMatrix(ctx, chatMid)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).

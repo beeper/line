@@ -5,9 +5,16 @@ import "encoding/json"
 type FlexibleMidMap map[string]bool
 
 func (f *FlexibleMidMap) UnmarshalJSON(data []byte) error {
-	var m map[string]bool
+	var m map[string]json.RawMessage
 	if err := json.Unmarshal(data, &m); err == nil {
-		*f = m
+		if m == nil {
+			*f = nil
+			return nil
+		}
+		*f = make(map[string]bool, len(m))
+		for mid := range m {
+			(*f)[mid] = true
+		}
 		return nil
 	}
 

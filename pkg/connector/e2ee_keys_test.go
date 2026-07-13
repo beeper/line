@@ -211,6 +211,63 @@ func TestCacheGroupMemberMIDsPreservesRicherList(t *testing.T) {
 	}
 }
 
+func TestGroupKeyFetchErrorAllowsLatestKeyPlaintextFallback(t *testing.T) {
+	err := groupKeyFetchError(0, errNotMember)
+
+	if !errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
+		t.Fatalf("error = %v, want ErrNoUsableE2EEGroupKey", err)
+	}
+	if !errors.Is(err, errNotMember) {
+		t.Fatalf("error = %v, want not-member error to remain wrapped", err)
+	}
+}
+
+func TestGroupKeyFetchErrorPreservesSpecificKeyMembershipError(t *testing.T) {
+	err := groupKeyFetchError(123, errNotMember)
+
+	if !errors.Is(err, errNotMember) {
+		t.Fatalf("error = %v, want original not-member error", err)
+	}
+	if errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
+		t.Fatalf("error = %v, specific group key lookup must not allow plaintext fallback", err)
+	}
+}
+
+func TestRegisterGroupKeyAllowsPlaintextFallbackWithoutKnownMembers(t *testing.T) {
+	lc := newPeerKeyTestClient()
+	lc.Mid = "U-self"
+
+	err := lc.registerGroupKey(context.Background(), "C-group", []string{"U-self"})
+	if !errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
+		t.Fatalf("error = %v, want ErrNoUsableE2EEGroupKey", err)
+	}
+}
+
+func TestJoinedGroupMemberMIDsExcludeInvitees(t *testing.T) {
+	group := &line.GroupExtra{
+		MemberMids: line.FlexibleMidMap{
+			"U-self":   true,
+			"U-member": true,
+		},
+		InviteeMids: line.FlexibleMidMap{
+			"U-invitee": true,
+		},
+	}
+
+	mids, hasPendingInvitees := joinedGroupMemberMIDs(group, "U-self")
+	if !hasPendingInvitees {
+		t.Fatal("hasPendingInvitees = false, want true")
+	}
+	if len(mids) != 2 {
+		t.Fatalf("joined mids = %v, want self and joined member only", mids)
+	}
+	for _, mid := range mids {
+		if mid == "U-invitee" {
+			t.Fatalf("joined mids unexpectedly contain pending invitee: %v", mids)
+		}
+	}
+}
+
 func TestResolveGroupMemberPublicKeysFillsPartialBatchResponse(t *testing.T) {
 	oldGetLast := getLastE2EEPublicKeysWithClient
 	oldNegotiate := negotiateE2EEPublicKeyWithClient
