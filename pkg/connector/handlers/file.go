@@ -36,11 +36,12 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
 	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
 		client = newClient
-		fileData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+		fileData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 	}
 
 	if err != nil {
@@ -48,19 +49,8 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 			Err(err).
 			Str("oid", oid).
 			Bool("plain_media", isPlainMedia).
-			Msg("Failed to download file from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[File unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download file from OBS")
+		return mediaDownloadFailure("File", err, relatesTo)
 	}
 
 	// Try to decrypt using keyMaterial from encrypted payload

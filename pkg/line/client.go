@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,13 +22,21 @@ import (
 )
 
 const (
-	BaseURL          = "https://line-chrome-gw.line-apps.com/api/talk/thrift/Talk"
-	ShopBaseURL      = "https://line-chrome-gw.line-apps.com/api/shop/thrift/ShopService"
-	ExtensionVersion = "3.7.2"
-	UserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-	rpcClientTimeout = 30 * time.Second
-	obsRetryDelay    = 2 * time.Second
-	obsMaxRetries    = 5
+	BaseURL               = "https://line-chrome-gw.line-apps.com/api/talk/thrift/Talk"
+	ShopBaseURL           = "https://line-chrome-gw.line-apps.com/api/shop/thrift/ShopService"
+	ExtensionVersion      = "3.7.2"
+	UserAgent             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+	rpcClientTimeout      = 30 * time.Second
+	obsMaxRetries         = 5
+	lineApplicationHeader = "CHROMEOS\t" + ExtensionVersion + "\tChrome_OS\t"
+)
+
+var (
+	obsRetryDelay = 2 * time.Second
+
+	ErrOBSObjectNotFound     = errors.New("LINE OBS object not found")
+	ErrOBSEncodingIncomplete = errors.New("LINE OBS object encoding incomplete")
+	ErrOBSObjectValidation   = errors.New("LINE OBS object validation failed")
 )
 
 type Client struct {
@@ -696,11 +705,14 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 	// URL structure: https://obs.line-apps.com/r/talk/{SID}/{OID}
 	// SID: emi (images), emv (videos), ema (audio), emf (files)
 	obsURL := fmt.Sprintf("%s/r/talk/%s/%s", OBSBaseURL, sid, oid)
+	objectInfoURL := obsURL
 	if opts.TID != "" {
 		obsURL += "/" + url.PathEscape(opts.TID)
 	}
 	if opts.OBSPop != "" {
-		obsURL += "?p=" + url.QueryEscape(opts.OBSPop)
+		query := "?p=" + url.QueryEscape(opts.OBSPop)
+		objectInfoURL += query
+		obsURL += query
 	}
 
 	obsToken, err := c.AcquireEncryptedAccessToken()
@@ -708,58 +720,130 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 		return nil, fmt.Errorf("failed to acquire encrypted access token: %w", err)
 	}
 
-	// Retry loop for 202/404 (media still processing, e.g. video transcoding).
+	// Chrome preflights object_info.obs before downloading media. This is
+	// important because a missing object and an object that is still encoding
+	// require different bridge behavior.
 	for attempt := 0; attempt <= obsMaxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, "GET", obsURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create OBS download request: %w", err)
-		}
-
-		req.Header.Set("User-Agent", UserAgent)
-		if obsToken != "" {
-			req.Header.Set("x-line-access", obsToken)
-		}
-
-		// Add x-talk-meta header with Thrift-encoded message
-		if messageID != "" {
-			talkMeta := c.constructTalkMeta(messageID)
-			req.Header.Set("x-talk-meta", talkMeta)
-		}
-
-		resp, err := c.obsHTTPClient().Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("OBS download request failed: %w", err)
-		}
-
-		if resp.StatusCode == 202 || resp.StatusCode == 404 {
-			resp.Body.Close()
-			if attempt >= obsMaxRetries {
-				return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", obsMaxRetries)
+		err = c.checkOBSObjectReady(ctx, objectInfoURL, obsToken, messageID)
+		if err == nil {
+			var data []byte
+			data, err = c.downloadOBSObject(ctx, obsURL, obsToken, messageID)
+			if err == nil {
+				return data, nil
 			}
-			select {
-			case <-time.After(obsRetryDelay):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-			continue
 		}
-
-		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return nil, fmt.Errorf("OBS download failed (%d): %s", resp.StatusCode, string(body))
+		if !errors.Is(err, ErrOBSEncodingIncomplete) {
+			return nil, err
 		}
-
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read OBS response body: %w", err)
+		if attempt >= obsMaxRetries {
+			return nil, fmt.Errorf("%w after %d retries", ErrOBSEncodingIncomplete, obsMaxRetries)
 		}
-
-		return data, nil
+		if err = waitForOBSRetry(ctx); err != nil {
+			return nil, err
+		}
 	}
 
-	return nil, fmt.Errorf("OBS download failed: media still processing after %d retries", obsMaxRetries)
+	return nil, fmt.Errorf("%w after %d retries", ErrOBSEncodingIncomplete, obsMaxRetries)
+}
+
+type obsObjectInfo struct {
+	Status       string `json:"status"`
+	EncodeStatus string `json:"encodeStatus"`
+}
+
+func (c *Client) checkOBSObjectReady(ctx context.Context, obsURL, obsToken, messageID string) error {
+	parsedURL, err := url.Parse(obsURL)
+	if err != nil {
+		return fmt.Errorf("failed to parse OBS object URL: %w", err)
+	}
+	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/") + "/object_info.obs"
+
+	req, err := c.newOBSDownloadRequest(ctx, parsedURL.String(), obsToken, messageID)
+	if err != nil {
+		return fmt.Errorf("failed to create OBS object info request: %w", err)
+	}
+	resp, err := c.obsHTTPClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("OBS object info request failed: %w", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return fmt.Errorf("failed to read OBS object info response: %w", readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("OBS object info failed (%d): %s", resp.StatusCode, string(body))
+	}
+
+	var info obsObjectInfo
+	if err = json.Unmarshal(body, &info); err != nil {
+		return fmt.Errorf("%w: invalid response: %v", ErrOBSObjectValidation, err)
+	}
+	switch info.Status {
+	case "notexist":
+		return ErrOBSObjectNotFound
+	case "exist":
+		if info.EncodeStatus == "ing" {
+			return ErrOBSEncodingIncomplete
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unexpected status %q", ErrOBSObjectValidation, info.Status)
+	}
+}
+
+func (c *Client) downloadOBSObject(ctx context.Context, obsURL, obsToken, messageID string) ([]byte, error) {
+	req, err := c.newOBSDownloadRequest(ctx, obsURL, obsToken, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OBS download request: %w", err)
+	}
+	resp, err := c.obsHTTPClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("OBS download request failed: %w", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read OBS response body: %w", readErr)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return body, nil
+	case http.StatusAccepted:
+		return nil, ErrOBSEncodingIncomplete
+	default:
+		return nil, fmt.Errorf("OBS download failed (%d): %s", resp.StatusCode, string(body))
+	}
+}
+
+func (c *Client) newOBSDownloadRequest(ctx context.Context, requestURL, obsToken, messageID string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("x-line-application", lineApplicationHeader)
+	if obsToken != "" {
+		req.Header.Set("x-line-access", obsToken)
+	}
+	if messageID != "" {
+		req.Header.Set("x-talk-meta", c.constructTalkMeta(messageID))
+	}
+	return req, nil
+}
+
+func waitForOBSRetry(ctx context.Context) error {
+	if obsRetryDelay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(obsRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // this builds x-talk-meta

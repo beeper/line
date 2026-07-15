@@ -67,6 +67,8 @@ func IsUnauthorizedStatus(err error) bool {
 		strings.Contains(msg, "sse error: 403") ||
 		strings.Contains(msg, "obs upload failed (401)") ||
 		strings.Contains(msg, "obs upload failed (403)") ||
+		strings.Contains(msg, "obs object info failed (401)") ||
+		strings.Contains(msg, "obs object info failed (403)") ||
 		strings.Contains(msg, "obs download failed (401)") ||
 		strings.Contains(msg, "obs download failed (403)")
 }

@@ -45,11 +45,12 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	audioData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	audioData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
 	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
 		client = newClient
-		audioData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+		audioData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 	}
 
 	if err != nil {
@@ -58,19 +59,8 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 			Str("oid", oid).
 			Str("msg_id", data.ID).
 			Bool("plain_media", isPlainMedia).
-			Msg("Failed to download audio from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[Audio unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download audio from OBS")
+		return mediaDownloadFailure("Audio", err, relatesTo)
 	}
 
 	// Decrypt audio if it has keyMaterial (E2EE)

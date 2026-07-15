@@ -8,8 +8,11 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+
+	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
 func TestCapabilitiesAdvertiseSupportedReactions(t *testing.T) {
@@ -455,5 +458,110 @@ func TestReactionNotAMemberError(t *testing.T) {
 	}
 	if !status.IsCertain || !status.ErrorAsMessage {
 		t.Fatalf("status certainty/message flags = %v/%v, want true/true", status.IsCertain, status.ErrorAsMessage)
+	}
+}
+
+func TestEventSenderForMIDMarksOwnAccount(t *testing.T) {
+	lc := &LineClient{
+		Mid: "own-mid",
+		UserLogin: &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{ID: networkid.UserLoginID("login-mid")},
+		},
+	}
+
+	for _, tc := range []struct {
+		name string
+		mid  string
+	}{
+		// BIOS-36189: an own paid reaction in a DM arrived with the account MID.
+		// IsFromMe makes bridgev2 use the source login instead of joining its ghost
+		// as a third DM member.
+		{name: "BIOS-36189 DM own reaction", mid: "own-mid"},
+		{name: "persisted login ID alias", mid: "login-mid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := lc.eventSenderForMID(tc.mid)
+			if !sender.IsFromMe {
+				t.Fatalf("sender %q was not marked IsFromMe", tc.mid)
+			}
+			if sender.Sender != networkid.UserID(tc.mid) {
+				t.Fatalf("sender ID = %q, want %q", sender.Sender, tc.mid)
+			}
+		})
+	}
+
+	other := lc.eventSenderForMID("other-mid")
+	if other.IsFromMe {
+		t.Fatal("other sender was marked IsFromMe")
+	}
+	if other.Sender != networkid.UserID("other-mid") {
+		t.Fatalf("other sender ID = %q", other.Sender)
+	}
+}
+
+func TestResolveReactionSenderMID(t *testing.T) {
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{ID: networkid.UserLoginID("Uself")},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		opType  OperationType
+		op      line.Operation
+		chatMID string
+		want    string
+	}{
+		{
+			name:    "type 139 always uses the logged-in user",
+			opType:  OpPredefinedReaction,
+			op:      line.Operation{Param3: "Uobserver"},
+			chatMID: "Cgroup",
+			want:    "Uself",
+		},
+		{
+			name:    "type 140 group reaction preserves param3 actor",
+			opType:  OpReaction,
+			op:      line.Operation{Param3: "Ureactor"},
+			chatMID: "Cgroup",
+			want:    "Ureactor",
+		},
+		{
+			name:    "type 140 DM can infer a missing actor from chat MID",
+			opType:  OpReaction,
+			op:      line.Operation{},
+			chatMID: "Upeer",
+			want:    "Upeer",
+		},
+		{
+			name:    "type 140 DM preserves the param3 actor",
+			opType:  OpReaction,
+			op:      line.Operation{Param3: "Uactor"},
+			chatMID: "Upeer",
+			want:    "Uactor",
+		},
+		{
+			name:    "type 140 group cannot use chat MID as actor",
+			opType:  OpReaction,
+			op:      line.Operation{},
+			chatMID: "Cgroup",
+			want:    "",
+		},
+		{
+			name:    "type 140 rejects a group MID in param3",
+			opType:  OpReaction,
+			op:      line.Operation{Param3: "Cgroup"},
+			chatMID: "Cgroup",
+			want:    "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lc.resolveReactionSenderMID(tc.opType, tc.op, tc.chatMID); got != tc.want {
+				t.Fatalf("resolveReactionSenderMID() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
