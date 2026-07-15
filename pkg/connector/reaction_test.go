@@ -535,6 +535,13 @@ func TestResolveReactionSenderMID(t *testing.T) {
 			want:    "Upeer",
 		},
 		{
+			name:    "type 140 DM preserves the param3 actor",
+			opType:  OpReaction,
+			op:      line.Operation{Param3: "Uactor"},
+			chatMID: "Upeer",
+			want:    "Uactor",
+		},
+		{
 			name:    "type 140 group cannot use chat MID as actor",
 			opType:  OpReaction,
 			op:      line.Operation{},

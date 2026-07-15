@@ -40,6 +40,34 @@ func TestTryRecoverClientUsesShouldRecover(t *testing.T) {
 	}
 }
 
+func TestTryRecoverClientRecoversOBSObjectInfoUnauthorized(t *testing.T) {
+	recoveredClient := line.NewClient("refreshed-token")
+	var recoverCalled bool
+	h := &Handler{
+		ShouldRecover: func(_ context.Context, err error) bool {
+			return line.IsUnauthorizedStatus(err)
+		},
+		IsLoggedOut: func(error) bool {
+			return false
+		},
+		RecoverToken: func(context.Context) error {
+			recoverCalled = true
+			return nil
+		},
+		NewClient: func() *line.Client {
+			return recoveredClient
+		},
+	}
+
+	client, ok := h.tryRecoverClient(context.Background(), errors.New("OBS object info failed (401): unauthorized"))
+	if !ok || client != recoveredClient {
+		t.Fatalf("tryRecoverClient returned client=%v ok=%v, want refreshed client", client, ok)
+	}
+	if !recoverCalled {
+		t.Fatal("RecoverToken was not called for OBS object-info 401")
+	}
+}
+
 func TestMediaDownloadFailureOnlyMaterializesKnownExpiry(t *testing.T) {
 	converted, err := mediaDownloadFailure("Image", line.ErrOBSObjectNotFound, nil)
 	if err != nil {

@@ -946,10 +946,11 @@ func (lc *LineClient) eventSenderForMID(mid string) bridgev2.EventSender {
 }
 
 // resolveReactionSenderMID mirrors the Chrome extension's operation handling:
-// type 139 is the current user's reaction, while type 140 carries the reacting
-// user's MID in param3. A missing param3 can only be inferred safely in a DM,
-// where chatMid is the other user's MID. Never turn a group chat MID into a
-// Matrix ghost.
+// SEND_REACTION (type 139) updates the current user's reaction without a sender,
+// while NOTIFIED_SEND_REACTION (type 140) always passes param3 as senderMid.
+// This handler is shared by DMs and groups regardless of Letter Sealing mode.
+// A missing param3 can only be inferred safely in a DM, where chatMid is the
+// other user's MID. Never turn a group chat MID into a Matrix ghost.
 func (lc *LineClient) resolveReactionSenderMID(opType OperationType, op line.Operation, chatMid string) string {
 	if opType == OpPredefinedReaction {
 		return string(lc.UserLogin.ID)
@@ -1815,9 +1816,6 @@ func (lc *LineClient) handlePredefinedReaction(ctx context.Context, op line.Oper
 	}
 
 	senderID := makeUserID(op.Param3)
-	if op.Param3 == "" {
-		senderID = makeUserID(chatMid)
-	}
 
 	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
 

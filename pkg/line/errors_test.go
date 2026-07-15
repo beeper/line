@@ -78,6 +78,8 @@ func TestIsUnauthorizedStatus(t *testing.T) {
 		errors.New("SSE error: 403"),
 		errors.New("OBS upload failed (401): unauthorized"),
 		errors.New("OBS upload failed (403): forbidden"),
+		errors.New("OBS object info failed (401): unauthorized"),
+		errors.New("OBS object info failed (403): forbidden"),
 		errors.New("OBS download failed (401): unauthorized"),
 		errors.New("OBS download failed (403): forbidden"),
 		errors.New("api error 401: unauthorized"),

@@ -229,6 +229,22 @@ func TestDownloadOBSDoesNotCallObjectInfoHTTP404Expired(t *testing.T) {
 	}
 }
 
+func TestDownloadOBSClassifiesObjectInfoUnauthorized(t *testing.T) {
+	installCachedOBSToken(t)
+
+	client := NewClient("line-token")
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return obsResponse(http.StatusUnauthorized, "unauthorized"), nil
+		}),
+	}
+
+	_, err := client.DownloadOBSWithSIDOptions(context.Background(), "message-id", "", "m", OBSDownloadOptions{})
+	if !IsUnauthorizedStatus(err) {
+		t.Fatalf("err = %v, want unauthorized status for token recovery", err)
+	}
+}
+
 func TestDownloadOBSDoesNotCallPostPreflight404Expired(t *testing.T) {
 	installCachedOBSToken(t)
 
