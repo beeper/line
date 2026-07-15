@@ -2,9 +2,14 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/event"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
@@ -26,6 +31,35 @@ type Handler struct {
 
 	// DecryptMedia decrypts E2EE encrypted media data using the given key material.
 	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
+}
+
+func obsTalkMetaMessageID(messageID string, isPlainMedia bool) string {
+	if isPlainMedia {
+		return ""
+	}
+	return messageID
+}
+
+func mediaDownloadFailure(kind string, err error, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if !errors.Is(err, line.ErrOBSObjectNotFound) {
+		// Keep ambiguous OBS failures retryable. Returning ErrIgnoringRemoteEvent
+		// prevents bridgev2 from posting a generic error notice, while omitting a
+		// converted message means the remote event isn't stored as successfully
+		// bridged and can be retried by a later backfill.
+		return nil, fmt.Errorf("%w: failed to download %s from LINE OBS: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), err)
+	}
+	return &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{
+			{
+				Type: event.EventMessage,
+				Content: &event.MessageEventContent{
+					MsgType:   event.MsgNotice,
+					Body:      fmt.Sprintf("[%s unavailable — LINE media expired before it could be bridged]", kind),
+					RelatesTo: relatesTo,
+				},
+			},
+		},
+	}, nil
 }
 
 // tryRecoverClient attempts token recovery on auth errors and returns a fresh client.

@@ -30,6 +30,7 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 
 	mediaCategory := lineMediaCategory(data.ContentMetadata)
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
 
 	var imgData []byte
 	var err error
@@ -43,18 +44,18 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		Bool("plain_media", isPlainMedia).
 		Msg("Downloading image from LINE OBS")
 	if isPlainMedia {
-		imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, "m", downloadOptions)
+		imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, "m", downloadOptions)
 	} else {
-		imgData, err = client.DownloadOBSWithOptions(ctx, oid, data.ID, downloadOptions)
+		imgData, err = client.DownloadOBSWithOptions(ctx, oid, talkMetaMessageID, downloadOptions)
 	}
 
 	// Refresh token if we get a 401
 	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
 		client = newClient
 		if isPlainMedia {
-			imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, "m", downloadOptions)
+			imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, "m", downloadOptions)
 		} else {
-			imgData, err = client.DownloadOBSWithOptions(ctx, oid, data.ID, downloadOptions)
+			imgData, err = client.DownloadOBSWithOptions(ctx, oid, talkMetaMessageID, downloadOptions)
 		}
 	}
 	downloadDuration := time.Since(dlStart)
@@ -66,19 +67,8 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			Str("msg_id", data.ID).
 			Bool("plain_media", isPlainMedia).
 			Dur("download_duration", downloadDuration).
-			Msg("Failed to download image from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[Image unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download image from OBS")
+		return mediaDownloadFailure("Image", err, relatesTo)
 	}
 
 	// Decrypt image if it has keyMaterial (E2EE)

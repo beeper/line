@@ -938,6 +938,31 @@ func (lc *LineClient) isOwnMID(mid string) bool {
 	return false
 }
 
+func (lc *LineClient) eventSenderForMID(mid string) bridgev2.EventSender {
+	return bridgev2.EventSender{
+		Sender:   makeUserID(mid),
+		IsFromMe: lc.isOwnMID(mid),
+	}
+}
+
+// resolveReactionSenderMID mirrors the Chrome extension's operation handling:
+// type 139 is the current user's reaction, while type 140 carries the reacting
+// user's MID in param3. A missing param3 can only be inferred safely in a DM,
+// where chatMid is the other user's MID. Never turn a group chat MID into a
+// Matrix ghost.
+func (lc *LineClient) resolveReactionSenderMID(opType OperationType, op line.Operation, chatMid string) string {
+	if opType == OpPredefinedReaction {
+		return string(lc.UserLogin.ID)
+	}
+	if isUserMID(op.Param3) {
+		return op.Param3
+	}
+	if op.Param3 == "" && isUserMID(chatMid) {
+		return chatMid
+	}
+	return ""
+}
+
 func hiddenMemberEventExtra(exclude bool) map[string]any {
 	if !exclude {
 		return nil
@@ -1590,7 +1615,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 					Receiver: lc.UserLogin.ID,
 				},
 				Timestamp: time.UnixMilli(ts),
-				Sender:    bridgev2.EventSender{Sender: senderID},
+				Sender:    lc.eventSenderForMID(string(senderID)),
 			},
 			ReadUpTo: time.UnixMilli(ts),
 		})
@@ -1621,8 +1646,8 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				return
 			}
 
-			// Type 139 is the "self" event - sender is always the bridge user
-			op.Param3 = string(lc.UserLogin.ID)
+			// Type 139 is the "self" event - sender is always the bridge user.
+			op.Param3 = lc.resolveReactionSenderMID(OpPredefinedReaction, op, param2.ChatMid)
 
 			// Curr == nil signals a reaction removal/clear from LINE.
 			if param2.Curr == nil {
@@ -1651,30 +1676,27 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				return
 			}
 
+			op.Param3 = lc.resolveReactionSenderMID(OpReaction, op, param2.ChatMid)
+			if op.Param3 == "" {
+				lc.UserLogin.Bridge.Log.Warn().
+					Str("msg_id", op.Param1).
+					Str("chat_mid", param2.ChatMid).
+					Msg("Skipping reaction without a user sender MID")
+				return
+			}
+
 			// Curr == nil signals a reaction removal/clear from LINE. The
 			// payload does not carry the previous reaction type, so we don't
-			// know whether the original was predefined or paid. Existing
-			// predefined adds in this branch override op.Param3 = chatMid,
-			// while paid adds leave it as the observer MID — so we queue a
-			// removal for each candidate sender. The framework safely ignores
-			// any sender that doesn't have a matching reaction row.
+			// know whether the original was predefined or paid. Both variants
+			// use the type 140 actor from param3, so the sender is unambiguous.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (other)")
-				senders := []networkid.UserID{makeUserID(param2.ChatMid)}
-				if op.Param3 != "" && op.Param3 != param2.ChatMid {
-					senders = append(senders, makeUserID(op.Param3))
-				}
-				lc.handleReactionRemove(op, param2.ChatMid, senders)
+				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(op.Param3)})
 				return
 			}
 
 			// Handle predefined reactions sent via type 140 operations
 			if param2.Curr.PaidReactionType == nil && param2.Curr.PredefinedReactionType != nil {
-				// Type 140 is the "other" event - param3 is the observer,
-				// not the actor. Override with chatMid, which in 1:1 DMs
-				// is the other participant's MID (the reacting user).
-				op.Param3 = param2.ChatMid
-
 				lc.handlePredefinedReaction(ctx, op, param2.ChatMid, param2.Curr.PredefinedReactionType.Val)
 				return
 			}
@@ -1779,7 +1801,7 @@ func (lc *LineClient) handlePaidReaction(ctx context.Context, op line.Operation,
 			Type:      bridgev2.RemoteEventReaction,
 			PortalKey: portalKey,
 			Timestamp: time.UnixMilli(ts),
-			Sender:    bridgev2.EventSender{Sender: senderID},
+			Sender:    lc.eventSenderForMID(op.Param3),
 		},
 		TargetMessage: networkid.MessageID(op.Param1),
 		Emoji:         string(mxc),
@@ -1842,7 +1864,7 @@ func (lc *LineClient) handlePredefinedReaction(ctx context.Context, op line.Oper
 			Type:      bridgev2.RemoteEventReaction,
 			PortalKey: portalKey,
 			Timestamp: time.UnixMilli(ts),
-			Sender:    bridgev2.EventSender{Sender: senderID},
+			Sender:    lc.eventSenderForMID(string(senderID)),
 		},
 		TargetMessage: networkid.MessageID(op.Param1),
 		Emoji:         mxc,
@@ -1874,7 +1896,7 @@ func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, se
 				Type:      bridgev2.RemoteEventReactionRemove,
 				PortalKey: portalKey,
 				Timestamp: time.UnixMilli(ts),
-				Sender:    bridgev2.EventSender{Sender: sender},
+				Sender:    lc.eventSenderForMID(string(sender)),
 			},
 			TargetMessage: networkid.MessageID(op.Param1),
 		})

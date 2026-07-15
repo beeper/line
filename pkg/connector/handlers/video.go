@@ -46,12 +46,13 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
 	dlStart := time.Now()
-	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
 	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
 		client = newClient
-		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 	}
 
 	if err != nil {
@@ -61,19 +62,8 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 			Str("msg_id", data.ID).
 			Bool("plain_media", isPlainMedia).
 			Dur("download_duration", time.Since(dlStart)).
-			Msg("Failed to download video from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[Video unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download video from OBS")
+		return mediaDownloadFailure("Video", err, relatesTo)
 	}
 
 	decrypted := false
