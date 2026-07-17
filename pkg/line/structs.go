@@ -61,6 +61,17 @@ type Profile struct {
 	CreatedTimeMillis            string            `json:"createdTimeMillis"`
 }
 
+// SettingsAttributeNotificationDisabledWithSub selects the account setting
+// that controls whether another LINE client suppresses mobile notifications.
+const SettingsAttributeNotificationDisabledWithSub = 16
+
+// Settings contains the account-level values accepted by
+// TalkService/updateSettingsAttributes2. Fields must not use omitempty: LINE
+// distinguishes an explicit false value from a missing setting.
+type Settings struct {
+	NotificationDisabledWithSub bool `json:"notificationDisabledWithSub"`
+}
+
 type Operation struct {
 	Revision    json.Number `json:"revision"`
 	Type        int         `json:"type"` // 25=Send, 26=Receive

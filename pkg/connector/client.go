@@ -588,6 +588,25 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		})
 		return
 	}
+	// LINE Chrome disables mobile notifications while its session is active by
+	// default. Explicitly clear that setting once per bridge connection so the
+	// user's phone continues receiving notifications.
+	if err := lc.configurePhoneNotifications(ctx); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if lc.isLoggedOut(err) {
+			lc.markLoggedOutByOtherClient(ctx, err)
+			return
+		}
+		lc.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      "line-token-expired",
+			Message:    fmt.Sprintf("session expired and could not be restored: %v", err),
+			UserAction: status.UserActionRelogin,
+		})
+		return
+	}
 	if !lc.sendConnectedStateIfCurrent(ctx) {
 		return
 	}
