@@ -394,6 +394,29 @@ func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
 	return wrapper.Data, nil
 }
 
+// UpdateSettingsAttributes2Context updates the selected account settings. The
+// request shape matches LINE Chrome: [reqSeq, attribute IDs, settings].
+func (c *Client) UpdateSettingsAttributes2Context(ctx context.Context, reqSeq int64, attributes []int, settings Settings) error {
+	resp, err := c.callRPCContext(ctx, "TalkService", "updateSettingsAttributes2", reqSeq, attributes, settings)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse updateSettingsAttributes2 response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		// Preserve the response data because TalkException details contain the
+		// error code used by connector-level auth recovery.
+		return fmt.Errorf("updateSettingsAttributes2 failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
+	}
+	return nil
+}
+
 func (c *Client) React(reqSeq int64, messageID string, reactionType ReactionType) error {
 	req := ReactRequest{
 		ReqSeq:       int(reqSeq),

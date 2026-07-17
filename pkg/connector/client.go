@@ -588,6 +588,13 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		})
 		return
 	}
+	// LINE Chrome disables mobile notifications while its session is active by
+	// default. Explicitly clear that setting once per bridge connection so the
+	// user's phone continues receiving notifications.
+	lc.configurePhoneNotifications(ctx)
+	if ctx.Err() != nil {
+		return
+	}
 	if !lc.sendConnectedStateIfCurrent(ctx) {
 		return
 	}
