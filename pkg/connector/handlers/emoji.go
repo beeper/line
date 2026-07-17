@@ -181,7 +181,11 @@ func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Porta
 		}
 	}
 
-	h.Log.Debug().Str("text_body", stkTxt).Str("raw_body", bodyText).Interface("content_metadata", data.ContentMetadata).Msg("Falling back to text for inline emoji")
+	h.Log.Debug().
+		Int("text_length", len(stkTxt)).
+		Int("raw_body_length", len(bodyText)).
+		Int("metadata_count", len(data.ContentMetadata)).
+		Msg("Falling back to text for inline emoji")
 	return h.ConvertText(cleanInlineSticonPlaceholders(stkTxt), relatesTo)
 }
 
@@ -205,7 +209,7 @@ func (h *Handler) convertSticonParts(ctx context.Context, portal *bridgev2.Porta
 			h.Log.Debug().
 				Int("start", r.Start).
 				Int("end", r.End).
-				Str("text_body", stkTxt).
+				Int("text_length", len(stkTxt)).
 				Msg("Skipping inline sticon with invalid text offsets")
 			continue
 		}
@@ -222,9 +226,10 @@ func (h *Handler) convertSticonParts(ctx context.Context, portal *bridgev2.Porta
 	}
 
 	h.Log.Debug().
-		Str("body", body).
+		Int("body_length", len(body)).
 		Str("format", string(event.FormatHTML)).
-		Str("formatted_body", formattedBody).
+		Int("formatted_body_length", len(formattedBody)).
+		Int("replacement_count", len(replacements)).
 		Msg("Converted sticon parts to HTML message")
 
 	msg := &event.MessageEventContent{
@@ -292,9 +297,6 @@ func sticonResourceByteRange(text string, r SticonResource) (int, int, bool) {
 			return start, end, true
 		}
 	}
-	if r.Start >= 0 && r.End <= len(text) && utf8.ValidString(text[r.Start:r.End]) {
-		return r.Start, r.End, true
-	}
 	return 0, 0, false
 }
 
@@ -345,10 +347,6 @@ func inlineSticonFallback(placeholder string) string {
 // EMTVER3 glyphs or a complete EMTVER4 token. Their private-use code points
 // commonly render as replacement boxes in Matrix clients.
 func ContainsLineSticonPlaceholder(text string) bool {
-	return containsLineSticonPlaceholder(text)
-}
-
-func containsLineSticonPlaceholder(text string) bool {
 	runes := []rune(text)
 	for i := 0; i < len(runes); i++ {
 		if _, _, ok := lineSticonPlaceholderAt(runes, i); ok {

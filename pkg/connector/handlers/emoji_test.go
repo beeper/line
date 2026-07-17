@@ -29,15 +29,23 @@ func TestSticonResourceByteRangeUsesUTF16Offsets(t *testing.T) {
 func TestSticonResourceByteRangeRejectsInvalidOffsets(t *testing.T) {
 	text := "abc"
 	tests := map[string]SticonResource{
-		"empty":        {Start: 1, End: 1},
-		"reversed":     {Start: 2, End: 1},
-		"negative":     {Start: -1, End: 1},
-		"unresolvable": {Start: 0, End: 100},
+		"empty":                   {Start: 1, End: 1},
+		"reversed":                {Start: 2, End: 1},
+		"negative":                {Start: -1, End: 1},
+		"unresolvable":            {Start: 0, End: 100},
+		"byte fallback collision": {Start: 4, End: 5},
+	}
+	texts := map[string]string{
+		"byte fallback collision": "éabc",
 	}
 
 	for name, resource := range tests {
 		t.Run(name, func(t *testing.T) {
-			if start, end, ok := sticonResourceByteRange(text, resource); ok {
+			testText := text
+			if override := texts[name]; override != "" {
+				testText = override
+			}
+			if start, end, ok := sticonResourceByteRange(testText, resource); ok {
 				t.Fatalf("sticonResourceByteRange = %d/%d/true, want false", start, end)
 			}
 		})
