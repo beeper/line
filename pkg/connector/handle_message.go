@@ -402,32 +402,38 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 		return h.ConvertDeviceContact(ctx, portal, intent, data, unwrappedText, replyRelatesTo)
 	}
 
+	var converted *bridgev2.ConvertedMessage
+	var err error
+
 	// Handle inline emoji/stamp embedded in text messages
 	if data.ContentMetadata["STKID"] != "" || data.ContentMetadata["STKPKGID"] != "" ||
-		data.ContentMetadata["STICON_OWNERSHIP"] != "" {
+		data.ContentMetadata["STICON_OWNERSHIP"] != "" ||
+		handlers.HasSticonBody(bodyText) ||
+		handlers.ContainsLineSticonPlaceholder(unwrappedText) {
 		if data.ContentMetadata["STICON_OWNERSHIP"] != "" {
 			h.Log.Debug().
-				Str("body_text", bodyText).
-				Str("unwrapped_text", unwrappedText).
-				Interface("content_metadata", data.ContentMetadata).
+				Int("body_length", len(bodyText)).
+				Int("unwrapped_length", len(unwrappedText)).
+				Int("metadata_count", len(data.ContentMetadata)).
 				Msg("STICON_OWNERSHIP: full message body")
 		}
-		return h.ConvertInlineEmoji(ctx, portal, intent, data, unwrappedText, bodyText, replyRelatesTo)
-	}
+		converted, err = h.ConvertInlineEmoji(ctx, portal, intent, data, unwrappedText, bodyText, replyRelatesTo)
+	} else {
+		// Skip empty/whitespace-only text messages (system messages that fell through)
+		if strings.TrimSpace(unwrappedText) == "" {
+			return nil, nil
+		}
 
-	// Skip empty/whitespace-only text messages (system messages that fell through)
-	if strings.TrimSpace(unwrappedText) == "" {
-		return nil, nil
+		// Default to text
+		converted, err = h.ConvertText(unwrappedText, replyRelatesTo)
 	}
-
-	// Default to text
-	converted, err := h.ConvertText(unwrappedText, replyRelatesTo)
 	if err != nil {
 		return nil, err
 	}
 
-	if mentionStr := data.ContentMetadata["MENTION"]; mentionStr != "" && len(converted.Parts) > 0 {
+	if mentionStr := data.ContentMetadata["MENTION"]; mentionStr != "" && converted != nil && len(converted.Parts) > 0 && converted.Parts[0].Content != nil {
 		lc.UserLogin.Bridge.Log.Debug().Str("raw_mention", mentionStr).Msg("Processing inbound LINE MENTION metadata")
+		canFormatMentions := converted.Parts[0].Content.Body == unwrappedText && converted.Parts[0].Content.FormattedBody == ""
 		var mentionData struct {
 			MENTIONEES []struct {
 				M string `json:"M,omitempty"`
@@ -472,17 +478,21 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 					}
 					lc.UserLogin.Bridge.Log.Debug().Str("mxid", string(mxid)).Msg("Formatted MXID from LINE MID")
 					mentions.UserIDs = append(mentions.UserIDs, mxid)
-					if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
-						if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
-							entries = append(entries, mentionEntry{start: s, end: e, mxid: string(mxid)})
+					if canFormatMentions {
+						if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
+							if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
+								entries = append(entries, mentionEntry{start: s, end: e, mxid: string(mxid)})
+							}
 						}
 					}
 				}
 				if ment.A == "1" {
 					mentions.Room = true
-					if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
-						if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
-							entries = append(entries, mentionEntry{start: s, end: e, mxid: "@room"})
+					if canFormatMentions {
+						if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
+							if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
+								entries = append(entries, mentionEntry{start: s, end: e, mxid: "@room"})
+							}
 						}
 					}
 				}
