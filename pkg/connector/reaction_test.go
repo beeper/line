@@ -103,6 +103,23 @@ func TestNextReqSeqIsUniqueAndNonZeroAcrossWrap(t *testing.T) {
 	}
 }
 
+func TestNextUntrackedReqSeqDoesNotLookLikeASentReaction(t *testing.T) {
+	lc := &LineClient{}
+
+	untracked := lc.nextUntrackedReqSeq()
+	tracked := lc.nextReqSeq()
+
+	if untracked <= 0 || tracked <= 0 || untracked == tracked {
+		t.Fatalf("request sequences = %d/%d, want distinct positive values", untracked, tracked)
+	}
+	if lc.consumeSentReqSeq(untracked) {
+		t.Fatalf("untracked request sequence %d was recorded as sent", untracked)
+	}
+	if !lc.consumeSentReqSeq(tracked) {
+		t.Fatalf("tracked request sequence %d was not recorded", tracked)
+	}
+}
+
 func TestTrackReqSeqCleansExpiredEntries(t *testing.T) {
 	now := time.Now()
 	lc := &LineClient{

@@ -41,8 +41,8 @@ func TestPreservePhoneNotificationsUsesReqSeqAndAuthRecovery(t *testing.T) {
 		if !slices.Equal(attributes, []int{line.SettingsAttributeNotificationDisabledWithSub}) {
 			t.Fatalf("attributes = %v, want [%d]", attributes, line.SettingsAttributeNotificationDisabledWithSub)
 		}
-		if settings.NotificationDisabledWithSub {
-			t.Fatal("notificationDisabledWithSub = true, want false")
+		if settings.NotificationDisabledWithSub == nil || *settings.NotificationDisabledWithSub {
+			t.Fatalf("notificationDisabledWithSub = %v, want pointer to false", settings.NotificationDisabledWithSub)
 		}
 		if calls == 1 {
 			return errAuthRequired
@@ -68,8 +68,8 @@ func TestPreservePhoneNotificationsUsesReqSeqAndAuthRecovery(t *testing.T) {
 	if len(reqSeqs) != 2 || reqSeqs[0] <= 0 || reqSeqs[0] != reqSeqs[1] {
 		t.Fatalf("request sequences = %v, want the same positive value for the retry", reqSeqs)
 	}
-	if !lc.consumeSentReqSeq(int(reqSeqs[0])) {
-		t.Fatalf("request sequence %d was not tracked", reqSeqs[0])
+	if lc.consumeSentReqSeq(int(reqSeqs[0])) {
+		t.Fatalf("settings request sequence %d was unexpectedly tracked as a reaction", reqSeqs[0])
 	}
 }
 
@@ -99,9 +99,7 @@ func TestConfigurePhoneNotificationsIsBestEffort(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := lc.configurePhoneNotifications(ctx); err != nil {
-		t.Fatalf("configurePhoneNotifications returned best-effort error: %v", err)
-	}
+	lc.configurePhoneNotifications(ctx)
 
 	if calls != 1 {
 		t.Fatalf("settings calls = %d, want 1", calls)
@@ -114,7 +112,7 @@ func TestConfigurePhoneNotificationsIsBestEffort(t *testing.T) {
 	}
 }
 
-func TestConfigurePhoneNotificationsReturnsUnrecoverableAuthError(t *testing.T) {
+func TestConfigurePhoneNotificationsTreatsAuthRecoveryFailureAsBestEffort(t *testing.T) {
 	oldUpdateSettings := updateSettingsAttributes2WithClient
 	oldRecover := recoverLineToken
 	t.Cleanup(func() {
@@ -139,15 +137,21 @@ func TestConfigurePhoneNotificationsReturnsUnrecoverableAuthError(t *testing.T) 
 		return errAuthRequired
 	}
 	recoveryErr := errors.New("stored credentials rejected")
+	var recoveries int
 	recoverLineToken = func(*LineClient, context.Context) error {
+		recoveries++
 		return recoveryErr
 	}
 
-	err := lc.configurePhoneNotifications(context.Background())
-	if err == nil {
-		t.Fatal("expected unrecoverable auth error")
+	ctx := context.Background()
+	lc.configurePhoneNotifications(ctx)
+	if ctx.Err() != nil {
+		t.Fatalf("connect context was canceled: %v", ctx.Err())
 	}
-	if !line.IsAuthError(err) || !errors.Is(err, errAuthRequired) || !errors.Is(err, recoveryErr) {
-		t.Fatalf("configurePhoneNotifications error = %v, want auth and recovery details", err)
+	if recoveries != 1 {
+		t.Fatalf("recovery attempts = %d, want 1", recoveries)
+	}
+	if lc.getAccessToken() != "expired-token" || lc.isSessionInvalidated() {
+		t.Fatal("best-effort auth recovery failure changed login state")
 	}
 }

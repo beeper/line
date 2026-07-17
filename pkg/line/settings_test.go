@@ -6,6 +6,7 @@ import (
 )
 
 func TestUpdateSettingsAttributes2RequestBodyKeepsExplicitFalse(t *testing.T) {
+	notificationDisabledWithSub := false
 	var body string
 	client := newReactionTestClient(
 		t,
@@ -17,7 +18,7 @@ func TestUpdateSettingsAttributes2RequestBodyKeepsExplicitFalse(t *testing.T) {
 		context.Background(),
 		1994881164,
 		[]int{SettingsAttributeNotificationDisabledWithSub},
-		Settings{NotificationDisabledWithSub: false},
+		Settings{NotificationDisabledWithSub: &notificationDisabledWithSub},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -30,6 +31,7 @@ func TestUpdateSettingsAttributes2RequestBodyKeepsExplicitFalse(t *testing.T) {
 }
 
 func TestUpdateSettingsAttributes2PreservesAuthErrorDetails(t *testing.T) {
+	notificationDisabledWithSub := false
 	client := newReactionTestClientWithResponse(
 		t,
 		"/api/talk/thrift/Talk/TalkService/updateSettingsAttributes2",
@@ -41,7 +43,7 @@ func TestUpdateSettingsAttributes2PreservesAuthErrorDetails(t *testing.T) {
 		context.Background(),
 		123,
 		[]int{SettingsAttributeNotificationDisabledWithSub},
-		Settings{NotificationDisabledWithSub: false},
+		Settings{NotificationDisabledWithSub: &notificationDisabledWithSub},
 	)
 	if err == nil {
 		t.Fatal("expected non-zero wrapper error")
@@ -52,12 +54,13 @@ func TestUpdateSettingsAttributes2PreservesAuthErrorDetails(t *testing.T) {
 }
 
 func TestUpdateSettingsAttributes2ContextCancellation(t *testing.T) {
+	notificationDisabledWithSub := false
 	testRPCContextCancellation(t, "updateSettingsAttributes2", func(client *Client, ctx context.Context) error {
 		return client.UpdateSettingsAttributes2Context(
 			ctx,
 			123,
 			[]int{SettingsAttributeNotificationDisabledWithSub},
-			Settings{NotificationDisabledWithSub: false},
+			Settings{NotificationDisabledWithSub: &notificationDisabledWithSub},
 		)
 	})
 }

@@ -296,6 +296,14 @@ func parseReactionTargetMessageID(messageID networkid.MessageID) (string, error)
 }
 
 func (lc *LineClient) nextReqSeq() int {
+	return lc.nextReqSeqWithTracking(true)
+}
+
+func (lc *LineClient) nextUntrackedReqSeq() int {
+	return lc.nextReqSeqWithTracking(false)
+}
+
+func (lc *LineClient) nextReqSeqWithTracking(track bool) int {
 	now := time.Now()
 
 	lc.reqSeqMu.Lock()
@@ -315,7 +323,9 @@ func (lc *LineClient) nextReqSeq() int {
 			lc.lastReqSeq = 1
 		}
 		if _, exists := lc.sentReqSeqs[lc.lastReqSeq]; !exists {
-			lc.sentReqSeqs[lc.lastReqSeq] = now
+			if track {
+				lc.sentReqSeqs[lc.lastReqSeq] = now
+			}
 			return lc.lastReqSeq
 		}
 	}

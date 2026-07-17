@@ -17,28 +17,27 @@ var updateSettingsAttributes2WithClient = func(
 }
 
 func (lc *LineClient) preservePhoneNotifications(ctx context.Context) error {
-	reqSeq := int64(lc.nextReqSeq())
+	reqSeq := int64(lc.nextUntrackedReqSeq())
+	notificationDisabledWithSub := false
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
 		return updateSettingsAttributes2WithClient(
 			ctx,
 			client,
 			reqSeq,
 			[]int{line.SettingsAttributeNotificationDisabledWithSub},
-			line.Settings{NotificationDisabledWithSub: false},
+			line.Settings{NotificationDisabledWithSub: &notificationDisabledWithSub},
 		)
 	})
 	return err
 }
 
-// configurePhoneNotifications is best-effort for ordinary settings failures.
-// Auth failures are returned because startup must not announce a stale session
-// as connected when refresh and re-login could not recover it.
-func (lc *LineClient) configurePhoneNotifications(ctx context.Context) error {
+// configurePhoneNotifications is best-effort because updating this optional
+// preference must not prevent an otherwise healthy bridge session from connecting.
+func (lc *LineClient) configurePhoneNotifications(ctx context.Context) {
 	err := lc.preservePhoneNotifications(ctx)
-	if err == nil || ctx.Err() != nil || line.IsAuthError(err) {
-		return err
+	if err == nil || ctx.Err() != nil || lc.isSessionInvalidated() {
+		return
 	}
 	lc.UserLogin.Bridge.Log.Warn().Err(err).
 		Msg("Failed to preserve LINE phone notifications")
-	return nil
 }

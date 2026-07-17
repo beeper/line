@@ -66,10 +66,10 @@ type Profile struct {
 const SettingsAttributeNotificationDisabledWithSub = 16
 
 // Settings contains the account-level values accepted by
-// TalkService/updateSettingsAttributes2. Fields must not use omitempty: LINE
-// distinguishes an explicit false value from a missing setting.
+// TalkService/updateSettingsAttributes2. Pointer fields distinguish explicit
+// zero values from settings that should be omitted from the update.
 type Settings struct {
-	NotificationDisabledWithSub bool `json:"notificationDisabledWithSub"`
+	NotificationDisabledWithSub *bool `json:"notificationDisabledWithSub,omitempty"`
 }
 
 type Operation struct {
