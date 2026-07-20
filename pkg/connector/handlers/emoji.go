@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,29 +20,44 @@ import (
 
 // tryUploadEmoji downloads a sticon from the LINE CDN, uploads it to Matrix,
 // and returns the MXC URI (or empty on failure).
-func (h *Handler) tryUploadEmoji(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, productID, sticonID string) string {
-	url := fmt.Sprintf("https://stickershop.line-scdn.net/sticonshop/v1/sticon/%s/android/%s.png", productID, sticonID)
-	resp, err := h.HTTPClient.Get(url)
-	if err != nil {
-		h.Log.Warn().Err(err).Str("product_id", productID).Str("sticon_id", sticonID).Msg("CDN request failed")
+func (h *Handler) tryUploadEmoji(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, resource SticonResource) string {
+	if h.HTTPClient == nil || intent == nil {
 		return ""
 	}
-	if resp.StatusCode != 200 {
+
+	var data []byte
+	var mimeType string
+	for _, url := range inlineSticonURLs(resource) {
+		resp, err := h.HTTPClient.Get(url)
+		if err != nil {
+			h.Log.Warn().Err(err).Str("product_id", resource.ProductID).Str("sticon_id", resource.SticonID).Msg("CDN request failed")
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			h.Log.Warn().Int("status", resp.StatusCode).Str("product_id", resource.ProductID).Str("sticon_id", resource.SticonID).Msg("CDN returned non-200")
+			continue
+		}
+
+		downloadedData, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		h.Log.Warn().Int("status", resp.StatusCode).Str("product_id", productID).Str("sticon_id", sticonID).Msg("CDN returned non-200")
-		return ""
+		if err != nil {
+			h.Log.Warn().Err(err).Str("product_id", resource.ProductID).Str("sticon_id", resource.SticonID).Msg("Failed to read CDN body")
+			continue
+		}
+		if len(downloadedData) == 0 {
+			h.Log.Warn().Str("product_id", resource.ProductID).Str("sticon_id", resource.SticonID).Msg("CDN returned empty body")
+			continue
+		}
+		data = downloadedData
+		mimeType = resp.Header.Get("Content-Type")
+		if mimeType == "" {
+			mimeType = "image/png"
+		}
+		break
 	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		h.Log.Warn().Err(err).Str("product_id", productID).Str("sticon_id", sticonID).Msg("Failed to read CDN body")
+	if len(data) == 0 {
 		return ""
-	}
-
-	mimeType := resp.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "image/png"
 	}
 
 	var ext string
@@ -63,7 +79,7 @@ func (h *Handler) tryUploadEmoji(ctx context.Context, portal *bridgev2.Portal, i
 	// raw MXC access (no E2EE key material in HTML).
 	mxc, _, err := intent.UploadMedia(ctx, "", data, "emoji."+ext, mimeType)
 	if err != nil {
-		h.Log.Warn().Err(err).Str("product_id", productID).Str("sticon_id", sticonID).Msg("Failed to upload emoji to Matrix")
+		h.Log.Warn().Err(err).Str("product_id", resource.ProductID).Str("sticon_id", resource.SticonID).Msg("Failed to upload emoji to Matrix")
 		return ""
 	}
 	return string(mxc)
@@ -73,12 +89,16 @@ const (
 	inlineSticonFallbackText = "[Emoji]"
 	// LINE EMTVER3 sticons are one code point in the first range. EMTVER4
 	// sticons are a product code point, a sticon code point, alt text, and the
-	// terminator. REPLACE.sticon carries the image IDs for both formats.
+	// terminator. REPLACE.sticon may also carry the image IDs for both formats.
 	lineSticonEMTVER3RuneStart  = 0x100000
 	lineSticonEMTVER3RuneEnd    = 0x1000ff
 	lineSticonEMTVER4RuneStart  = 0x100100
 	lineSticonEMTVER4RuneEnd    = 0x10fffe
 	lineSticonEMTVER4Terminator = 0x10ffff
+	lineSticonEMTVER3Product    = 1048843
+	lineSticonEMTVER3Version    = 11
+	sticonFormatEMTVER3         = "EMTVER3"
+	sticonFormatEMTVER4         = "EMTVER4"
 )
 
 // sticonRefRegex matches inline sticon references embedded in the text body.
@@ -94,20 +114,47 @@ type SticonResource struct {
 	SticonID     string `json:"sticonId"`
 	Version      int    `json:"version"`
 	ResourceType string `json:"resourceType"`
+	Format       string `json:"format,omitempty"`
+}
+
+type sticonReplace struct {
+	Sticon struct {
+		Resources []SticonResource `json:"resources"`
+	} `json:"sticon"`
 }
 
 // replaceBody holds the REPLACE.sticon portion of the encrypted message body.
 type replaceBody struct {
-	Replace struct {
-		Sticon struct {
-			Resources []SticonResource `json:"resources"`
-		} `json:"sticon"`
-	} `json:"REPLACE"`
+	Replace sticonReplace `json:"REPLACE"`
+}
+
+func inlineSticonURLs(resource SticonResource) []string {
+	if resource.ProductID == "" || resource.SticonID == "" {
+		return nil
+	}
+	if resource.Format == sticonFormatEMTVER3 || resource.Format == sticonFormatEMTVER4 {
+		if len(resource.ProductID) < 3 {
+			return nil
+		}
+		return []string{fmt.Sprintf(
+			"https://stickershop.line-scdn.net/sticon/v1/%c/%c/%c/%s/android/%s_k.png",
+			resource.ProductID[0], resource.ProductID[1], resource.ProductID[2], resource.ProductID, resource.SticonID,
+		)}
+	}
+
+	base := fmt.Sprintf(
+		"https://stickershop.line-scdn.net/sticonshop/v1/sticon/%s/android/%s",
+		resource.ProductID, resource.SticonID,
+	)
+	if resource.ResourceType == "ANIMATION" {
+		return []string{base + "_animation.png", base + ".png"}
+	}
+	return []string{base + ".png"}
 }
 
 // ConvertInlineEmoji converts a LINE text message containing inline emoji/stamp
-// to a Matrix message with text and image parts interleaved according to the
-// REPLACE.sticon.resources positions in the decrypted body JSON.
+// to a Matrix message with text and image parts interleaved according to
+// explicit REPLACE resources or IDs derived from EMTVER3/4 text.
 // bodyText is the full decrypted JSON body, stkTxt is the unwrapped plain text.
 func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, stkTxt string, bodyText string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
 	stkID := data.ContentMetadata["STKID"]
@@ -121,13 +168,13 @@ func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Porta
 		stkTxt = inlineSticonFallbackText
 	}
 
-	// Try parsing the full bodyText as JSON — LINE embeds sticon resources
-	// in the REPLACE.sticon.resources array of the encrypted message body.
-	if strings.HasPrefix(bodyText, "{") {
-		if resources, err := parseSticonBody(bodyText); err == nil && len(resources) > 0 {
-			if msg := h.convertSticonParts(ctx, portal, intent, stkTxt, resources, relatesTo); msg != nil {
-				return msg, nil
-			}
+	// Chrome merges explicit REPLACE resources with IDs derived directly from
+	// EMTVER3/4 text. The explicit data may be in the encrypted body or, for
+	// plaintext messages, ContentMetadata["REPLACE"].
+	resources := collectSticonResources(bodyText, data.ContentMetadata["REPLACE"], stkTxt)
+	if len(resources) > 0 {
+		if msg := h.convertSticonParts(ctx, portal, intent, stkTxt, resources, relatesTo); msg != nil {
+			return msg, nil
 		}
 	}
 
@@ -213,7 +260,7 @@ func (h *Handler) convertSticonParts(ctx context.Context, portal *bridgev2.Porta
 				Msg("Skipping inline sticon with invalid text offsets")
 			continue
 		}
-		mxc := h.tryUploadEmoji(ctx, portal, intent, r.ProductID, r.SticonID)
+		mxc := h.tryUploadEmoji(ctx, portal, intent, r)
 		replacements = append(replacements, sticonReplacement{start: start, end: end, mxc: mxc})
 	}
 	if len(replacements) == 0 {
@@ -402,6 +449,107 @@ func isLineSticonEMTVER4Rune(r rune) bool {
 	return r >= lineSticonEMTVER4RuneStart && r <= lineSticonEMTVER4RuneEnd
 }
 
+func sticonProductHash(productCode rune) string {
+	sum := md5.Sum([]byte(fmt.Sprintf("%X", productCode)))
+	return fmt.Sprintf("%x", sum)[:16]
+}
+
+func utf16RuneUnits(r rune) int {
+	if r <= 0xFFFF {
+		return 1
+	}
+	return 2
+}
+
+// deriveSticonResources implements Chrome's EMTVER3/4 text fallback. Some
+// native LINE clients only send the encoded text token, without REPLACE
+// metadata, so the product and sticon IDs must be reconstructed from it.
+func deriveSticonResources(text string) []SticonResource {
+	runes := []rune(text)
+	resources := make([]SticonResource, 0)
+	utf16Pos := 0
+	for i := 0; i < len(runes); {
+		start := utf16Pos
+		if isLineSticonEMTVER3Rune(runes[i]) {
+			utf16Pos += utf16RuneUnits(runes[i])
+			resources = append(resources, SticonResource{
+				Start:        start,
+				End:          utf16Pos,
+				ProductID:    sticonProductHash(lineSticonEMTVER3Product),
+				SticonID:     fmt.Sprintf("%X", runes[i]+0x100),
+				Version:      lineSticonEMTVER3Version,
+				ResourceType: "STATIC",
+				Format:       sticonFormatEMTVER3,
+			})
+			i++
+			continue
+		}
+
+		if end, _, ok := lineSticonPlaceholderAt(runes, i); ok {
+			for _, r := range runes[i:end] {
+				utf16Pos += utf16RuneUnits(r)
+			}
+			resources = append(resources, SticonResource{
+				Start:        start,
+				End:          utf16Pos,
+				ProductID:    sticonProductHash(runes[i]),
+				SticonID:     fmt.Sprintf("%X", runes[i+1]),
+				Version:      int(runes[i]) & 0xFF,
+				ResourceType: "STATIC",
+				Format:       sticonFormatEMTVER4,
+			})
+			i = end
+			continue
+		}
+
+		utf16Pos += utf16RuneUnits(runes[i])
+		i++
+	}
+	return resources
+}
+
+func appendUniqueSticonResources(dst, src []SticonResource) []SticonResource {
+	seenStarts := make(map[int]struct{}, len(dst)+len(src))
+	for _, resource := range dst {
+		seenStarts[resource.Start] = struct{}{}
+	}
+	for _, resource := range src {
+		if _, exists := seenStarts[resource.Start]; exists {
+			continue
+		}
+		seenStarts[resource.Start] = struct{}{}
+		dst = append(dst, resource)
+	}
+	return dst
+}
+
+func collectSticonResources(body, metadataReplace, text string) []SticonResource {
+	var resources []SticonResource
+	if strings.HasPrefix(body, "{") {
+		if parsed, err := parseSticonBody(body); err == nil {
+			resources = appendUniqueSticonResources(resources, parsed)
+		}
+	}
+	if metadataReplace != "" {
+		if parsed, err := parseSticonReplace(metadataReplace); err == nil {
+			resources = appendUniqueSticonResources(resources, parsed)
+		}
+	}
+	return appendUniqueSticonResources(resources, deriveSticonResources(text))
+}
+
+func validateSticonResources(resources []SticonResource) ([]SticonResource, error) {
+	if len(resources) == 0 {
+		return nil, fmt.Errorf("no sticon resources found")
+	}
+	for _, resource := range resources {
+		if resource.ProductID == "" || resource.SticonID == "" {
+			return nil, fmt.Errorf("incomplete sticon resource")
+		}
+	}
+	return resources, nil
+}
+
 // parseSticonBody extracts sticon resources from the REPLACE.sticon.resources
 // field of the encrypted message body JSON.
 func parseSticonBody(body string) ([]SticonResource, error) {
@@ -409,15 +557,17 @@ func parseSticonBody(body string) ([]SticonResource, error) {
 	if err := json.Unmarshal([]byte(body), &rb); err != nil {
 		return nil, err
 	}
-	if len(rb.Replace.Sticon.Resources) == 0 {
-		return nil, fmt.Errorf("no sticon resources found")
+	return validateSticonResources(rb.Replace.Sticon.Resources)
+}
+
+// parseSticonReplace extracts resources from the plaintext
+// ContentMetadata["REPLACE"] value.
+func parseSticonReplace(replace string) ([]SticonResource, error) {
+	var sr sticonReplace
+	if err := json.Unmarshal([]byte(replace), &sr); err != nil {
+		return nil, err
 	}
-	for _, r := range rb.Replace.Sticon.Resources {
-		if r.ProductID == "" || r.SticonID == "" {
-			return nil, fmt.Errorf("incomplete sticon resource")
-		}
-	}
-	return rb.Replace.Sticon.Resources, nil
+	return validateSticonResources(sr.Sticon.Resources)
 }
 
 // HasSticonBody reports whether a decrypted LINE JSON text body contains
@@ -427,6 +577,13 @@ func HasSticonBody(body string) bool {
 		return false
 	}
 	resources, err := parseSticonBody(body)
+	return err == nil && len(resources) > 0
+}
+
+// HasSticonMetadata reports whether plaintext LINE metadata contains inline
+// sticon replacement resources.
+func HasSticonMetadata(replace string) bool {
+	resources, err := parseSticonReplace(replace)
 	return err == nil && len(resources) > 0
 }
 

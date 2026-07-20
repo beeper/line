@@ -170,6 +170,87 @@ func TestHasSticonBody(t *testing.T) {
 	}
 }
 
+func TestDeriveSticonResourcesFromText(t *testing.T) {
+	tests := []struct {
+		name              string
+		token             string
+		expectedProductID string
+		expectedSticonID  string
+		expectedVersion   int
+		expectedFormat    string
+	}{
+		{
+			name:              "EMTVER3",
+			token:             testLineSticonPlaceholder1,
+			expectedProductID: "cfd6b19a5a184481",
+			expectedSticonID:  "100184",
+			expectedVersion:   11,
+			expectedFormat:    sticonFormatEMTVER3,
+		},
+		{
+			name:              "EMTVER4",
+			token:             "\U00100101\U00100211yoo-hoo\U0010ffff",
+			expectedProductID: "732e276ec85f14e6",
+			expectedSticonID:  "100211",
+			expectedVersion:   1,
+			expectedFormat:    sticonFormatEMTVER4,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prefix := "日本😀 "
+			text := prefix + test.token
+			resources := deriveSticonResources(text)
+			if len(resources) != 1 {
+				t.Fatalf("deriveSticonResources returned %#v, want one resource", resources)
+			}
+			resource := resources[0]
+			if resource.Start != utf16Units(prefix) || resource.End != utf16Units(text) {
+				t.Fatalf("resource offsets = %d/%d, want %d/%d", resource.Start, resource.End, utf16Units(prefix), utf16Units(text))
+			}
+			if resource.ProductID != test.expectedProductID || resource.SticonID != test.expectedSticonID ||
+				resource.Version != test.expectedVersion || resource.Format != test.expectedFormat {
+				t.Fatalf("derived resource = %#v", resource)
+			}
+		})
+	}
+}
+
+func TestCollectSticonResourcesPrefersExplicitMetadata(t *testing.T) {
+	const token = "\U00100101\U00100211yoo-hoo\U0010ffff"
+	metadata := `{"sticon":{"resources":[{"S":0,"E":13,"productId":"explicit-product","sticonId":"999","version":7,"resourceType":"ANIMATION"}]}}`
+
+	resources := collectSticonResources("", metadata, token)
+	if len(resources) != 1 {
+		t.Fatalf("collectSticonResources returned %#v, want one deduplicated resource", resources)
+	}
+	resource := resources[0]
+	if resource.ProductID != "explicit-product" || resource.SticonID != "999" || resource.ResourceType != "ANIMATION" {
+		t.Fatalf("explicit resource did not win over derived resource: %#v", resource)
+	}
+}
+
+func TestInlineSticonURLsFallsBackToStaticForAnimation(t *testing.T) {
+	urls := inlineSticonURLs(SticonResource{
+		ProductID:    "product",
+		SticonID:     "123",
+		ResourceType: "ANIMATION",
+	})
+	want := []string{
+		"https://stickershop.line-scdn.net/sticonshop/v1/sticon/product/android/123_animation.png",
+		"https://stickershop.line-scdn.net/sticonshop/v1/sticon/product/android/123.png",
+	}
+	if len(urls) != len(want) {
+		t.Fatalf("inlineSticonURLs = %#v, want %#v", urls, want)
+	}
+	for i := range want {
+		if urls[i] != want[i] {
+			t.Fatalf("inlineSticonURLs[%d] = %q, want %q", i, urls[i], want[i])
+		}
+	}
+}
+
 func TestSticonRefRegexAllowsHexProductIDs(t *testing.T) {
 	matches := sticonRefRegex.FindStringSubmatch("$STK:670e0cce840a8236ddd4ee4c:211$")
 	if len(matches) != 3 {

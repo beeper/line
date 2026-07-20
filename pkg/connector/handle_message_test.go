@@ -1,7 +1,9 @@
 package connector
 
 import (
+	"context"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -13,6 +15,117 @@ import (
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
+
+type inlineEmojiRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn inlineEmojiRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+type inlineEmojiTestMatrix struct {
+	bridgev2.MatrixAPI
+	uploadCount int
+}
+
+func (m *inlineEmojiTestMatrix) UploadMedia(_ context.Context, _ id.RoomID, _ []byte, _, _ string) (id.ContentURIString, *event.EncryptedFileInfo, error) {
+	m.uploadCount++
+	return "mxc://example/custom-emoji", nil, nil
+}
+
+func TestConvertLineMessageRendersPlaintextCustomEmoji(t *testing.T) {
+	const (
+		emtver4Token = "\U00100101\U00100211yoo-hoo\U0010ffff"
+		productID    = "0123456789abcdef01234567"
+	)
+	tests := []struct {
+		name         string
+		text         string
+		metadata     map[string]string
+		failFirstURL bool
+		expectedURLs []string
+	}{
+		{
+			name: "REPLACE metadata",
+			text: "hey (yoo-hoo)",
+			metadata: map[string]string{
+				"REPLACE": `{"sticon":{"resources":[{"S":4,"E":13,"productId":"` + productID + `","sticonId":"456","version":1,"resourceType":"ANIMATION"}]}}`,
+			},
+			failFirstURL: true,
+			expectedURLs: []string{
+				"https://stickershop.line-scdn.net/sticonshop/v1/sticon/" + productID + "/android/456_animation.png",
+				"https://stickershop.line-scdn.net/sticonshop/v1/sticon/" + productID + "/android/456.png",
+			},
+		},
+		{
+			name:     "EMTVER4 text",
+			text:     "hey " + emtver4Token,
+			metadata: map[string]string{},
+			expectedURLs: []string{
+				"https://stickershop.line-scdn.net/sticon/v1/7/3/2/732e276ec85f14e6/android/100211_k.png",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requestedURLs []string
+			httpClient := &http.Client{Transport: inlineEmojiRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requestedURLs = append(requestedURLs, req.URL.String())
+				header := make(http.Header)
+				header.Set("Content-Type", "image/png")
+				statusCode := http.StatusOK
+				body := "png"
+				if test.failFirstURL && len(requestedURLs) == 1 {
+					statusCode = http.StatusNotFound
+					body = ""
+				}
+				return &http.Response{
+					StatusCode: statusCode,
+					Header:     header,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Request:    req,
+				}, nil
+			})}
+			matrix := &inlineEmojiTestMatrix{}
+			lc := &LineClient{
+				HTTPClient: httpClient,
+				UserLogin: &bridgev2.UserLogin{
+					Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
+				},
+			}
+			data := line.Message{
+				ContentType:     int(ContentText),
+				ContentMetadata: test.metadata,
+			}
+
+			converted, err := lc.convertLineMessage(t.Context(), nil, matrix, data, test.text, test.text, false)
+			if err != nil {
+				t.Fatalf("convertLineMessage returned error: %v", err)
+			}
+			if converted == nil || len(converted.Parts) != 1 || converted.Parts[0].Content == nil {
+				t.Fatalf("convertLineMessage returned %#v, want one message part", converted)
+			}
+			content := converted.Parts[0].Content
+			if content.Body != "hey (yoo-hoo)" {
+				t.Fatalf("Body = %q, want custom emoji fallback text", content.Body)
+			}
+			if content.Format != event.FormatHTML || !strings.Contains(content.FormattedBody, `<img data-mx-emoticon src="mxc://example/custom-emoji"`) {
+				t.Fatalf("formatted message = %q / %q, want inline custom emoji", content.Format, content.FormattedBody)
+			}
+			if len(requestedURLs) != len(test.expectedURLs) {
+				t.Fatalf("requested URLs = %#v, want %#v", requestedURLs, test.expectedURLs)
+			}
+			for i := range test.expectedURLs {
+				if requestedURLs[i] != test.expectedURLs[i] {
+					t.Fatalf("requested URLs = %#v, want %#v", requestedURLs, test.expectedURLs)
+				}
+			}
+			if matrix.uploadCount != 1 {
+				t.Fatalf("UploadMedia call count = %d, want 1", matrix.uploadCount)
+			}
+		})
+	}
+}
 
 func TestConvertLineMessagePreservesMentionsForSticonFallback(t *testing.T) {
 	const placeholder = "\U00100084"
