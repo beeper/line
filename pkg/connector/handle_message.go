@@ -408,6 +408,7 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 	// Handle inline emoji/stamp embedded in text messages
 	if data.ContentMetadata["STKID"] != "" || data.ContentMetadata["STKPKGID"] != "" ||
 		data.ContentMetadata["STICON_OWNERSHIP"] != "" ||
+		handlers.HasSticonMetadata(data.ContentMetadata["REPLACE"]) ||
 		handlers.HasSticonBody(bodyText) ||
 		handlers.ContainsLineSticonPlaceholder(unwrappedText) {
 		if data.ContentMetadata["STICON_OWNERSHIP"] != "" {
