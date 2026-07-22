@@ -66,6 +66,62 @@ func TestDefaultReceiveAuthProbeIntervalIs150Seconds(t *testing.T) {
 	}
 }
 
+func TestUnblockFallbackUsesSilentBackfill(t *testing.T) {
+	oldRunSilentUnblockBackfill := runSilentUnblockBackfill
+	t.Cleanup(func() {
+		runSilentUnblockBackfill = oldRunSilentUnblockBackfill
+	})
+
+	called := make(chan string, 1)
+	runSilentUnblockBackfill = func(_ context.Context, _ *LineClient, mid string) {
+		called <- mid
+	}
+
+	log := zerolog.New(io.Discard)
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			Bridge: &bridgev2.Bridge{Log: log},
+		},
+	}
+
+	lc.runUnblockBackfillFallback(context.Background(), "U-contact")
+
+	select {
+	case mid := <-called:
+		if mid != "U-contact" {
+			t.Fatalf("silent fallback mid = %q, want U-contact", mid)
+		}
+	default:
+		t.Fatal("silent unblock fallback was not called")
+	}
+}
+
+func TestUnblockFallbackSkipsSilentBackfillWhenContactIsBlockedAgain(t *testing.T) {
+	oldRunSilentUnblockBackfill := runSilentUnblockBackfill
+	t.Cleanup(func() {
+		runSilentUnblockBackfill = oldRunSilentUnblockBackfill
+	})
+
+	called := false
+	runSilentUnblockBackfill = func(context.Context, *LineClient, string) {
+		called = true
+	}
+
+	log := zerolog.New(io.Discard)
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			Bridge: &bridgev2.Bridge{Log: log},
+		},
+		blockedUsers: map[string]bool{"U-contact": true},
+	}
+
+	lc.runUnblockBackfillFallback(context.Background(), "U-contact")
+
+	if called {
+		t.Fatal("silent unblock fallback ran after the contact was blocked again")
+	}
+}
+
 func TestReceiveAuthProbeContextExpiresOnSchedule(t *testing.T) {
 	oldInterval := receiveAuthProbeInterval
 	oldNow := receiveAuthProbeNow

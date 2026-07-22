@@ -50,6 +50,9 @@ var (
 	newReceiveAuthProbeContext = func(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
 		return context.WithDeadlineCause(parent, deadline, errReceiveAuthProbeDue)
 	}
+	runSilentUnblockBackfill = func(ctx context.Context, lc *LineClient, mid string) {
+		lc.silentBackfillRecentMessages(ctx, mid, startupBackfillMessageLimit)
+	}
 )
 
 func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
@@ -261,6 +264,96 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 	})
 }
 
+func (lc *LineClient) silentBackfillRecentMessages(ctx context.Context, chatMID string, limit int) {
+	log := lc.UserLogin.Bridge.Log.With().
+		Str("chat_mid", chatMID).
+		Str("action", "silent unblock backfill").
+		Logger()
+	ctx = log.WithContext(ctx)
+
+	portalKey := networkid.PortalKey{ID: makePortalID(chatMID), Receiver: lc.UserLogin.ID}
+	portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get restored portal for silent unblock backfill")
+		return
+	} else if portal == nil || portal.MXID == "" {
+		log.Warn().Msg("Restored portal is not ready for silent unblock backfill")
+		return
+	}
+
+	capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
+	if capabilities == nil || !capabilities.BatchSending {
+		log.Warn().Msg("Skipping unblock fallback because silent batch sending is unavailable")
+		return
+	}
+
+	resp, err := lc.FetchMessages(ctx, bridgev2.FetchMessagesParams{
+		Portal:  portal,
+		Forward: true,
+		Count:   limit,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to fetch messages for silent unblock backfill")
+		return
+	} else if resp == nil {
+		log.Warn().Msg("No response returned for silent unblock backfill")
+		return
+	} else if len(resp.Messages) == 0 {
+		if resp.CompleteCallback != nil {
+			resp.CompleteCallback()
+		}
+		log.Debug().Msg("No messages found for silent unblock backfill")
+		return
+	}
+
+	latestMessage, err := lc.UserLogin.Bridge.DB.Message.GetLastPartAtOrBeforeTime(
+		ctx,
+		portal.PortalKey,
+		time.Now().Add(10*time.Second),
+	)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get latest message before silent unblock backfill")
+		return
+	}
+	// bridgev2 does not expose a public API for forcing a silent forward backfill
+	// when the normal resync path is disabled by the runtime backfill config.
+	//lint:ignore SA1019 The fallback must use bridgev2's batch backfill internals to remain notification-free.
+	portalInternals := portal.Internal()
+	resp.Messages = portalInternals.CutoffMessages(ctx, resp.Messages, true, true, latestMessage)
+	if len(resp.Messages) == 0 {
+		if resp.CompleteCallback != nil {
+			resp.CompleteCallback()
+		}
+		log.Debug().Msg("No new messages left for silent unblock backfill")
+		return
+	}
+
+	messageCount := len(resp.Messages)
+	complete := resp.CompleteCallback
+	log.Info().Int("message_count", messageCount).Msg("Sending silent unblock backfill")
+	portalInternals.SendBackfill(ctx, lc.UserLogin, resp.Messages, true, true, false, func() {
+		if complete != nil {
+			complete()
+		}
+		log.Info().Int("message_count", messageCount).Msg("Finished silent unblock backfill")
+	})
+}
+
+func (lc *LineClient) runUnblockBackfillFallback(ctx context.Context, mid string) {
+	if lc.isUserBlocked(mid) {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("mid", mid).
+			Msg("Skipping unblock fallback backfill because contact is blocked again")
+		return
+	}
+
+	lc.UserLogin.Bridge.Log.Info().
+		Str("mid", mid).
+		Dur("delay", unblockBackfillFallbackDelay).
+		Msg("Running silent unblock fallback backfill")
+	runSilentUnblockBackfill(ctx, lc, mid)
+}
+
 func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid string) {
 	lc.wg.Add(1)
 	go func() {
@@ -275,18 +368,7 @@ func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid stri
 		case <-timer.C:
 		}
 
-		if lc.isUserBlocked(mid) {
-			lc.UserLogin.Bridge.Log.Debug().
-				Str("mid", mid).
-				Msg("Skipping unblock fallback backfill because contact is blocked again")
-			return
-		}
-
-		lc.UserLogin.Bridge.Log.Info().
-			Str("mid", mid).
-			Dur("delay", unblockBackfillFallbackDelay).
-			Msg("Re-requesting silent unblock backfill")
-		lc.queueDMChatResync(ctx, mid, true, true)
+		lc.runUnblockBackfillFallback(ctx, mid)
 	}()
 }
 
@@ -465,10 +547,6 @@ func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMI
 	return chatMIDs
 }
 
-// backfillRecentMessages fetches up to limit recent messages for a single
-// chat and queues any not already in the local DB through the normal inbound
-// (live) message path. Used by prefetchMessages on startup and as a delayed,
-// deduped fallback after unblock if bridgev2's silent forward backfill didn't
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
 // (live) message path. Used by prefetchMessages on startup.
