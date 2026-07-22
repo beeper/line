@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
@@ -63,6 +64,150 @@ func TestDefaultReceiveAuthProbeIntervalIs150Seconds(t *testing.T) {
 	want := startedAt.Add(150 * time.Second)
 	if !capturedDeadline.Equal(want) || !nextProbeAt.Equal(want) {
 		t.Fatalf("probe deadline = %s / %s, want %s", capturedDeadline, nextProbeAt, want)
+	}
+}
+
+func TestUnblockFallbackUsesSilentBackfill(t *testing.T) {
+	oldRunSilentUnblockBackfill := runSilentUnblockBackfill
+	t.Cleanup(func() {
+		runSilentUnblockBackfill = oldRunSilentUnblockBackfill
+	})
+
+	called := make(chan string, 1)
+	runSilentUnblockBackfill = func(_ context.Context, _ *LineClient, mid string) {
+		called <- mid
+	}
+
+	log := zerolog.New(io.Discard)
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			Bridge: &bridgev2.Bridge{Log: log},
+		},
+	}
+
+	lc.runUnblockBackfillFallback(context.Background(), "U-contact")
+
+	select {
+	case mid := <-called:
+		if mid != "U-contact" {
+			t.Fatalf("silent fallback mid = %q, want U-contact", mid)
+		}
+	default:
+		t.Fatal("silent unblock fallback was not called")
+	}
+}
+
+func TestUnblockFallbackSkipsSilentBackfillWhenContactIsBlockedAgain(t *testing.T) {
+	oldRunSilentUnblockBackfill := runSilentUnblockBackfill
+	t.Cleanup(func() {
+		runSilentUnblockBackfill = oldRunSilentUnblockBackfill
+	})
+
+	called := false
+	runSilentUnblockBackfill = func(context.Context, *LineClient, string) {
+		called = true
+	}
+
+	log := zerolog.New(io.Discard)
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			Bridge: &bridgev2.Bridge{Log: log},
+		},
+		blockedUsers: map[string]bool{"U-contact": true},
+	}
+
+	lc.runUnblockBackfillFallback(context.Background(), "U-contact")
+
+	if called {
+		t.Fatal("silent unblock fallback ran after the contact was blocked again")
+	}
+}
+
+func TestWaitForUnblockBackfillPortalRetriesUntilReady(t *testing.T) {
+	readyPortal := &bridgev2.Portal{Portal: &database.Portal{MXID: "!ready:example.com"}}
+	attempts := 0
+	portal, err := waitForUnblockBackfillPortal(
+		context.Background(),
+		100*time.Millisecond,
+		time.Millisecond,
+		nil,
+		func(context.Context) (*bridgev2.Portal, error) {
+			attempts++
+			if attempts < 3 {
+				return nil, nil
+			}
+			return readyPortal, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("waitForUnblockBackfillPortal returned error: %v", err)
+	}
+	if portal != readyPortal {
+		t.Fatalf("waitForUnblockBackfillPortal returned portal %p, want %p", portal, readyPortal)
+	}
+	if attempts != 3 {
+		t.Fatalf("portal lookup attempts = %d, want 3", attempts)
+	}
+}
+
+func TestWaitForUnblockBackfillPortalStopsForFrameworkBackfill(t *testing.T) {
+	state := newUnblockBackfillState()
+	if !state.claimFramework() {
+		t.Fatal("framework did not claim unblock backfill")
+	}
+	attempts := 0
+	_, err := waitForUnblockBackfillPortal(
+		context.Background(),
+		100*time.Millisecond,
+		time.Millisecond,
+		state.frameworkStarted,
+		func(context.Context) (*bridgev2.Portal, error) {
+			attempts++
+			return nil, nil
+		},
+	)
+	if !errors.Is(err, errUnblockBackfillHandledByFramework) {
+		t.Fatalf("waitForUnblockBackfillPortal error = %v, want framework sentinel", err)
+	}
+	if attempts != 0 {
+		t.Fatalf("portal lookup ran %d times after framework claimed backfill", attempts)
+	}
+}
+
+func TestManualUnblockBackfillClaimSuppressesFrameworkClaim(t *testing.T) {
+	state := newUnblockBackfillState()
+	if !state.claimManual() {
+		t.Fatal("manual fallback did not claim unblock backfill")
+	}
+	if state.claimFramework() {
+		t.Fatal("framework claimed unblock backfill after manual fallback")
+	}
+
+	state = newUnblockBackfillState()
+	if !state.claimFramework() {
+		t.Fatal("framework did not claim unblock backfill")
+	}
+	if state.claimManual() {
+		t.Fatal("manual fallback claimed unblock backfill after framework")
+	}
+}
+
+func TestBeginUnblockBackfillDeduplicatesChat(t *testing.T) {
+	lc := &LineClient{}
+	first, queued := lc.beginUnblockBackfill("U-contact")
+	if !queued {
+		t.Fatal("first unblock backfill was not queued")
+	}
+	second, queued := lc.beginUnblockBackfill("U-contact")
+	if queued {
+		t.Fatal("duplicate unblock backfill was queued")
+	}
+	if second != first {
+		t.Fatal("duplicate unblock backfill returned a different state")
+	}
+	lc.finishUnblockBackfill("U-contact", first)
+	if state := lc.getUnblockBackfill("U-contact"); state != nil {
+		t.Fatal("finished unblock backfill state was not removed")
 	}
 }
 

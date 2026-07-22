@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -227,6 +228,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 
 	res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)
 	if err != nil {
+		ll.logLoginFailure(err, "reconnect")
 		reason := loginErrorReason(err)
 		if reason == "" {
 			reason = fmt.Sprintf("Login failed: %v", err)
@@ -253,6 +255,7 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 
 	res, err := loginWithCredentials(ll.Email, ll.Password, "")
 	if err != nil {
+		ll.logLoginFailure(err, "credentials")
 		reason := loginErrorReason(err)
 		if reason == "" {
 			reason = fmt.Sprintf("Login failed: %v", err)
@@ -299,28 +302,140 @@ func loginErrorInstructions(message string) string {
 	return fmt.Sprintf("Could not log in to LINE: %s", message)
 }
 
-func loginErrorReason(err error) string {
+type loginErrorDetails struct {
+	HTTPStatus        int
+	ResponseCode      int
+	ResponseMessage   string
+	ErrorName         string
+	ErrorCode         int
+	ErrorMessage      string
+	ErrorReason       string
+	HasHTTPStatus     bool
+	HasResponseCode   bool
+	HasErrorCode      bool
+	HasResponseFields bool
+}
+
+func parseLoginErrorDetails(err error) loginErrorDetails {
+	var details loginErrorDetails
 	if err == nil {
-		return ""
+		return details
 	}
+
 	msg := err.Error()
+	if apiErrorIndex := strings.Index(msg, "API error "); apiErrorIndex >= 0 {
+		if parsed, scanErr := fmt.Sscanf(msg[apiErrorIndex:], "API error %d:", &details.HTTPStatus); parsed == 1 && scanErr == nil {
+			details.HasHTTPStatus = true
+		}
+	}
+
 	start := strings.Index(msg, "{")
 	end := strings.LastIndex(msg, "}")
 	if start == -1 || end == -1 || end <= start {
-		return ""
+		return details
 	}
+
 	var payload struct {
-		Data struct {
-			Message string `json:"message"`
-			Reason  string `json:"reason"`
-		} `json:"data"`
+		Code    *int            `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal([]byte(msg[start:end+1]), &payload); err != nil {
+	if json.Unmarshal([]byte(msg[start:end+1]), &payload) != nil {
+		return details
+	}
+
+	details.HasResponseFields = true
+	details.ResponseMessage = payload.Message
+	if payload.Code != nil {
+		details.ResponseCode = *payload.Code
+		details.HasResponseCode = true
+	}
+
+	var responseError struct {
+		Name    string `json:"name"`
+		Code    *int   `json:"code"`
+		Message string `json:"message"`
+		Reason  string `json:"reason"`
+	}
+	if len(payload.Data) > 0 && json.Unmarshal(payload.Data, &responseError) == nil {
+		details.ErrorName = responseError.Name
+		details.ErrorMessage = responseError.Message
+		details.ErrorReason = responseError.Reason
+		if responseError.Code != nil {
+			details.ErrorCode = *responseError.Code
+			details.HasErrorCode = true
+		}
+	}
+	return details
+}
+
+func loginErrorSummary(err error, details loginErrorDetails) string {
+	if err == nil {
 		return ""
 	}
-	reason := payload.Data.Reason
+	if details.HasHTTPStatus {
+		return fmt.Sprintf("API error %d", details.HTTPStatus)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "request timed out"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "request canceled"
+	}
+	return ""
+}
+
+func loginLogField(value string) string {
+	value = strings.TrimSpace(value)
+	const maxRunes = 512
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…"
+	}
+	return value
+}
+
+func (ll *LineEmailLogin) logLoginFailure(err error, flow string) {
+	if err == nil || ll.User == nil {
+		return
+	}
+
+	details := parseLoginErrorDetails(err)
+	event := ll.User.Log.Warn().
+		Str("login_flow", flow).
+		Bool("has_certificate", ll.Certificate != "")
+	if summary := loginErrorSummary(err, details); summary != "" {
+		event.Str("error_summary", summary)
+	}
+	if details.HasHTTPStatus {
+		event.Int("http_status", details.HTTPStatus)
+	}
+	if details.HasResponseCode {
+		event.Int("line_response_code", details.ResponseCode)
+	}
+	if details.ResponseMessage != "" {
+		event.Str("line_response_message", loginLogField(details.ResponseMessage))
+	}
+	if details.ErrorName != "" {
+		event.Str("line_error_name", loginLogField(details.ErrorName))
+	}
+	if details.HasErrorCode {
+		event.Int("line_error_code", details.ErrorCode)
+	}
+	if details.ErrorMessage != "" {
+		event.Str("line_error_message", loginLogField(details.ErrorMessage))
+	}
+	if details.ErrorReason != "" {
+		event.Str("line_error_reason", loginLogField(details.ErrorReason))
+	}
+	event.Msg("LINE login attempt failed")
+}
+
+func loginErrorReason(err error) string {
+	details := parseLoginErrorDetails(err)
+	reason := details.ErrorReason
 	if reason == "" {
-		reason = payload.Data.Message
+		reason = details.ErrorMessage
 	}
 	if isBlockedUserLoginError(reason) {
 		return loginTooManyAttemptsReason
@@ -341,6 +456,7 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 			}
 			return nil, fmt.Errorf("verification failed: no auth token received")
 		case err := <-ll.pollErr:
+			ll.logLoginFailure(err, "verification_poll")
 			return nil, fmt.Errorf("verification failed: %w", err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -350,6 +466,7 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 	if ll.AwaitingPIN {
 		res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)
 		if err != nil {
+			ll.logLoginFailure(err, "pin_continuation")
 			return nil, fmt.Errorf("login failed: %w", err)
 		}
 		return ll.handleLoginResponse(ctx, res)

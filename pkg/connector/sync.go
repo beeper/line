@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -26,16 +27,76 @@ import (
 )
 
 const (
-	prefetchMessagesConcurrency     = 4
-	messageBoxPageLimit             = 100
-	startupBackfillMessageLimit     = 50
-	unblockBackfillFallbackDelay    = 10 * time.Second
-	groupPortalCreateWait           = 30 * time.Second
-	beeperExcludeFromTimelineKey    = "com.beeper.exclude_from_timeline"
-	defaultReceiveAuthProbeInterval = 150 * time.Second
+	prefetchMessagesConcurrency               = 4
+	messageBoxPageLimit                       = 100
+	startupBackfillMessageLimit               = 50
+	unblockBackfillPortalWaitTimeout          = time.Minute
+	unblockBackfillPortalPollInterval         = 500 * time.Millisecond
+	unblockBackfillFrameworkGrace             = 10 * time.Second
+	unblockBackfillFrameworkCompletionTimeout = 2 * time.Minute
+	groupPortalCreateWait                     = 30 * time.Second
+	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
+	defaultReceiveAuthProbeInterval           = 150 * time.Second
 )
 
-var errReceiveAuthProbeDue = errors.New("receive auth probe due")
+var (
+	errReceiveAuthProbeDue               = errors.New("receive auth probe due")
+	errUnblockBackfillHandledByFramework = errors.New("unblock backfill handled by framework")
+)
+
+type unblockBackfillOwner uint8
+
+const (
+	unblockBackfillOwnerNone unblockBackfillOwner = iota
+	unblockBackfillOwnerFramework
+	unblockBackfillOwnerManual
+)
+
+// unblockBackfillState gives either bridgev2's normal forward backfill or the
+// manual silent fallback exclusive ownership of one unblocked chat.
+type unblockBackfillState struct {
+	mu               sync.Mutex
+	owner            unblockBackfillOwner
+	frameworkStarted chan struct{}
+	done             chan struct{}
+	doneOnce         sync.Once
+}
+
+func newUnblockBackfillState() *unblockBackfillState {
+	return &unblockBackfillState{
+		frameworkStarted: make(chan struct{}),
+		done:             make(chan struct{}),
+	}
+}
+
+func (state *unblockBackfillState) claimFramework() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.owner != unblockBackfillOwnerNone {
+		return false
+	}
+	state.owner = unblockBackfillOwnerFramework
+	close(state.frameworkStarted)
+	return true
+}
+
+func (state *unblockBackfillState) claimManual() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.owner != unblockBackfillOwnerNone {
+		return false
+	}
+	state.owner = unblockBackfillOwnerManual
+	return true
+}
+
+func (state *unblockBackfillState) complete() {
+	state.doneOnce.Do(func() {
+		close(state.done)
+	})
+}
+
+type manualUnblockBackfillContextKey struct{}
 
 var (
 	getLastOpRevisionWithClient = func(ctx context.Context, client *line.Client) (int64, error) {
@@ -49,6 +110,9 @@ var (
 	receiveAuthProbeNow        = time.Now
 	newReceiveAuthProbeContext = func(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
 		return context.WithDeadlineCause(parent, deadline, errReceiveAuthProbeDue)
+	}
+	runSilentUnblockBackfill = func(ctx context.Context, lc *LineClient, mid string) {
+		lc.silentBackfillRecentMessages(ctx, mid, startupBackfillMessageLimit)
 	}
 )
 
@@ -261,37 +325,239 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 	})
 }
 
-func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid string) {
-	lc.wg.Add(1)
-	go func() {
-		defer lc.wg.Done()
+func (lc *LineClient) beginUnblockBackfill(mid string) (*unblockBackfillState, bool) {
+	state := newUnblockBackfillState()
+	actual, loaded := lc.unblockBackfills.LoadOrStore(mid, state)
+	if loaded {
+		return actual.(*unblockBackfillState), false
+	}
+	return state, true
+}
 
-		timer := time.NewTimer(unblockBackfillFallbackDelay)
-		defer timer.Stop()
+func (lc *LineClient) getUnblockBackfill(mid string) *unblockBackfillState {
+	state, ok := lc.unblockBackfills.Load(mid)
+	if !ok {
+		return nil
+	}
+	return state.(*unblockBackfillState)
+}
+
+func (lc *LineClient) finishUnblockBackfill(mid string, state *unblockBackfillState) {
+	lc.unblockBackfills.CompareAndDelete(mid, state)
+}
+
+func waitForUnblockBackfillPortal(
+	ctx context.Context,
+	timeout time.Duration,
+	pollInterval time.Duration,
+	frameworkStarted <-chan struct{},
+	lookup func(context.Context) (*bridgev2.Portal, error),
+) (*bridgev2.Portal, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	var lastLookupErr error
+	for {
+		select {
+		case <-frameworkStarted:
+			return nil, errUnblockBackfillHandledByFramework
+		default:
+		}
+
+		portal, err := lookup(waitCtx)
+		if err != nil {
+			lastLookupErr = err
+		} else if portal != nil && portal.MXID != "" {
+			return portal, nil
+		}
 
 		select {
+		case <-frameworkStarted:
+			return nil, errUnblockBackfillHandledByFramework
+		case <-waitCtx.Done():
+			if lastLookupErr != nil {
+				return nil, fmt.Errorf("portal did not become ready after lookup error: %w", lastLookupErr)
+			}
+			return nil, waitCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (lc *LineClient) waitForFrameworkUnblockBackfill(ctx context.Context, log zerolog.Logger, state *unblockBackfillState) {
+	timer := time.NewTimer(unblockBackfillFrameworkCompletionTimeout)
+	defer timer.Stop()
+	select {
+	case <-state.done:
+		log.Debug().Msg("Framework unblock backfill finished")
+	case <-ctx.Done():
+	case <-timer.C:
+		log.Warn().Msg("Timed out waiting for framework unblock backfill to finish")
+	}
+}
+
+func (lc *LineClient) silentBackfillRecentMessages(ctx context.Context, chatMID string, limit int) {
+	log := lc.UserLogin.Bridge.Log.With().
+		Str("chat_mid", chatMID).
+		Str("action", "silent unblock backfill").
+		Logger()
+	ctx = log.WithContext(ctx)
+
+	state := lc.getUnblockBackfill(chatMID)
+	var frameworkStarted <-chan struct{}
+	if state != nil {
+		frameworkStarted = state.frameworkStarted
+	}
+	portalKey := networkid.PortalKey{ID: makePortalID(chatMID), Receiver: lc.UserLogin.ID}
+	portal, err := waitForUnblockBackfillPortal(
+		ctx,
+		unblockBackfillPortalWaitTimeout,
+		unblockBackfillPortalPollInterval,
+		frameworkStarted,
+		func(ctx context.Context) (*bridgev2.Portal, error) {
+			return lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		},
+	)
+	if errors.Is(err, errUnblockBackfillHandledByFramework) {
+		log.Debug().Msg("Skipping manual unblock backfill because framework backfill started")
+		lc.waitForFrameworkUnblockBackfill(ctx, log, state)
+		return
+	} else if err != nil {
+		if ctx.Err() != nil {
+			log.Debug().Err(ctx.Err()).Msg("Stopped waiting for restored portal")
+		} else {
+			log.Warn().Err(err).Dur("wait_timeout", unblockBackfillPortalWaitTimeout).Msg("Restored portal did not become ready for silent unblock backfill")
+		}
+		return
+	}
+
+	if state != nil {
+		timer := time.NewTimer(unblockBackfillFrameworkGrace)
+		select {
+		case <-state.frameworkStarted:
+			timer.Stop()
+			log.Debug().Msg("Skipping manual unblock backfill because framework backfill started")
+			lc.waitForFrameworkUnblockBackfill(ctx, log, state)
+			return
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		case <-timer.C:
 		}
-
-		if lc.isUserBlocked(mid) {
-			lc.UserLogin.Bridge.Log.Debug().
-				Str("mid", mid).
-				Msg("Skipping unblock fallback backfill because contact is blocked again")
+		if !state.claimManual() {
+			log.Debug().Msg("Skipping manual unblock backfill because another backfill claimed the chat")
+			lc.waitForFrameworkUnblockBackfill(ctx, log, state)
 			return
 		}
+	}
 
-		lc.UserLogin.Bridge.Log.Info().
+	if lc.isUserBlocked(chatMID) {
+		log.Debug().Msg("Skipping silent unblock backfill because contact is blocked again")
+		return
+	}
+
+	capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
+	if capabilities == nil || !capabilities.BatchSending {
+		log.Debug().Msg("Skipping unblock fallback because silent batch sending is unavailable")
+		return
+	}
+	log.Info().Msg("Running silent unblock fallback backfill")
+	ctx = context.WithValue(ctx, manualUnblockBackfillContextKey{}, true)
+
+	resp, err := lc.FetchMessages(ctx, bridgev2.FetchMessagesParams{
+		Portal:  portal,
+		Forward: true,
+		Count:   limit,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to fetch messages for silent unblock backfill")
+		return
+	} else if resp == nil {
+		log.Warn().Msg("No response returned for silent unblock backfill")
+		return
+	} else if len(resp.Messages) == 0 {
+		if resp.CompleteCallback != nil {
+			resp.CompleteCallback()
+		}
+		log.Debug().Msg("No messages found for silent unblock backfill")
+		return
+	}
+
+	latestMessage, err := lc.UserLogin.Bridge.DB.Message.GetLastPartAtOrBeforeTime(
+		ctx,
+		portal.PortalKey,
+		time.Now().Add(10*time.Second),
+	)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get latest message before silent unblock backfill")
+		return
+	}
+	// bridgev2 does not expose a public API for forcing a silent forward backfill
+	// when the normal resync path is disabled by the runtime backfill config.
+	//lint:ignore SA1019 The fallback must use bridgev2's batch backfill internals to remain notification-free.
+	portalInternals := portal.Internal()
+	resp.Messages = portalInternals.CutoffMessages(ctx, resp.Messages, true, true, latestMessage)
+	if len(resp.Messages) == 0 {
+		if resp.CompleteCallback != nil {
+			resp.CompleteCallback()
+		}
+		log.Debug().Msg("No new messages left for silent unblock backfill")
+		return
+	}
+
+	messageCount := len(resp.Messages)
+	complete := resp.CompleteCallback
+	log.Info().Int("message_count", messageCount).Msg("Sending silent unblock backfill")
+	portalInternals.SendBackfill(ctx, lc.UserLogin, resp.Messages, true, true, false, func() {
+		if complete != nil {
+			complete()
+		}
+		log.Info().Int("message_count", messageCount).Msg("Finished silent unblock backfill")
+	})
+}
+
+func (lc *LineClient) runUnblockBackfillFallback(ctx context.Context, mid string) {
+	if lc.isUserBlocked(mid) {
+		lc.UserLogin.Bridge.Log.Debug().
 			Str("mid", mid).
-			Dur("delay", unblockBackfillFallbackDelay).
-			Msg("Re-requesting silent unblock backfill")
-		lc.queueDMChatResync(ctx, mid, true, true)
+			Msg("Skipping unblock fallback backfill because contact is blocked again")
+		return
+	}
+
+	runSilentUnblockBackfill(ctx, lc, mid)
+}
+
+func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid string) {
+	state := lc.getUnblockBackfill(mid)
+	lc.wg.Add(1)
+	go func() {
+		defer lc.wg.Done()
+		if state != nil {
+			defer lc.finishUnblockBackfill(mid, state)
+		}
+		lc.runUnblockBackfillFallback(ctx, mid)
 	}()
 }
 
 func (lc *LineClient) queueUnblockedDMRestore(ctx context.Context, mid, reason string) {
 	if isChatMID(mid) {
+		return
+	}
+	capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
+	if capabilities == nil || !capabilities.BatchSending {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("mid", mid).
+			Msg("Restoring unblocked DM without history because silent batch sending is unavailable")
+		lc.queueDMChatResync(ctx, mid, true, false)
+		return
+	}
+	_, queued := lc.beginUnblockBackfill(mid)
+	if !queued {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("mid", mid).
+			Msg("Unblock backfill is already queued")
 		return
 	}
 	lc.UserLogin.Bridge.Log.Info().
@@ -315,6 +581,20 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	}
 
 	chatMID := string(params.Portal.PortalKey.ID)
+	unblockState := lc.getUnblockBackfill(chatMID)
+	manualUnblockBackfill, _ := ctx.Value(manualUnblockBackfillContextKey{}).(bool)
+	if unblockState != nil && !manualUnblockBackfill {
+		capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
+		if capabilities == nil || !capabilities.BatchSending {
+			return &bridgev2.FetchMessagesResponse{HasMore: false, MarkRead: true}, nil
+		}
+		if !unblockState.claimFramework() {
+			lc.UserLogin.Bridge.Log.Debug().
+				Str("chat_mid", chatMID).
+				Msg("Skipping duplicate unblock backfill fetch")
+			return &bridgev2.FetchMessagesResponse{HasMore: false, MarkRead: true}, nil
+		}
+	}
 	limit := params.Count
 	if limit <= 0 {
 		limit = 50
@@ -329,6 +609,9 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		}
 	}
 	if err != nil {
+		if unblockState != nil {
+			unblockState.complete()
+		}
 		return nil, fmt.Errorf("failed to fetch recent messages for backfill: %w", err)
 	}
 
@@ -372,9 +655,14 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		})
 	}
 
+	var completeCallback func()
+	if unblockState != nil {
+		completeCallback = unblockState.complete
+	}
 	return &bridgev2.FetchMessagesResponse{
-		Messages: backfillMsgs,
-		HasMore:  false,
+		Messages:         backfillMsgs,
+		HasMore:          false,
+		CompleteCallback: completeCallback,
 		// Mark the restored chat as read so the silent backfill doesn't leave a
 		// stale unread badge — and so the forward batch send never notifies.
 		MarkRead: true,
@@ -465,10 +753,6 @@ func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMI
 	return chatMIDs
 }
 
-// backfillRecentMessages fetches up to limit recent messages for a single
-// chat and queues any not already in the local DB through the normal inbound
-// (live) message path. Used by prefetchMessages on startup and as a delayed,
-// deduped fallback after unblock if bridgev2's silent forward backfill didn't
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
 // (live) message path. Used by prefetchMessages on startup.
@@ -1518,11 +1802,10 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Unlock()
 		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact unblocked")
-		// Reattach the DM portal and request an immediate backfill in the same
-		// resync. The backfill is batch-sent silently (see FetchMessages), so the
-		// restored chat repopulates without firing a
-		// notification for every old message — a blocked contact can't have sent
-		// anything new, so notifying on unblock is never useful.
+		// Reattach the DM portal and, when silent batch sending is available,
+		// restore its recent history without notifying for every old message.
+		// A blocked contact can't have sent anything new, so notifying on unblock
+		// is never useful; without batch sending, restore the empty room instead.
 		lc.queueUnblockedDMRestore(ctx, mid, "op_unblock")
 
 	case OpContactUpdate:
