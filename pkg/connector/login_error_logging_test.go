@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -53,6 +54,7 @@ func TestSubmitUserInputLogsStructuredLoginErrorWithoutCredentials(t *testing.T)
 		"message":               "LINE login attempt failed",
 		"login_flow":            "credentials",
 		"has_certificate":       false,
+		"error_summary":         "API error 400",
 		"http_status":           float64(400),
 		"line_response_code":    float64(10051),
 		"line_response_message": "RESPONSE_ERROR",
@@ -76,11 +78,28 @@ func TestSubmitUserInputLogsStructuredLoginErrorWithoutCredentials(t *testing.T)
 }
 
 func TestParseLoginErrorDetailsWithoutJSON(t *testing.T) {
-	details := parseLoginErrorDetails(errors.New("login failed: request failed: context deadline exceeded"))
+	err := errors.New("login failed: request failed: context deadline exceeded")
+	details := parseLoginErrorDetails(err)
 	if details.HasHTTPStatus || details.HasResponseFields {
 		t.Fatalf("unexpected parsed response details: %#v", details)
 	}
-	if got := loginErrorSummary(errors.New("login failed: request failed: context deadline exceeded")); got != "login failed: request failed: context deadline exceeded" {
-		t.Fatalf("loginErrorSummary = %q", got)
+	if got := loginErrorSummary(err, details); got != "" {
+		t.Fatalf("loginErrorSummary = %q, want empty", got)
+	}
+}
+
+func TestLoginErrorSummaryDoesNotIncludeNonJSONResponseBody(t *testing.T) {
+	err := errors.New("login failed: API error 502: upstream secret response")
+	details := parseLoginErrorDetails(err)
+	if got := loginErrorSummary(err, details); got != "API error 502" {
+		t.Fatalf("loginErrorSummary = %q, want %q", got, "API error 502")
+	}
+}
+
+func TestLoginErrorSummaryAllowsKnownContextErrors(t *testing.T) {
+	err := fmt.Errorf("login failed: %w", context.DeadlineExceeded)
+	details := parseLoginErrorDetails(err)
+	if got := loginErrorSummary(err, details); got != "request timed out" {
+		t.Fatalf("loginErrorSummary = %q, want %q", got, "request timed out")
 	}
 }

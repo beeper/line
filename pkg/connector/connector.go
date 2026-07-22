@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -368,15 +369,20 @@ func parseLoginErrorDetails(err error) loginErrorDetails {
 	return details
 }
 
-func loginErrorSummary(err error) string {
+func loginErrorSummary(err error, details loginErrorDetails) string {
 	if err == nil {
 		return ""
 	}
-	summary := strings.TrimSpace(err.Error())
-	if jsonStart := strings.Index(summary, "{"); jsonStart >= 0 {
-		summary = strings.TrimSpace(summary[:jsonStart])
+	if details.HasHTTPStatus {
+		return fmt.Sprintf("API error %d", details.HTTPStatus)
 	}
-	return loginLogField(summary)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "request timed out"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "request canceled"
+	}
+	return ""
 }
 
 func loginLogField(value string) string {
@@ -398,7 +404,7 @@ func (ll *LineEmailLogin) logLoginFailure(err error, flow string) {
 	event := ll.User.Log.Warn().
 		Str("login_flow", flow).
 		Bool("has_certificate", ll.Certificate != "")
-	if summary := loginErrorSummary(err); summary != "" {
+	if summary := loginErrorSummary(err, details); summary != "" {
 		event.Str("error_summary", summary)
 	}
 	if details.HasHTTPStatus {
