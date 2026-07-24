@@ -963,11 +963,15 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 			}
 		}
 		if pos >= 0 {
-			mentionees = append(mentionees, mentionEntry{
-				S: strconv.Itoa(pos),
-				E: strconv.Itoa(pos + matchLen),
-				A: "1",
-			})
+			start, startOK := byteIndexToUTF16Offset(body, pos)
+			end, endOK := byteIndexToUTF16Offset(body, pos+matchLen)
+			if startOK && endOK {
+				mentionees = append(mentionees, mentionEntry{
+					S: strconv.Itoa(start),
+					E: strconv.Itoa(end),
+					A: "1",
+				})
+			}
 		}
 	}
 
@@ -1002,11 +1006,15 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 		searchStr := "@" + displayName
 		pos := strings.Index(body, searchStr)
 		if pos >= 0 {
-			mentionees = append(mentionees, mentionEntry{
-				S: strconv.Itoa(pos),
-				E: strconv.Itoa(pos + len(searchStr)),
-				M: string(mid),
-			})
+			start, startOK := byteIndexToUTF16Offset(body, pos)
+			end, endOK := byteIndexToUTF16Offset(body, pos+len(searchStr))
+			if startOK && endOK {
+				mentionees = append(mentionees, mentionEntry{
+					S: strconv.Itoa(start),
+					E: strconv.Itoa(end),
+					M: string(mid),
+				})
+			}
 		}
 	}
 

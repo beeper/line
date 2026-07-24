@@ -1,16 +1,82 @@
 package connector
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
+
+type mentionTestMatrix struct {
+	bridgev2.MatrixConnector
+	ghosts map[id.UserID]networkid.UserID
+}
+
+func (matrix *mentionTestMatrix) ParseGhostMXID(userID id.UserID) (networkid.UserID, bool) {
+	ghostID, ok := matrix.ghosts[userID]
+	return ghostID, ok
+}
+
+func TestBuildMentionMetadataUsesUTF16Offsets(t *testing.T) {
+	userIDs := []id.UserID{
+		"@line_zhang:example.com",
+		"@line_kik:example.com",
+		"@line_alice:example.com",
+	}
+	matrix := &mentionTestMatrix{ghosts: map[id.UserID]networkid.UserID{
+		userIDs[0]: "u-zhang",
+		userIDs[1]: "u-kik",
+		userIDs[2]: "u-alice",
+	}}
+	lc := &LineClient{UserLogin: &bridgev2.UserLogin{
+		Bridge: &bridgev2.Bridge{Matrix: matrix},
+	}}
+	body := "🙂 @张三 @กิ๊ก @Alice"
+	formattedBody := `🙂 <a href="https://matrix.to/#/@line_zhang:example.com">张三</a> ` +
+		`<a href="https://matrix.to/#/@line_kik:example.com">กิ๊ก</a> ` +
+		`<a href="https://matrix.to/#/@line_alice:example.com">Alice</a>`
+
+	metadata := lc.buildMentionMetadata(t.Context(), body, formattedBody, &event.Mentions{UserIDs: userIDs})
+	var payload struct {
+		Mentionees []mentionEntry `json:"MENTIONEES"`
+	}
+	if err := json.Unmarshal([]byte(metadata["MENTION"]), &payload); err != nil {
+		t.Fatalf("failed to unmarshal MENTION metadata: %v", err)
+	}
+
+	expected := []mentionEntry{
+		{S: "3", E: "6", M: "u-zhang"},
+		{S: "7", E: "12", M: "u-kik"},
+		{S: "13", E: "19", M: "u-alice"},
+	}
+	if fmt.Sprintf("%#v", payload.Mentionees) != fmt.Sprintf("%#v", expected) {
+		t.Fatalf("MENTIONEES = %#v, want %#v", payload.Mentionees, expected)
+	}
+}
+
+func TestBuildRoomMentionMetadataUsesUTF16Offsets(t *testing.T) {
+	lc := &LineClient{}
+	metadata := lc.buildMentionMetadata(t.Context(), "你好🙂 @room", "", &event.Mentions{Room: true})
+	var payload struct {
+		Mentionees []mentionEntry `json:"MENTIONEES"`
+	}
+	if err := json.Unmarshal([]byte(metadata["MENTION"]), &payload); err != nil {
+		t.Fatalf("failed to unmarshal MENTION metadata: %v", err)
+	}
+
+	expected := []mentionEntry{{S: "5", E: "10", A: "1"}}
+	if fmt.Sprintf("%#v", payload.Mentionees) != fmt.Sprintf("%#v", expected) {
+		t.Fatalf("MENTIONEES = %#v, want %#v", payload.Mentionees, expected)
+	}
+}
 
 func TestLineGroupE2EEReconnectRequiredError(t *testing.T) {
 	err := lineGroupE2EEReconnectRequiredError(fmt.Errorf("failed to unwrap group key: %w for 5625926", e2ee.ErrMissingOwnPrivateKey))

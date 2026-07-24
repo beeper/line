@@ -480,9 +480,13 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 					lc.UserLogin.Bridge.Log.Debug().Str("mxid", string(mxid)).Msg("Formatted MXID from LINE MID")
 					mentions.UserIDs = append(mentions.UserIDs, mxid)
 					if canFormatMentions {
-						if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
-							if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
-								entries = append(entries, mentionEntry{start: s, end: e, mxid: string(mxid)})
+						if s, errS := strconv.Atoi(ment.S); errS == nil {
+							if e, errE := strconv.Atoi(ment.E); errE == nil && e > s {
+								start, startOK := utf16OffsetToByteIndex(unwrappedText, s)
+								end, endOK := utf16OffsetToByteIndex(unwrappedText, e)
+								if startOK && endOK && end > start {
+									entries = append(entries, mentionEntry{start: start, end: end, mxid: string(mxid)})
+								}
 							}
 						}
 					}
@@ -490,9 +494,13 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 				if ment.A == "1" {
 					mentions.Room = true
 					if canFormatMentions {
-						if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
-							if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
-								entries = append(entries, mentionEntry{start: s, end: e, mxid: "@room"})
+						if s, errS := strconv.Atoi(ment.S); errS == nil {
+							if e, errE := strconv.Atoi(ment.E); errE == nil && e > s {
+								start, startOK := utf16OffsetToByteIndex(unwrappedText, s)
+								end, endOK := utf16OffsetToByteIndex(unwrappedText, e)
+								if startOK && endOK && end > start {
+									entries = append(entries, mentionEntry{start: start, end: end, mxid: "@room"})
+								}
 							}
 						}
 					}
