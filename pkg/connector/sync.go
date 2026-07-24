@@ -1860,9 +1860,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpNotifiedLeaveChat:
 		lower1 := strings.ToLower(op.Param1)
 		if strings.HasPrefix(lower1, "c") || strings.HasPrefix(lower1, "r") {
-			lc.handleMemberLeave(op.Param1, op.Param2)
+			lc.handleMemberLeft(op.Param1, op.Param2)
 		} else {
-			lc.handleMemberLeave(op.Param2, op.Param1)
+			lc.handleMemberLeft(op.Param2, op.Param1)
 		}
 
 	case OpNotifiedJoinChat:
@@ -2300,51 +2300,95 @@ func (lc *LineClient) checkChatMembership(ctx context.Context, chatMid string) (
 }
 
 func (lc *LineClient) emitMemberChange(chatMid, userMid string, membership event.Membership, ts time.Time, excludeFromTimeline ...bool) {
+	lc.emitMemberChangeWithSender(chatMid, userMid, membership, ts, bridgev2.EventSender{}, excludeFromTimeline...)
+}
+
+func (lc *LineClient) emitMemberChangeWithSender(
+	chatMid, userMid string,
+	membership event.Membership,
+	ts time.Time,
+	changeSender bridgev2.EventSender,
+	excludeFromTimeline ...bool,
+) {
 	exclude := len(excludeFromTimeline) > 0 && excludeFromTimeline[0]
 	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
-	sender := bridgev2.EventSender{Sender: networkid.UserID(userMid)}
-	if userMid == string(lc.UserLogin.ID) || userMid == lc.Mid {
-		sender.IsFromMe = true
-	}
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatInfoChange{
+	member := lc.eventSenderForMID(userMid)
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, makeMemberChangeEvent(
+		portalKey,
+		member,
+		changeSender,
+		membership,
+		ts,
+		exclude,
+	))
+}
+
+func makeMemberChangeEvent(
+	portalKey networkid.PortalKey,
+	member, changeSender bridgev2.EventSender,
+	membership event.Membership,
+	ts time.Time,
+	exclude bool,
+) *simplevent.ChatInfoChange {
+	return &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatInfoChange,
 			PortalKey: portalKey,
+			Sender:    changeSender,
 			Timestamp: ts,
 		},
 		ChatInfoChange: &bridgev2.ChatInfoChange{
 			MemberChanges: &bridgev2.ChatMemberList{
 				ExcludeChangesFromTimeline: exclude,
-				Members: []bridgev2.ChatMember{
-					{
-						EventSender:      sender,
+				MemberMap: bridgev2.ChatMemberMap{
+					member.Sender: {
+						EventSender:      member,
 						Membership:       membership,
 						MemberEventExtra: hiddenMemberEventExtra(exclude),
 					},
 				},
 			},
 		},
-	})
+	}
 }
 
 func (lc *LineClient) handleSelfLeave(chatMid string) {
+	selfID := string(lc.UserLogin.ID)
+	lc.handleSelfLeaveWithSender(chatMid, lc.eventSenderForMID(selfID))
+}
+
+func (lc *LineClient) handleSelfLeaveWithSender(chatMid string, changeSender bridgev2.EventSender) {
 	lc.cacheMu.Lock()
 	delete(lc.groupMemberCache, chatMid)
 	lc.cacheMu.Unlock()
-	lc.emitMemberChange(chatMid, string(lc.UserLogin.ID), event.MembershipLeave, time.Now())
+	lc.emitMemberChangeWithSender(
+		chatMid,
+		string(lc.UserLogin.ID),
+		event.MembershipLeave,
+		time.Now(),
+		changeSender,
+	)
 }
 
 func (lc *LineClient) handleMemberLeave(chatMid, leaverMid string) {
+	lc.handleMemberLeaveWithSender(chatMid, leaverMid, bridgev2.EventSender{})
+}
+
+func (lc *LineClient) handleMemberLeft(chatMid, leaverMid string) {
+	lc.handleMemberLeaveWithSender(chatMid, leaverMid, lc.eventSenderForMID(leaverMid))
+}
+
+func (lc *LineClient) handleMemberLeaveWithSender(chatMid, leaverMid string, changeSender bridgev2.EventSender) {
 	lower := strings.ToLower(chatMid)
 	if !strings.HasPrefix(lower, "c") && !strings.HasPrefix(lower, "r") {
 		return
 	}
 	if leaverMid == lc.Mid || leaverMid == string(lc.UserLogin.ID) {
-		lc.handleSelfLeave(chatMid)
+		lc.handleSelfLeaveWithSender(chatMid, changeSender)
 		return
 	}
 	lc.removeGroupMemberFromCache(chatMid, leaverMid)
-	lc.emitMemberChange(chatMid, leaverMid, event.MembershipLeave, time.Now())
+	lc.emitMemberChangeWithSender(chatMid, leaverMid, event.MembershipLeave, time.Now(), changeSender)
 }
 
 func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
@@ -2468,8 +2512,18 @@ func (lc *LineClient) handleSystemMessage(op line.Operation) {
 	case "C_MJ", "A_MJ":
 		lc.addGroupMembersToCache(msg.To, msg.From)
 		lc.emitMemberChange(msg.To, msg.From, event.MembershipJoin, tsTime)
-	case "C_ML", "A_ML", "C_MR", "A_MR":
+	case "C_ML", "A_ML":
 		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("leaver_mid", msg.From).Msg("System message: member leave")
+		lc.removeGroupMemberFromCache(msg.To, msg.From)
+		lc.emitMemberChangeWithSender(
+			msg.To,
+			msg.From,
+			event.MembershipLeave,
+			tsTime,
+			lc.eventSenderForMID(msg.From),
+		)
+	case "C_MR", "A_MR":
+		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("removed_mid", msg.From).Msg("System message: member removed")
 		lc.removeGroupMemberFromCache(msg.To, msg.From)
 		lc.emitMemberChange(msg.To, msg.From, event.MembershipLeave, tsTime)
 	case "C_GI", "C_MI", "A_MI":
