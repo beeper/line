@@ -201,6 +201,41 @@ func TestConvertLineMessageUsesUTF16MentionOffsets(t *testing.T) {
 	}
 }
 
+func TestConvertLineMessageUsesUTF16RoomMentionOffsets(t *testing.T) {
+	text := "🙂 嗨 @everyone!"
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{UserMXID: "@user:example.com"},
+			Bridge:    &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
+		},
+	}
+	data := line.Message{
+		ContentType: int(ContentText),
+		ContentMetadata: map[string]string{
+			"MENTION": `{"MENTIONEES":[{"A":"1","S":"5","E":"14"}]}`,
+		},
+	}
+
+	converted, err := lc.convertLineMessage(t.Context(), nil, nil, data, text, text, false)
+	if err != nil {
+		t.Fatalf("convertLineMessage returned error: %v", err)
+	}
+	if converted == nil || len(converted.Parts) != 1 || converted.Parts[0].Content == nil {
+		t.Fatalf("convertLineMessage returned %#v, want one message part", converted)
+	}
+	content := converted.Parts[0].Content
+	if content.Body != "🙂 嗨 @room!" {
+		t.Fatalf("Body = %q, want room mention replacement", content.Body)
+	}
+	if content.Mentions == nil || !content.Mentions.Room {
+		t.Fatalf("Mentions = %#v, want room mention", content.Mentions)
+	}
+	expectedLink := `<a href="https://matrix.to/#/@room">@everyone</a>`
+	if !strings.Contains(content.FormattedBody, expectedLink) {
+		t.Fatalf("FormattedBody = %q, want link %q", content.FormattedBody, expectedLink)
+	}
+}
+
 func TestDecryptMessageBodySkipsGeneratedFallbackWhenDecryptUnavailable(t *testing.T) {
 	msg := &line.Message{
 		Text:   "",

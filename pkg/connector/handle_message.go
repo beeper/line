@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"html"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -480,28 +479,16 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 					lc.UserLogin.Bridge.Log.Debug().Str("mxid", string(mxid)).Msg("Formatted MXID from LINE MID")
 					mentions.UserIDs = append(mentions.UserIDs, mxid)
 					if canFormatMentions {
-						if s, errS := strconv.Atoi(ment.S); errS == nil {
-							if e, errE := strconv.Atoi(ment.E); errE == nil && e > s {
-								start, startOK := utf16OffsetToByteIndex(unwrappedText, s)
-								end, endOK := utf16OffsetToByteIndex(unwrappedText, e)
-								if startOK && endOK && end > start {
-									entries = append(entries, mentionEntry{start: start, end: end, mxid: string(mxid)})
-								}
-							}
+						if start, end, ok := resolveMentionRange(unwrappedText, ment.S, ment.E); ok {
+							entries = append(entries, mentionEntry{start: start, end: end, mxid: string(mxid)})
 						}
 					}
 				}
 				if ment.A == "1" {
 					mentions.Room = true
 					if canFormatMentions {
-						if s, errS := strconv.Atoi(ment.S); errS == nil {
-							if e, errE := strconv.Atoi(ment.E); errE == nil && e > s {
-								start, startOK := utf16OffsetToByteIndex(unwrappedText, s)
-								end, endOK := utf16OffsetToByteIndex(unwrappedText, e)
-								if startOK && endOK && end > start {
-									entries = append(entries, mentionEntry{start: start, end: end, mxid: "@room"})
-								}
-							}
+						if start, end, ok := resolveMentionRange(unwrappedText, ment.S, ment.E); ok {
+							entries = append(entries, mentionEntry{start: start, end: end, mxid: "@room"})
 						}
 					}
 				}

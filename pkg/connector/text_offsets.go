@@ -1,6 +1,24 @@
 package connector
 
-import "unicode/utf8"
+import (
+	"strconv"
+	"unicode/utf8"
+)
+
+func resolveMentionRange(text, startOffset, endOffset string) (int, int, bool) {
+	startUTF16, err := strconv.Atoi(startOffset)
+	if err != nil {
+		return 0, 0, false
+	}
+	endUTF16, err := strconv.Atoi(endOffset)
+	if err != nil || endUTF16 <= startUTF16 {
+		return 0, 0, false
+	}
+
+	start, startOK := utf16OffsetToByteIndex(text, startUTF16)
+	end, endOK := utf16OffsetToByteIndex(text, endUTF16)
+	return start, end, startOK && endOK && end > start
+}
 
 func utf16OffsetToByteIndex(text string, offset int) (int, bool) {
 	if offset < 0 {
