@@ -10,9 +10,58 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
+
+func TestMakeMemberChangeEventPreservesChangeSender(t *testing.T) {
+	portalKey := networkid.PortalKey{
+		ID:       "C-group",
+		Receiver: "U-login",
+	}
+	member := bridgev2.EventSender{Sender: "U-member"}
+	timestamp := time.UnixMilli(1_784_890_442_000)
+
+	tests := []struct {
+		name         string
+		changeSender bridgev2.EventSender
+	}{
+		{
+			name:         "voluntary leave is sent by departing member",
+			changeSender: member,
+		},
+		{
+			name:         "removal keeps default bridge sender",
+			changeSender: bridgev2.EventSender{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evt := makeMemberChangeEvent(
+				portalKey,
+				member,
+				tc.changeSender,
+				event.MembershipLeave,
+				timestamp,
+				false,
+			)
+
+			if evt.EventMeta.Sender != tc.changeSender {
+				t.Fatalf("change sender = %#v, want %#v", evt.EventMeta.Sender, tc.changeSender)
+			}
+			if !evt.EventMeta.Timestamp.Equal(timestamp) {
+				t.Fatalf("timestamp = %s, want %s", evt.EventMeta.Timestamp, timestamp)
+			}
+			if changes := evt.ChatInfoChange.MemberChanges.Members; len(changes) != 1 {
+				t.Fatalf("member changes = %d, want 1", len(changes))
+			} else if changes[0].EventSender != member || changes[0].Membership != event.MembershipLeave {
+				t.Fatalf("member change = %#v, want member %#v to leave", changes[0], member)
+			}
+		})
+	}
+}
 
 func installManualReceiveAuthProbeDeadline(t *testing.T) <-chan context.CancelCauseFunc {
 	t.Helper()
