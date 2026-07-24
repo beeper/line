@@ -45,3 +45,65 @@ func TestFlexibleMidMapUnmarshalJSON(t *testing.T) {
 		})
 	}
 }
+
+func TestMessageUnmarshalsRecentMessageReactions(t *testing.T) {
+	var msg Message
+	err := json.Unmarshal([]byte(`{
+		"id":"616934195205767730",
+		"reactions":[
+			{
+				"fromUserMid":"U-predefined",
+				"atMillis":"1784930400123",
+				"reactionType":{"predefinedReactionType":2}
+			},
+			{
+				"fromUserMid":"U-paid",
+				"atMillis":1784930400456,
+				"reactionType":{
+					"paidReactionType":{
+						"productId":"670e0cce840a8236ddd4ee4c",
+						"emojiId":"143",
+						"resourceType":1,
+						"version":1
+					}
+				}
+			}
+		]
+	}`), &msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.Reactions) != 2 {
+		t.Fatalf("reaction count = %d, want 2", len(msg.Reactions))
+	}
+	if got := msg.Reactions[0]; got.FromUserMID != "U-predefined" ||
+		got.AtMillis.String() != "1784930400123" ||
+		got.ReactionType.PredefinedReactionType != 2 {
+		t.Fatalf("predefined reaction = %#v", got)
+	}
+	paid := msg.Reactions[1]
+	if paid.FromUserMID != "U-paid" || paid.AtMillis.String() != "1784930400456" ||
+		paid.ReactionType.PaidReactionType == nil ||
+		paid.ReactionType.PaidReactionType.ProductID != "670e0cce840a8236ddd4ee4c" ||
+		paid.ReactionType.PaidReactionType.EmojiID != "143" {
+		t.Fatalf("paid reaction = %#v", paid)
+	}
+}
+
+func TestMessageDistinguishesMissingAndEmptyReactions(t *testing.T) {
+	var missing Message
+	if err := json.Unmarshal([]byte(`{"id":"missing"}`), &missing); err != nil {
+		t.Fatal(err)
+	}
+	if missing.Reactions != nil {
+		t.Fatalf("missing reactions decoded as %#v, want nil", missing.Reactions)
+	}
+
+	var empty Message
+	if err := json.Unmarshal([]byte(`{"id":"empty","reactions":[]}`), &empty); err != nil {
+		t.Fatal(err)
+	}
+	if empty.Reactions == nil || len(empty.Reactions) != 0 {
+		t.Fatalf("empty reactions decoded as %#v, want non-nil empty slice", empty.Reactions)
+	}
+}

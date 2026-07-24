@@ -66,6 +66,14 @@ type ReactionType struct {
 	PaidReactionType       *PaidReactionType `json:"paidReactionType,omitempty"`
 }
 
+// MessageReaction is a reaction embedded in a message returned by
+// getRecentMessagesV2.
+type MessageReaction struct {
+	FromUserMID  string       `json:"fromUserMid"`
+	AtMillis     json.Number  `json:"atMillis"`
+	ReactionType ReactionType `json:"reactionType"`
+}
+
 type ReactRequest struct {
 	ReqSeq       int          `json:"reqSeq"`
 	MessageID    string       `json:"messageId"`
