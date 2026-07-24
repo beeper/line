@@ -2353,10 +2353,21 @@ func makeMemberChangeEvent(
 }
 
 func (lc *LineClient) handleSelfLeave(chatMid string) {
+	selfID := string(lc.UserLogin.ID)
+	lc.handleSelfLeaveWithSender(chatMid, lc.eventSenderForMID(selfID))
+}
+
+func (lc *LineClient) handleSelfLeaveWithSender(chatMid string, changeSender bridgev2.EventSender) {
 	lc.cacheMu.Lock()
 	delete(lc.groupMemberCache, chatMid)
 	lc.cacheMu.Unlock()
-	lc.emitMemberChange(chatMid, string(lc.UserLogin.ID), event.MembershipLeave, time.Now())
+	lc.emitMemberChangeWithSender(
+		chatMid,
+		string(lc.UserLogin.ID),
+		event.MembershipLeave,
+		time.Now(),
+		changeSender,
+	)
 }
 
 func (lc *LineClient) handleMemberLeave(chatMid, leaverMid string) {
@@ -2373,10 +2384,7 @@ func (lc *LineClient) handleMemberLeaveWithSender(chatMid, leaverMid string, cha
 		return
 	}
 	if leaverMid == lc.Mid || leaverMid == string(lc.UserLogin.ID) {
-		lc.cacheMu.Lock()
-		delete(lc.groupMemberCache, chatMid)
-		lc.cacheMu.Unlock()
-		lc.emitMemberChangeWithSender(chatMid, string(lc.UserLogin.ID), event.MembershipLeave, time.Now(), changeSender)
+		lc.handleSelfLeaveWithSender(chatMid, changeSender)
 		return
 	}
 	lc.removeGroupMemberFromCache(chatMid, leaverMid)
