@@ -2340,8 +2340,8 @@ func makeMemberChangeEvent(
 		ChatInfoChange: &bridgev2.ChatInfoChange{
 			MemberChanges: &bridgev2.ChatMemberList{
 				ExcludeChangesFromTimeline: exclude,
-				Members: []bridgev2.ChatMember{
-					{
+				MemberMap: bridgev2.ChatMemberMap{
+					member.Sender: {
 						EventSender:      member,
 						Membership:       membership,
 						MemberEventExtra: hiddenMemberEventExtra(exclude),

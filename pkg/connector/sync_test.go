@@ -54,10 +54,12 @@ func TestMakeMemberChangeEventPreservesChangeSender(t *testing.T) {
 			if !evt.EventMeta.Timestamp.Equal(timestamp) {
 				t.Fatalf("timestamp = %s, want %s", evt.EventMeta.Timestamp, timestamp)
 			}
-			if changes := evt.ChatInfoChange.MemberChanges.Members; len(changes) != 1 {
+			if changes := evt.ChatInfoChange.MemberChanges.MemberMap; len(changes) != 1 {
 				t.Fatalf("member changes = %d, want 1", len(changes))
-			} else if changes[0].EventSender != member || changes[0].Membership != event.MembershipLeave {
-				t.Fatalf("member change = %#v, want member %#v to leave", changes[0], member)
+			} else if change, ok := changes[member.Sender]; !ok {
+				t.Fatalf("member change for %q not found", member.Sender)
+			} else if change.EventSender != member || change.Membership != event.MembershipLeave {
+				t.Fatalf("member change = %#v, want member %#v to leave", change, member)
 			}
 		})
 	}
