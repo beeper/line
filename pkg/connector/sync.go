@@ -2638,13 +2638,11 @@ func (lc *LineClient) queueHistoricalSystemMessage(msg *line.Message, opType int
 				return nil, bridgev2.ErrIgnoringRemoteEvent
 			}
 			if systemEvent != nil {
-				handleResult := portal.Internal().HandleRemoteChatInfoChange(ctx, lc.UserLogin, systemEvent)
-				if !handleResult.Success {
-					if handleResult.Error != nil {
-						return nil, handleResult.Error
-					}
-					return nil, errors.New("failed to apply historical system message")
+				change, err := systemEvent.GetChatInfoChange(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("get historical system message change: %w", err)
 				}
+				portal.ProcessChatInfoChange(ctx, systemEvent.GetSender(), lc.UserLogin, change, systemEvent.GetTimestamp())
 			}
 			return &bridgev2.ConvertedMessage{
 				Parts: []*bridgev2.ConvertedMessagePart{{
