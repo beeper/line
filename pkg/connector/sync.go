@@ -737,8 +737,7 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	// a hidden resync so a truncated recent-message window cannot leave a room
 	// at an old membership or name.
 	if backfilledSystemEvents.Load() && ctx.Err() == nil {
-		lc.wg.Add(1)
-		lc.syncChats(ctx)
+		lc.syncChatsNow(ctx)
 	}
 }
 
@@ -842,7 +841,10 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 
 func (lc *LineClient) syncChats(ctx context.Context) {
 	defer lc.wg.Done()
+	lc.syncChatsNow(ctx)
+}
 
+func (lc *LineClient) syncChatsNow(ctx context.Context) {
 	client := lc.newClient()
 	midsResp, err := client.GetAllChatMids(true, true)
 	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
@@ -2602,6 +2604,11 @@ func (lc *LineClient) handleSystemMessage(op line.Operation) bool {
 	systemEvent, handled := lc.makeSystemMessageEvent(op)
 	if systemEvent != nil {
 		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, systemEvent)
+	} else if !handled && op.Message != nil {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("loc_key", op.Message.ContentMetadata["LOC_KEY"]).
+			Str("chat_mid", op.Message.To).
+			Msg("Unhandled system message LOC_KEY")
 	}
 	return handled
 }

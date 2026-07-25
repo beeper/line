@@ -203,6 +203,16 @@ func lineSticonURL(productID, emojiID string) string {
 	return fmt.Sprintf("https://stickershop.line-scdn.net/sticonshop/v1/sticon/%s/android/%s.png", productID, emojiID)
 }
 
+func reactionUploadMXC(uploadedMXC string, uploadedFile *event.EncryptedFileInfo) (string, error) {
+	if uploadedFile != nil {
+		return "", errors.New("reaction icon upload returned encrypted media")
+	}
+	if uploadedMXC == "" {
+		return "", errors.New("reaction icon upload returned an empty MXC URI")
+	}
+	return uploadedMXC, nil
+}
+
 func (lc *LineClient) getPredefinedReactionMXC(ctx context.Context, prt int) (string, error) {
 	if _, ok := line.PredefinedReactionEmoji[prt]; !ok {
 		return "", fmt.Errorf("unknown predefined reaction type %d", prt)
@@ -223,12 +233,9 @@ func (lc *LineClient) getPredefinedReactionMXC(ctx context.Context, prt int) (st
 	if err != nil {
 		return "", fmt.Errorf("upload reaction icon: %w", err)
 	}
-	mxc = string(uploadedMXC)
-	if mxc == "" && uploadedFile != nil {
-		mxc = string(uploadedFile.URL)
-	}
-	if mxc == "" {
-		return "", errors.New("reaction icon upload returned an empty MXC URI")
+	mxc, err = reactionUploadMXC(string(uploadedMXC), uploadedFile)
+	if err != nil {
+		return "", err
 	}
 
 	lc.cacheMu.Lock()
@@ -277,12 +284,9 @@ func (lc *LineClient) getPaidReactionMXC(ctx context.Context, prt *line.PaidReac
 	if err != nil {
 		return "", fmt.Errorf("upload paid reaction icon: %w", err)
 	}
-	mxc = string(uploadedMXC)
-	if mxc == "" && uploadedFile != nil {
-		mxc = string(uploadedFile.URL)
-	}
-	if mxc == "" {
-		return "", errors.New("paid reaction icon upload returned an empty MXC URI")
+	mxc, err = reactionUploadMXC(string(uploadedMXC), uploadedFile)
+	if err != nil {
+		return "", fmt.Errorf("paid %w", err)
 	}
 
 	lc.cacheMu.Lock()
@@ -351,7 +355,7 @@ func (lc *LineClient) convertMessageReactions(ctx context.Context, msg *line.Mes
 }
 
 func (lc *LineClient) queueMessageReactionSync(ctx context.Context, chatMID string, msg *line.Message) bool {
-	if msg == nil || msg.Reactions == nil {
+	if msg == nil || ContentType(msg.ContentType) == ContentSystem || msg.Reactions == nil {
 		return false
 	}
 

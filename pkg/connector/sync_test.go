@@ -1,10 +1,12 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +159,32 @@ func TestHandledSystemMessageRejectsUnsupportedRecords(t *testing.T) {
 				t.Fatal("record was unexpectedly accepted as a handled system message")
 			}
 		})
+	}
+}
+
+func TestHandleSystemMessageLogsUnknownLocationKey(t *testing.T) {
+	var output bytes.Buffer
+	logger := zerolog.New(&output)
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{ID: "Uself"},
+			Bridge:    &bridgev2.Bridge{Log: logger},
+		},
+	}
+
+	handled := lc.handleSystemMessage(line.Operation{Message: &line.Message{
+		To:          "Cgroup",
+		ContentType: int(ContentSystem),
+		ContentMetadata: map[string]string{
+			"LOC_KEY": "C_UNKNOWN",
+		},
+	}})
+	if handled {
+		t.Fatal("unknown system message was marked handled")
+	}
+	logged := output.String()
+	if !strings.Contains(logged, "Unhandled system message LOC_KEY") || !strings.Contains(logged, "C_UNKNOWN") {
+		t.Fatalf("unknown LOC_KEY log = %q", logged)
 	}
 }
 

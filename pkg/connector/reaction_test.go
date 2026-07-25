@@ -573,6 +573,36 @@ func TestConvertMessageReactionsUsesEmbeddedHistory(t *testing.T) {
 	}
 }
 
+func TestReactionUploadMXCRejectsEncryptedMedia(t *testing.T) {
+	if mxc, err := reactionUploadMXC("mxc://line/plain", nil); err != nil || mxc != "mxc://line/plain" {
+		t.Fatalf("plain upload = %q, %v", mxc, err)
+	}
+	if _, err := reactionUploadMXC("mxc://line/encrypted", &event.EncryptedFileInfo{}); err == nil {
+		t.Fatal("encrypted upload was accepted without decryption metadata")
+	}
+	if _, err := reactionUploadMXC("", nil); err == nil {
+		t.Fatal("empty upload was accepted")
+	}
+}
+
+func TestQueueMessageReactionSyncSkipsSystemMarkers(t *testing.T) {
+	lc := &LineClient{}
+	msg := &line.Message{
+		ID:          "system-message",
+		ContentType: int(ContentSystem),
+		Reactions: []line.MessageReaction{{
+			FromUserMID: "Ureactor",
+			ReactionType: line.ReactionType{
+				PredefinedReactionType: 2,
+			},
+		}},
+	}
+
+	if lc.queueMessageReactionSync(context.Background(), "Cgroup", msg) {
+		t.Fatal("system-message marker unexpectedly queued a reaction sync")
+	}
+}
+
 func TestResolveReactionSenderMID(t *testing.T) {
 	lc := &LineClient{
 		UserLogin: &bridgev2.UserLogin{
