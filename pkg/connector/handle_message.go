@@ -170,9 +170,15 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 
 // isBridgeableContentType reports whether an inbound LINE message should be
 // bridged to Matrix. System messages (group created, member invited, etc.) are
-// skipped, but call and contact notifications are let through regardless of
-// content type because LINE may wrap them in non-standard content type values.
+// skipped, but post, call, and contact notifications are let through regardless
+// of content type because LINE may wrap them in non-standard content types.
 func isBridgeableContentType(msg *line.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if isPostNotification(msg) {
+		return true
+	}
 	switch ContentType(msg.ContentType) {
 	case ContentText, ContentImage, ContentVideo, ContentAudio,
 		ContentSticker, ContentContact, ContentFile, ContentLocation, ContentFlex:
@@ -180,6 +186,17 @@ func isBridgeableContentType(msg *line.Message) bool {
 	default:
 		return msg.ContentMetadata["ORGCONTP"] == "CALL" || msg.ContentMetadata["ORGCONTP"] == "CONTACT"
 	}
+}
+
+// isPostNotification reports whether a LINE message represents a note, album,
+// or another post notification. LINE sends native notifications as content
+// type 16 and shared notifications as text messages with ORGCONTP metadata.
+func isPostNotification(msg *line.Message) bool {
+	if msg == nil {
+		return false
+	}
+	return ContentType(msg.ContentType) == ContentPostNotification ||
+		msg.ContentMetadata["ORGCONTP"] == "POSTNOTIFICATION"
 }
 
 // portalMIDForMessage returns the chat MID that owns a message (the portal key).
@@ -354,6 +371,14 @@ func isLineDecryptFallbackText(text string) bool {
 func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, bodyText, unwrappedText string, decryptionFailed bool) (*bridgev2.ConvertedMessage, error) {
 	decryptedBody := bodyText
 	replyRelatesTo := lc.resolveReplyRelatesTo(ctx, &data)
+
+	// Handle LINE notes/albums before decryption failures and ordinary text
+	// conversion. Post metadata is unencrypted, so it remains useful even when
+	// a shared post's text fallback was marked as encrypted but could not be
+	// decrypted.
+	if isPostNotification(&data) {
+		return lc.newMessageHandler().ConvertPostNotification(data, replyRelatesTo)
+	}
 
 	if decryptionFailed && strings.TrimSpace(unwrappedText) == "" && ContentType(data.ContentType) == ContentText {
 		return &bridgev2.ConvertedMessage{
