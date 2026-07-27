@@ -122,32 +122,54 @@ func TestConvertLineMessageDispatchesSharedPostBeforeTextFallback(t *testing.T) 
 		},
 	}
 
-	converted, err := lc.convertLineMessage(
-		t.Context(),
-		nil,
-		nil,
-		data,
-		fallbackText,
-		fallbackText,
-		false,
-	)
-	if err != nil {
-		t.Fatalf("convertLineMessage returned error: %v", err)
-	}
-	if converted == nil || len(converted.Parts) != 1 || converted.Parts[0].Content == nil {
-		t.Fatalf("convertLineMessage returned %#v, want one message part", converted)
-	}
-	content := converted.Parts[0].Content
-	if content.MsgType != event.MsgNotice {
-		t.Fatalf("MsgType = %s, want %s", content.MsgType, event.MsgNotice)
-	}
-	if strings.Contains(content.Body, fallbackText) {
-		t.Fatalf("Body = %q, must not contain LINE's unsupported-client fallback", content.Body)
-	}
 	expectedBody := "You received a LINE note.\n\nPreview:\nShared note preview\n\n" +
 		"Open in LINE: https://line.me/R/group/home/posts/post?example=shared"
-	if content.Body != expectedBody {
-		t.Fatalf("Body = %q, want %q", content.Body, expectedBody)
+
+	tests := []struct {
+		name             string
+		bodyText         string
+		unwrappedText    string
+		decryptionFailed bool
+	}{
+		{
+			name:          "unsupported text fallback",
+			bodyText:      fallbackText,
+			unwrappedText: fallbackText,
+		},
+		{
+			name:             "decryption failure",
+			decryptionFailed: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			converted, err := lc.convertLineMessage(
+				t.Context(),
+				nil,
+				nil,
+				data,
+				test.bodyText,
+				test.unwrappedText,
+				test.decryptionFailed,
+			)
+			if err != nil {
+				t.Fatalf("convertLineMessage returned error: %v", err)
+			}
+			if converted == nil || len(converted.Parts) != 1 || converted.Parts[0].Content == nil {
+				t.Fatalf("convertLineMessage returned %#v, want one message part", converted)
+			}
+			content := converted.Parts[0].Content
+			if content.MsgType != event.MsgNotice {
+				t.Fatalf("MsgType = %s, want %s", content.MsgType, event.MsgNotice)
+			}
+			if strings.Contains(content.Body, fallbackText) {
+				t.Fatalf("Body = %q, must not contain LINE's unsupported-client fallback", content.Body)
+			}
+			if content.Body != expectedBody {
+				t.Fatalf("Body = %q, want %q", content.Body, expectedBody)
+			}
+		})
 	}
 }
 

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"html"
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -46,15 +47,24 @@ func (*Handler) ConvertPostNotification(data line.Message, relatesTo *event.Rela
 		body.WriteString("\n\nOpen LINE for full details.")
 	}
 
+	content := &event.MessageEventContent{
+		MsgType:   event.MsgNotice,
+		Body:      body.String(),
+		RelatesTo: relatesTo,
+	}
+	if postURL != "" {
+		plainPrefix := strings.TrimSuffix(content.Body, postURL)
+		escapedURL := html.EscapeString(postURL)
+		content.Format = event.FormatHTML
+		content.FormattedBody = strings.ReplaceAll(html.EscapeString(plainPrefix), "\n", "<br>") +
+			`<a href="` + escapedURL + `">` + escapedURL + `</a>`
+	}
+
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{
 			{
-				Type: event.EventMessage,
-				Content: &event.MessageEventContent{
-					MsgType:   event.MsgNotice,
-					Body:      body.String(),
-					RelatesTo: relatesTo,
-				},
+				Type:    event.EventMessage,
+				Content: content,
 			},
 		},
 	}, nil

@@ -12,9 +12,10 @@ import (
 func TestConvertPostNotification(t *testing.T) {
 	relatesTo := &event.RelatesTo{}
 	tests := []struct {
-		name     string
-		metadata map[string]string
-		expected string
+		name         string
+		metadata     map[string]string
+		expected     string
+		expectedHTML string
 	}{
 		{
 			name: "note with multiline preview and link",
@@ -25,16 +26,22 @@ func TestConvertPostNotification(t *testing.T) {
 			},
 			expected: "You received a LINE note.\n\nPreview:\nFirst line\nSecond line\n\n" +
 				"Open in LINE: https://line.me/R/group/home/posts/post?example=1",
+			expectedHTML: "You received a LINE note.<br><br>Preview:<br>First line<br>Second line<br><br>" +
+				`Open in LINE: <a href="https://line.me/R/group/home/posts/post?example=1">` +
+				"https://line.me/R/group/home/posts/post?example=1</a>",
 		},
 		{
-			name: "album with name and deep link",
+			name: "album with escaped name and deep link",
 			metadata: map[string]string{
 				"serviceType": "AB",
-				"albumName":   "Summer photos",
-				"postEndUrl":  "line://group/home/albums/album?example=1",
+				"albumName":   "Summer <photos>",
+				"postEndUrl":  "line://group/home/albums/album?example=1&source=chat",
 			},
-			expected: "LINE album update: Summer photos\n\n" +
-				"Open in LINE: line://group/home/albums/album?example=1",
+			expected: "LINE album update: Summer <photos>\n\n" +
+				"Open in LINE: line://group/home/albums/album?example=1&source=chat",
+			expectedHTML: "LINE album update: Summer &lt;photos&gt;<br><br>" +
+				`Open in LINE: <a href="line://group/home/albums/album?example=1&amp;source=chat">` +
+				"line://group/home/albums/album?example=1&amp;source=chat</a>",
 		},
 		{
 			name:     "missing metadata",
@@ -60,12 +67,12 @@ func TestConvertPostNotification(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ConvertPostNotification returned error: %v", err)
 			}
-			assertPostNotificationContent(t, converted, test.expected, relatesTo)
+			assertPostNotificationContent(t, converted, test.expected, test.expectedHTML, relatesTo)
 		})
 	}
 }
 
-func assertPostNotificationContent(t *testing.T, converted *bridgev2.ConvertedMessage, expectedBody string, relatesTo *event.RelatesTo) {
+func assertPostNotificationContent(t *testing.T, converted *bridgev2.ConvertedMessage, expectedBody, expectedHTML string, relatesTo *event.RelatesTo) {
 	t.Helper()
 	if converted == nil || len(converted.Parts) != 1 || converted.Parts[0].Content == nil {
 		t.Fatalf("converted = %#v, want one message part", converted)
@@ -79,6 +86,18 @@ func assertPostNotificationContent(t *testing.T, converted *bridgev2.ConvertedMe
 	}
 	if part.Content.Body != expectedBody {
 		t.Fatalf("body = %q, want %q", part.Content.Body, expectedBody)
+	}
+	if expectedHTML == "" {
+		if part.Content.Format != "" || part.Content.FormattedBody != "" {
+			t.Fatalf("formatted message = %q / %q, want plain text only", part.Content.Format, part.Content.FormattedBody)
+		}
+	} else {
+		if part.Content.Format != event.FormatHTML {
+			t.Fatalf("format = %q, want %q", part.Content.Format, event.FormatHTML)
+		}
+		if part.Content.FormattedBody != expectedHTML {
+			t.Fatalf("formatted body = %q, want %q", part.Content.FormattedBody, expectedHTML)
+		}
 	}
 	if part.Content.RelatesTo != relatesTo {
 		t.Fatalf("relates_to = %#v, want original pointer %#v", part.Content.RelatesTo, relatesTo)

@@ -372,6 +372,14 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 	decryptedBody := bodyText
 	replyRelatesTo := lc.resolveReplyRelatesTo(ctx, &data)
 
+	// Handle LINE notes/albums before decryption failures and ordinary text
+	// conversion. Post metadata is unencrypted, so it remains useful even when
+	// a shared post's text fallback was marked as encrypted but could not be
+	// decrypted.
+	if isPostNotification(&data) {
+		return lc.newMessageHandler().ConvertPostNotification(data, replyRelatesTo)
+	}
+
 	if decryptionFailed && strings.TrimSpace(unwrappedText) == "" && ContentType(data.ContentType) == ContentText {
 		return &bridgev2.ConvertedMessage{
 			Parts: []*bridgev2.ConvertedMessagePart{
@@ -388,13 +396,6 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 	}
 
 	h := lc.newMessageHandler()
-
-	// Handle LINE notes/albums before ordinary text conversion. Shared posts
-	// arrive as contentType 0 with LINE's unsupported-client fallback in Text,
-	// while the useful preview and link are in ContentMetadata.
-	if isPostNotification(&data) {
-		return h.ConvertPostNotification(data, replyRelatesTo)
-	}
 
 	// Handle call events (ORGCONTP == "CALL")
 	if data.ContentMetadata["ORGCONTP"] == "CALL" {
