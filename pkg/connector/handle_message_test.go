@@ -122,8 +122,7 @@ func TestConvertLineMessageDispatchesSharedPostBeforeTextFallback(t *testing.T) 
 		},
 	}
 
-	expectedBody := "You received a LINE note.\n\nPreview:\nShared note preview\n\n" +
-		"Open in LINE: https://line.me/R/group/home/posts/post?example=shared"
+	expectedBody := "You received a LINE note.\n\nPreview:\nShared note preview"
 
 	tests := []struct {
 		name             string

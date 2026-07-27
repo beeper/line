@@ -88,6 +88,50 @@ func TestDownloadOBSPlainMatchesChromeRequestFlow(t *testing.T) {
 	}
 }
 
+func TestDownloadOBSResourceUsesReceiveServiceAndSID(t *testing.T) {
+	installCachedOBSToken(t)
+
+	var requests []observedOBSRequest
+	client := NewClient("line-token")
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests = append(requests, observedOBSRequest{
+				path:    req.URL.Path,
+				headers: req.Header.Clone(),
+			})
+			if len(requests) == 1 {
+				return obsResponse(http.StatusOK, `{"status":"exist","encodeStatus":"done"}`), nil
+			}
+			return obsResponse(http.StatusOK, "album-image"), nil
+		}),
+	}
+
+	data, err := client.DownloadOBSResource(context.Background(), "album", "a", "preview-oid", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "album-image" {
+		t.Fatalf("data = %q, want album-image", data)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want object-info preflight plus download", len(requests))
+	}
+	if requests[0].path != "/r/album/a/preview-oid/object_info.obs" || requests[1].path != "/r/album/a/preview-oid" {
+		t.Fatalf("request paths = %q / %q", requests[0].path, requests[1].path)
+	}
+	for i, req := range requests {
+		if req.headers.Get("X-Line-Access") != "obs-token" {
+			t.Fatalf("request %d X-Line-Access = %q", i, req.headers.Get("X-Line-Access"))
+		}
+		if req.headers.Get("X-Line-Application") != lineApplicationHeader {
+			t.Fatalf("request %d X-Line-Application = %q, want %q", i, req.headers.Get("X-Line-Application"), lineApplicationHeader)
+		}
+		if req.headers.Get("X-Talk-Meta") != "" {
+			t.Fatalf("album request %d unexpectedly sent X-Talk-Meta", i)
+		}
+	}
+}
+
 func TestDownloadOBSPreflightsBaseObjectBeforeTID(t *testing.T) {
 	installCachedOBSToken(t)
 
@@ -290,5 +334,140 @@ func TestDownloadOBSClassifiesEncodingRetryExhaustion(t *testing.T) {
 	}
 	if requests != obsMaxRetries+1 {
 		t.Fatalf("requests = %d, want %d", requests, obsMaxRetries+1)
+	}
+}
+
+func TestDownloadAlbumPreviewMatchesLINERequestContract(t *testing.T) {
+	var channelRequests int
+	client := NewClient("line-token")
+	client.HTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			channelRequests++
+			if req.URL.Path != "/api/talk/thrift/Talk/ChannelService/issueChannelToken" {
+				t.Fatalf("channel token path = %q", req.URL.Path)
+			}
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != `["1341209850"]` {
+				t.Fatalf("channel token body = %q", body)
+			}
+			return obsResponse(
+				http.StatusOK,
+				`{"code":0,"message":"OK","data":{"channelAccessToken":"channel-token","expiration":9999999999999}}`,
+			), nil
+		}),
+	}
+
+	var requests []observedOBSRequest
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests = append(requests, observedOBSRequest{
+				path:    req.URL.Path,
+				query:   req.URL.RawQuery,
+				headers: req.Header.Clone(),
+			})
+			return obsResponse(http.StatusOK, "album-thumbnail"), nil
+		}),
+	}
+
+	for range 2 {
+		data, err := client.DownloadAlbumPreview(
+			context.Background(),
+			"preview-oid",
+			"chat-id",
+			"album-id",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "album-thumbnail" {
+			t.Fatalf("data = %q, want album-thumbnail", data)
+		}
+	}
+
+	if channelRequests != 1 {
+		t.Fatalf("channel token requests = %d, want one cached request", channelRequests)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("OBS requests = %d, want two direct thumbnail downloads", len(requests))
+	}
+	for index, request := range requests {
+		if request.path != "/r/album/a/preview-oid/f482x482" {
+			t.Fatalf("request %d path = %q", index, request.path)
+		}
+		if request.query != "" {
+			t.Fatalf("request %d query = %q, want empty", index, request.query)
+		}
+		if request.headers.Get("X-Line-ChannelToken") != "channel-token" {
+			t.Fatalf("request %d channel token = %q", index, request.headers.Get("X-Line-ChannelToken"))
+		}
+		if request.headers.Get("X-Line-Mid") != "chat-id" {
+			t.Fatalf("request %d MID = %q", index, request.headers.Get("X-Line-Mid"))
+		}
+		if request.headers.Get("X-Line-Album") != "album-id" {
+			t.Fatalf("request %d album = %q", index, request.headers.Get("X-Line-Album"))
+		}
+		if request.headers.Get("X-Line-Access") != "line-token" {
+			t.Fatalf("request %d access token = %q", index, request.headers.Get("X-Line-Access"))
+		}
+		if request.headers.Get("User-Agent") == "" {
+			t.Fatalf("request %d omitted User-Agent", index)
+		}
+		if request.headers.Get("X-Line-Application") != "" {
+			t.Fatalf("request %d unexpectedly sent X-Line-Application", index)
+		}
+	}
+}
+
+func TestDownloadAlbumPreviewClassifiesHTTPStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		check  func(error) bool
+	}{
+		{
+			name:   "encoding incomplete",
+			status: http.StatusAccepted,
+			check:  func(err error) bool { return errors.Is(err, ErrOBSEncodingIncomplete) },
+		},
+		{
+			name:   "missing object",
+			status: http.StatusNotFound,
+			check:  func(err error) bool { return errors.Is(err, ErrOBSObjectNotFound) },
+		},
+		{
+			name:   "unauthorized",
+			status: http.StatusForbidden,
+			check:  IsUnauthorizedStatus,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := NewClient("line-token")
+			client.channelTokenCache = map[string]cachedChannelAccessToken{
+				albumPreviewChannelID: {
+					token:     "channel-token",
+					expiresAt: time.Now().Add(time.Hour),
+				},
+			}
+			client.OBSClient = &http.Client{
+				Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return obsResponse(test.status, "error"), nil
+				}),
+			}
+
+			_, err := client.DownloadAlbumPreview(
+				context.Background(),
+				"preview-oid",
+				"chat-id",
+				"",
+			)
+			if !test.check(err) {
+				t.Fatalf("err = %v, wrong classification", err)
+			}
+		})
 	}
 }

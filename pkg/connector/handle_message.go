@@ -377,7 +377,7 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 	// a shared post's text fallback was marked as encrypted but could not be
 	// decrypted.
 	if isPostNotification(&data) {
-		return lc.newMessageHandler().ConvertPostNotification(data, replyRelatesTo)
+		return lc.newMessageHandler().ConvertPostNotification(ctx, portal, intent, data, replyRelatesTo)
 	}
 
 	if decryptionFailed && strings.TrimSpace(unwrappedText) == "" && ContentType(data.ContentType) == ContentText {

@@ -29,8 +29,21 @@ type Handler struct {
 	// NewClient creates a new LINE API client with the current access token.
 	NewClient func() *line.Client
 
+	// DownloadOBSResource overrides non-talk OBS downloads in tests.
+	DownloadOBSResource func(ctx context.Context, client *line.Client, service, sid, oid string) ([]byte, error)
+
+	// DownloadAlbumPreview overrides album thumbnail downloads in tests.
+	DownloadAlbumPreview func(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error)
+
 	// DecryptMedia decrypts E2EE encrypted media data using the given key material.
 	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
+}
+
+func (h *Handler) downloadAlbumPreview(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error) {
+	if h.DownloadAlbumPreview != nil {
+		return h.DownloadAlbumPreview(ctx, client, oid, chatID, albumID)
+	}
+	return client.DownloadAlbumPreview(ctx, oid, chatID, albumID)
 }
 
 func obsTalkMetaMessageID(messageID string, isPlainMedia bool) string {
