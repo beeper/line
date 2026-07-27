@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	gen "github.com/highesttt/matrix-line-messenger/pkg"
@@ -29,6 +30,8 @@ const (
 	rpcClientTimeout      = 30 * time.Second
 	obsMaxRetries         = 5
 	lineApplicationHeader = "CHROMEOS\t" + ExtensionVersion + "\tChrome_OS\t"
+	albumPreviewChannelID = "1341209850"
+	albumPreviewTID       = "f482x482"
 )
 
 var (
@@ -43,11 +46,19 @@ type Client struct {
 	HTTPClient  *http.Client
 	OBSClient   *http.Client
 	AccessToken string
+
+	channelTokenMu    sync.Mutex
+	channelTokenCache map[string]cachedChannelAccessToken
 }
 
 type OBSDownloadOptions struct {
 	TID    string
 	OBSPop string
+}
+
+type cachedChannelAccessToken struct {
+	token     string
+	expiresAt time.Time
 }
 
 func NewClient(token string) *Client {
@@ -710,6 +721,59 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 // and SID "a".
 func (c *Client) DownloadOBSResource(ctx context.Context, service, sid, oid, messageID string) ([]byte, error) {
 	return c.downloadOBSWithServiceAndSIDOptions(ctx, service, sid, oid, messageID, OBSDownloadOptions{})
+}
+
+// DownloadAlbumPreview retrieves the thumbnail referenced by an album post
+// notification. Album thumbnails use a dedicated TID and are authorized by the
+// notification's chatId through LINE's Chrome home channel token.
+func (c *Client) DownloadAlbumPreview(ctx context.Context, oid, chatID, albumID string) ([]byte, error) {
+	if oid == "" || chatID == "" {
+		return nil, errors.New("album preview OID and chat ID are required")
+	}
+	channelToken, err := c.AcquireChannelAccessToken(albumPreviewChannelID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire album preview channel token: %w", err)
+	}
+
+	requestURL := fmt.Sprintf(
+		"%s/r/album/a/%s/%s",
+		OBSBaseURL,
+		url.PathEscape(oid),
+		albumPreviewTID,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create album preview request: %w", err)
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("X-Line-ChannelToken", channelToken)
+	req.Header.Set("X-Line-Mid", chatID)
+	if albumID != "" {
+		req.Header.Set("X-Line-Album", albumID)
+	}
+	if c.AccessToken != "" {
+		req.Header.Set("X-Line-Access", c.AccessToken)
+	}
+
+	resp, err := c.obsHTTPClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("OBS download request failed: %w", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read OBS response body: %w", readErr)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return body, nil
+	case http.StatusAccepted:
+		return nil, ErrOBSEncodingIncomplete
+	case http.StatusNotFound:
+		return nil, ErrOBSObjectNotFound
+	default:
+		return nil, fmt.Errorf("OBS download failed (%d): %s", resp.StatusCode, string(body))
+	}
 }
 
 func (c *Client) downloadOBSWithServiceAndSIDOptions(ctx context.Context, service, sid, oid, messageID string, opts OBSDownloadOptions) ([]byte, error) {

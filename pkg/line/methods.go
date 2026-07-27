@@ -19,6 +19,8 @@ var (
 
 const obsTokenBuffer = 30 * time.Second
 
+const defaultChannelTokenLifetime = 5 * time.Minute
+
 // InvalidateOBSTokenCache clears the cached OBS access token. The OBS token is
 // derived from the main LINE access token; when the latter is rotated (refresh
 // or re-login) any previously-issued OBS token is invalidated server-side, but
@@ -712,6 +714,94 @@ func (c *Client) AcquireEncryptedAccessToken() (string, error) {
 	}
 
 	return token, nil
+}
+
+// AcquireChannelAccessToken returns a cached token for an official LINE
+// channel, issuing one through ChannelService when necessary.
+func (c *Client) AcquireChannelAccessToken(channelID string) (string, error) {
+	if channelID == "" {
+		return "", fmt.Errorf("channel ID is required")
+	}
+
+	c.channelTokenMu.Lock()
+	defer c.channelTokenMu.Unlock()
+
+	now := time.Now()
+	if cached, ok := c.channelTokenCache[channelID]; ok &&
+		cached.token != "" &&
+		now.Before(cached.expiresAt) {
+		return cached.token, nil
+	}
+
+	resp, err := c.callRPC("ChannelService", "issueChannelToken", channelID)
+	if err != nil {
+		return "", err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			ChannelAccessToken string          `json:"channelAccessToken"`
+			Expiration         json.RawMessage `json:"expiration"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(resp, &wrapper); err != nil {
+		return "", fmt.Errorf("failed to decode issueChannelToken response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return "", fmt.Errorf("issueChannelToken API error: %s", wrapper.Message)
+	}
+	if wrapper.Data.ChannelAccessToken == "" {
+		return "", fmt.Errorf("issueChannelToken returned an empty token")
+	}
+
+	expiresAt := parseChannelTokenExpiration(wrapper.Data.Expiration, now)
+	if c.channelTokenCache == nil {
+		c.channelTokenCache = make(map[string]cachedChannelAccessToken)
+	}
+	c.channelTokenCache[channelID] = cachedChannelAccessToken{
+		token:     wrapper.Data.ChannelAccessToken,
+		expiresAt: expiresAt,
+	}
+	return wrapper.Data.ChannelAccessToken, nil
+}
+
+func parseChannelTokenExpiration(raw json.RawMessage, now time.Time) time.Time {
+	fallback := now.Add(defaultChannelTokenLifetime)
+	if len(raw) == 0 || string(raw) == "null" {
+		return fallback
+	}
+
+	var numericValue int64
+	if err := json.Unmarshal(raw, &numericValue); err != nil {
+		var stringValue string
+		if err = json.Unmarshal(raw, &stringValue); err != nil {
+			return fallback
+		}
+		if parsedTime, parseErr := time.Parse(time.RFC3339, stringValue); parseErr == nil {
+			return parsedTime.Add(-obsTokenBuffer)
+		}
+		numericValue, err = strconv.ParseInt(stringValue, 10, 64)
+		if err != nil {
+			return fallback
+		}
+	}
+
+	var expiresAt time.Time
+	switch {
+	case numericValue > 100_000_000_000:
+		expiresAt = time.UnixMilli(numericValue)
+	case numericValue > 1_000_000_000:
+		expiresAt = time.Unix(numericValue, 0)
+	case numericValue > 0:
+		expiresAt = now.Add(time.Duration(numericValue) * time.Second)
+	default:
+		return fallback
+	}
+	if expiresAt.Before(now.Add(obsTokenBuffer)) {
+		return fallback
+	}
+	return expiresAt.Add(-obsTokenBuffer)
 }
 
 func (c *Client) GetMessageBoxes(options MessageBoxesOptions) (*MessageBoxesResponse, error) {
