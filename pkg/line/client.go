@@ -702,9 +702,29 @@ func (c *Client) DownloadOBSWithSID(ctx context.Context, oid string, messageID s
 }
 
 func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, messageID string, sid string, opts OBSDownloadOptions) ([]byte, error) {
-	// URL structure: https://obs.line-apps.com/r/talk/{SID}/{OID}
-	// SID: emi (images), emv (videos), ema (audio), emf (files)
-	obsURL := fmt.Sprintf("%s/r/talk/%s/%s", OBSBaseURL, sid, oid)
+	return c.downloadOBSWithServiceAndSIDOptions(ctx, "talk", sid, oid, messageID, opts)
+}
+
+// DownloadOBSResource retrieves a non-talk resource using the service, SID,
+// and OID supplied by LINE metadata. Album post previews use service "album"
+// and SID "a".
+func (c *Client) DownloadOBSResource(ctx context.Context, service, sid, oid, messageID string) ([]byte, error) {
+	return c.downloadOBSWithServiceAndSIDOptions(ctx, service, sid, oid, messageID, OBSDownloadOptions{})
+}
+
+func (c *Client) downloadOBSWithServiceAndSIDOptions(ctx context.Context, service, sid, oid, messageID string, opts OBSDownloadOptions) ([]byte, error) {
+	if service == "" || sid == "" || oid == "" {
+		return nil, errors.New("OBS service, SID, and OID are required")
+	}
+
+	// URL structure: https://obs.line-apps.com/r/{service}/{SID}/{OID}
+	obsURL := fmt.Sprintf(
+		"%s/r/%s/%s/%s",
+		OBSBaseURL,
+		url.PathEscape(service),
+		url.PathEscape(sid),
+		url.PathEscape(oid),
+	)
 	objectInfoURL := obsURL
 	if opts.TID != "" {
 		obsURL += "/" + url.PathEscape(opts.TID)

@@ -88,6 +88,50 @@ func TestDownloadOBSPlainMatchesChromeRequestFlow(t *testing.T) {
 	}
 }
 
+func TestDownloadOBSResourceUsesReceiveServiceAndSID(t *testing.T) {
+	installCachedOBSToken(t)
+
+	var requests []observedOBSRequest
+	client := NewClient("line-token")
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests = append(requests, observedOBSRequest{
+				path:    req.URL.Path,
+				headers: req.Header.Clone(),
+			})
+			if len(requests) == 1 {
+				return obsResponse(http.StatusOK, `{"status":"exist","encodeStatus":"done"}`), nil
+			}
+			return obsResponse(http.StatusOK, "album-image"), nil
+		}),
+	}
+
+	data, err := client.DownloadOBSResource(context.Background(), "album", "a", "preview-oid", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "album-image" {
+		t.Fatalf("data = %q, want album-image", data)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want object-info preflight plus download", len(requests))
+	}
+	if requests[0].path != "/r/album/a/preview-oid/object_info.obs" || requests[1].path != "/r/album/a/preview-oid" {
+		t.Fatalf("request paths = %q / %q", requests[0].path, requests[1].path)
+	}
+	for i, req := range requests {
+		if req.headers.Get("X-Line-Access") != "obs-token" {
+			t.Fatalf("request %d X-Line-Access = %q", i, req.headers.Get("X-Line-Access"))
+		}
+		if req.headers.Get("X-Line-Application") != lineApplicationHeader {
+			t.Fatalf("request %d X-Line-Application = %q, want %q", i, req.headers.Get("X-Line-Application"), lineApplicationHeader)
+		}
+		if req.headers.Get("X-Talk-Meta") != "" {
+			t.Fatalf("album request %d unexpectedly sent X-Talk-Meta", i)
+		}
+	}
+}
+
 func TestDownloadOBSPreflightsBaseObjectBeforeTID(t *testing.T) {
 	installCachedOBSToken(t)
 
