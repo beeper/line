@@ -170,9 +170,15 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 
 // isBridgeableContentType reports whether an inbound LINE message should be
 // bridged to Matrix. System messages (group created, member invited, etc.) are
-// skipped, but call and contact notifications are let through regardless of
-// content type because LINE may wrap them in non-standard content type values.
+// skipped, but post, call, and contact notifications are let through regardless
+// of content type because LINE may wrap them in non-standard content types.
 func isBridgeableContentType(msg *line.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if isPostNotification(msg) {
+		return true
+	}
 	switch ContentType(msg.ContentType) {
 	case ContentText, ContentImage, ContentVideo, ContentAudio,
 		ContentSticker, ContentContact, ContentFile, ContentLocation, ContentFlex:
@@ -180,6 +186,17 @@ func isBridgeableContentType(msg *line.Message) bool {
 	default:
 		return msg.ContentMetadata["ORGCONTP"] == "CALL" || msg.ContentMetadata["ORGCONTP"] == "CONTACT"
 	}
+}
+
+// isPostNotification reports whether a LINE message represents a note, album,
+// or another post notification. LINE sends native notifications as content
+// type 16 and shared notifications as text messages with ORGCONTP metadata.
+func isPostNotification(msg *line.Message) bool {
+	if msg == nil {
+		return false
+	}
+	return ContentType(msg.ContentType) == ContentPostNotification ||
+		msg.ContentMetadata["ORGCONTP"] == "POSTNOTIFICATION"
 }
 
 // portalMIDForMessage returns the chat MID that owns a message (the portal key).
@@ -371,6 +388,13 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 	}
 
 	h := lc.newMessageHandler()
+
+	// Handle LINE notes/albums before ordinary text conversion. Shared posts
+	// arrive as contentType 0 with LINE's unsupported-client fallback in Text,
+	// while the useful preview and link are in ContentMetadata.
+	if isPostNotification(&data) {
+		return h.ConvertPostNotification(data, replyRelatesTo)
+	}
 
 	// Handle call events (ORGCONTP == "CALL")
 	if data.ContentMetadata["ORGCONTP"] == "CALL" {

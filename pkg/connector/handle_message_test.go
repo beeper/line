@@ -32,6 +32,125 @@ func (m *inlineEmojiTestMatrix) UploadMedia(_ context.Context, _ id.RoomID, _ []
 	return "mxc://example/custom-emoji", nil, nil
 }
 
+func TestPostNotificationClassification(t *testing.T) {
+	tests := []struct {
+		name           string
+		message        *line.Message
+		wantPost       bool
+		wantBridgeable bool
+	}{
+		{
+			name:           "nil message",
+			message:        nil,
+			wantPost:       false,
+			wantBridgeable: false,
+		},
+		{
+			name:           "native post notification",
+			message:        &line.Message{ContentType: int(ContentPostNotification)},
+			wantPost:       true,
+			wantBridgeable: true,
+		},
+		{
+			name: "shared post notification",
+			message: &line.Message{
+				ContentType: int(ContentText),
+				ContentMetadata: map[string]string{
+					"ORGCONTP": "POSTNOTIFICATION",
+				},
+			},
+			wantPost:       true,
+			wantBridgeable: true,
+		},
+		{
+			name:           "ordinary text",
+			message:        &line.Message{ContentType: int(ContentText)},
+			wantPost:       false,
+			wantBridgeable: true,
+		},
+		{
+			name: "post notification in unknown wrapper",
+			message: &line.Message{
+				ContentType: 99,
+				ContentMetadata: map[string]string{
+					"ORGCONTP": "POSTNOTIFICATION",
+				},
+			},
+			wantPost:       true,
+			wantBridgeable: true,
+		},
+		{
+			name: "unrelated system message",
+			message: &line.Message{
+				ContentType: int(ContentSystem),
+				ContentMetadata: map[string]string{
+					"LOC_KEY": "BD",
+				},
+			},
+			wantPost:       false,
+			wantBridgeable: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isPostNotification(test.message); got != test.wantPost {
+				t.Fatalf("isPostNotification() = %t, want %t", got, test.wantPost)
+			}
+			if got := isBridgeableContentType(test.message); got != test.wantBridgeable {
+				t.Fatalf("isBridgeableContentType() = %t, want %t", got, test.wantBridgeable)
+			}
+		})
+	}
+}
+
+func TestConvertLineMessageDispatchesSharedPostBeforeTextFallback(t *testing.T) {
+	const fallbackText = "Your version of LINE doesn't support this type of message."
+	data := line.Message{
+		ContentType: int(ContentText),
+		Text:        fallbackText,
+		ContentMetadata: map[string]string{
+			"ORGCONTP":    "POSTNOTIFICATION",
+			"serviceType": "GB",
+			"text":        "Shared note preview",
+			"postEndUrl":  "https://line.me/R/group/home/posts/post?example=shared",
+		},
+	}
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
+		},
+	}
+
+	converted, err := lc.convertLineMessage(
+		t.Context(),
+		nil,
+		nil,
+		data,
+		fallbackText,
+		fallbackText,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("convertLineMessage returned error: %v", err)
+	}
+	if converted == nil || len(converted.Parts) != 1 || converted.Parts[0].Content == nil {
+		t.Fatalf("convertLineMessage returned %#v, want one message part", converted)
+	}
+	content := converted.Parts[0].Content
+	if content.MsgType != event.MsgNotice {
+		t.Fatalf("MsgType = %s, want %s", content.MsgType, event.MsgNotice)
+	}
+	if strings.Contains(content.Body, fallbackText) {
+		t.Fatalf("Body = %q, must not contain LINE's unsupported-client fallback", content.Body)
+	}
+	expectedBody := "You received a LINE note.\n\nPreview:\nShared note preview\n\n" +
+		"Open in LINE: https://line.me/R/group/home/posts/post?example=shared"
+	if content.Body != expectedBody {
+		t.Fatalf("Body = %q, want %q", content.Body, expectedBody)
+	}
+}
+
 func TestConvertLineMessageRendersPlaintextCustomEmoji(t *testing.T) {
 	const (
 		emtver4Token = "\U00100101\U00100211yoo-hoo\U0010ffff"
