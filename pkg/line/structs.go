@@ -109,6 +109,8 @@ type Message struct {
 	RelatedMessageID          string `json:"relatedMessageId,omitempty"`
 	MessageRelationType       int    `json:"messageRelationType,omitempty"`
 	RelatedMessageServiceCode int    `json:"relatedMessageServiceCode,omitempty"`
+
+	Reactions []MessageReaction `json:"reactions,omitempty"`
 }
 
 // E2EEPublicKey represents the peer key returned by negotiateE2EEPublicKey

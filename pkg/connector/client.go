@@ -79,6 +79,7 @@ type LineClient struct {
 	generatedGroupNameCache map[string]bool     // chatMid -> true when Matrix name should be generated from member names
 	knownMemberChatMIDs     map[string]struct{} // chatMid -> current member chats returned by getAllChatMids
 	reactionIconMXC         map[int]string      // predefinedReactionType -> cached MXC URI
+	paidReactionIconMXC     map[string]string   // LINE sticon URL -> cached MXC URI
 	recentReactions         sync.Map            // "msgID\x00emoji" -> struct{} to dedup concurrent 139/140 events
 	unblockBackfills        sync.Map            // chat MID -> *unblockBackfillState while unblock history restoration is active
 
@@ -651,8 +652,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	// deliver messages. Otherwise an existing LINE group whose Matrix room
 	// doesn't exist yet may be created by the first message, which makes the
 	// sender's existing membership look like a fresh join.
-	lc.wg.Add(1)
-	lc.syncChats(ctx)
+	lc.syncChatsNow(ctx)
 	if ctx.Err() != nil {
 		return
 	}

@@ -2,10 +2,13 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -513,6 +516,90 @@ func TestEventSenderForMIDMarksOwnAccount(t *testing.T) {
 	}
 	if other.Sender != networkid.UserID("other-mid") {
 		t.Fatalf("other sender ID = %q", other.Sender)
+	}
+}
+
+func TestConvertMessageReactionsUsesEmbeddedHistory(t *testing.T) {
+	paidType := &line.PaidReactionType{
+		ProductID: "paid-product",
+		EmojiID:   "paid-emoji",
+	}
+	lc := &LineClient{
+		Mid: "Uself",
+		UserLogin: &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{ID: "Uself"},
+			Bridge:    &bridgev2.Bridge{Log: zerolog.Nop()},
+		},
+		reactionIconMXC: map[int]string{
+			2: "mxc://line/like",
+		},
+		paidReactionIconMXC: map[string]string{
+			lineSticonURL(paidType.ProductID, paidType.EmojiID): "mxc://line/paid",
+		},
+	}
+	msg := &line.Message{
+		ID: "message-id",
+		Reactions: []line.MessageReaction{
+			{
+				FromUserMID: "Uself",
+				AtMillis:    json.Number("1784930400123"),
+				ReactionType: line.ReactionType{
+					PredefinedReactionType: 2,
+				},
+			},
+			{
+				FromUserMID:  "Uother",
+				AtMillis:     json.Number("1784930400456"),
+				ReactionType: line.ReactionType{PaidReactionType: paidType},
+			},
+		},
+	}
+
+	reactions, complete := lc.convertMessageReactions(context.Background(), msg)
+	if !complete {
+		t.Fatal("reaction conversion was unexpectedly incomplete")
+	}
+	if len(reactions) != 2 {
+		t.Fatalf("reaction count = %d, want 2", len(reactions))
+	}
+	if reactions[0].Emoji != "mxc://line/like" || reactions[0].Sender.Sender != "Uself" || !reactions[0].Sender.IsFromMe {
+		t.Fatalf("predefined reaction = %#v", reactions[0])
+	}
+	if want := time.UnixMilli(1784930400123); !reactions[0].Timestamp.Equal(want) {
+		t.Fatalf("predefined reaction timestamp = %s, want %s", reactions[0].Timestamp, want)
+	}
+	if reactions[1].Emoji != "mxc://line/paid" || reactions[1].Sender.Sender != "Uother" || reactions[1].Sender.IsFromMe {
+		t.Fatalf("paid reaction = %#v", reactions[1])
+	}
+}
+
+func TestReactionUploadMXCRejectsEncryptedMedia(t *testing.T) {
+	if mxc, err := reactionUploadMXC("mxc://line/plain", nil); err != nil || mxc != "mxc://line/plain" {
+		t.Fatalf("plain upload = %q, %v", mxc, err)
+	}
+	if _, err := reactionUploadMXC("mxc://line/encrypted", &event.EncryptedFileInfo{}); err == nil {
+		t.Fatal("encrypted upload was accepted without decryption metadata")
+	}
+	if _, err := reactionUploadMXC("", nil); err == nil {
+		t.Fatal("empty upload was accepted")
+	}
+}
+
+func TestQueueMessageReactionSyncSkipsSystemMarkers(t *testing.T) {
+	lc := &LineClient{}
+	msg := &line.Message{
+		ID:          "system-message",
+		ContentType: int(ContentSystem),
+		Reactions: []line.MessageReaction{{
+			FromUserMID: "Ureactor",
+			ReactionType: line.ReactionType{
+				PredefinedReactionType: 2,
+			},
+		}},
+	}
+
+	if lc.queueMessageReactionSync(context.Background(), "Cgroup", msg) {
+		t.Fatal("system-message marker unexpectedly queued a reaction sync")
 	}
 }
 

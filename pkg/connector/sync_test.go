@@ -1,9 +1,12 @@
 package connector
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +65,126 @@ func TestMakeMemberChangeEventPreservesChangeSender(t *testing.T) {
 				t.Fatalf("member change = %#v, want member %#v to leave", change, member)
 			}
 		})
+	}
+}
+
+func TestMakeSystemMessageEventForHistoricalMembership(t *testing.T) {
+	lc := &LineClient{
+		Mid: "Uself",
+		UserLogin: &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{ID: "Uself"},
+			Bridge:    &bridgev2.Bridge{Log: zerolog.Nop()},
+		},
+	}
+	timestamp := time.UnixMilli(1784930400123)
+
+	invite, handled := lc.makeSystemMessageEvent(line.Operation{Message: &line.Message{
+		ID:          "invite-message",
+		From:        "Uinviter",
+		To:          "Cgroup",
+		ContentType: int(ContentSystem),
+		CreatedTime: json.Number("1784930400123"),
+		ContentMetadata: map[string]string{
+			"LOC_KEY":  "C_MI",
+			"LOC_ARGS": "Uinviter\x1eUinvitee",
+		},
+	}})
+	if !handled || invite == nil {
+		t.Fatalf("invite handled/event = %v/%#v, want true/non-nil", handled, invite)
+	}
+	if !invite.EventMeta.Timestamp.Equal(timestamp) {
+		t.Fatalf("invite timestamp = %s, want %s", invite.EventMeta.Timestamp, timestamp)
+	}
+	inviteChange, ok := invite.ChatInfoChange.MemberChanges.MemberMap["Uinvitee"]
+	if !ok || inviteChange.Membership != event.MembershipInvite {
+		t.Fatalf("invite member change = %#v", invite.ChatInfoChange.MemberChanges.MemberMap)
+	}
+
+	leave, handled := lc.makeSystemMessageEvent(line.Operation{Message: &line.Message{
+		ID:          "leave-message",
+		From:        "Uleaver",
+		To:          "Cgroup",
+		ContentType: int(ContentSystem),
+		CreatedTime: json.Number("1784930400123"),
+		ContentMetadata: map[string]string{
+			"LOC_KEY": "C_ML",
+		},
+	}})
+	if !handled || leave == nil {
+		t.Fatalf("leave handled/event = %v/%#v, want true/non-nil", handled, leave)
+	}
+	if leave.EventMeta.Sender.Sender != "Uleaver" {
+		t.Fatalf("voluntary leave sender = %q, want Uleaver", leave.EventMeta.Sender.Sender)
+	}
+	leaveChange, ok := leave.ChatInfoChange.MemberChanges.MemberMap["Uleaver"]
+	if !ok || leaveChange.Membership != event.MembershipLeave {
+		t.Fatalf("leave member change = %#v", leave.ChatInfoChange.MemberChanges.MemberMap)
+	}
+}
+
+func TestHandledSystemMessageRejectsUnsupportedRecords(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *line.Message
+	}{
+		{name: "nil", msg: nil},
+		{
+			name: "non-system content",
+			msg: &line.Message{
+				To:              "Cgroup",
+				ContentType:     int(ContentText),
+				ContentMetadata: map[string]string{"LOC_KEY": "C_ML"},
+			},
+		},
+		{
+			name: "unknown location key",
+			msg: &line.Message{
+				To:              "Cgroup",
+				ContentType:     int(ContentSystem),
+				ContentMetadata: map[string]string{"LOC_KEY": "C_UNKNOWN"},
+			},
+		},
+		{
+			name: "malformed invite",
+			msg: &line.Message{
+				To:              "Cgroup",
+				ContentType:     int(ContentSystem),
+				ContentMetadata: map[string]string{"LOC_KEY": "C_MI", "LOC_ARGS": "Uinviter"},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if isHandledSystemMessage(test.msg) {
+				t.Fatal("record was unexpectedly accepted as a handled system message")
+			}
+		})
+	}
+}
+
+func TestHandleSystemMessageLogsUnknownLocationKey(t *testing.T) {
+	var output bytes.Buffer
+	logger := zerolog.New(&output)
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{
+			UserLogin: &database.UserLogin{ID: "Uself"},
+			Bridge:    &bridgev2.Bridge{Log: logger},
+		},
+	}
+
+	handled := lc.handleSystemMessage(line.Operation{Message: &line.Message{
+		To:          "Cgroup",
+		ContentType: int(ContentSystem),
+		ContentMetadata: map[string]string{
+			"LOC_KEY": "C_UNKNOWN",
+		},
+	}})
+	if handled {
+		t.Fatal("unknown system message was marked handled")
+	}
+	logged := output.String()
+	if !strings.Contains(logged, "Unhandled system message LOC_KEY") || !strings.Contains(logged, "C_UNKNOWN") {
+		t.Fatalf("unknown LOC_KEY log = %q", logged)
 	}
 }
 

@@ -113,7 +113,7 @@ func (lc *LineClient) getChatInfoForIncomingMessage(ctx context.Context, portal 
 	return info, nil
 }
 
-func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
+func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 	// Only process known content types; skip system messages (group created, member invited, etc.)
 	if !isBridgeableContentType(msg) {
 		lc.UserLogin.Bridge.Log.Debug().
@@ -123,7 +123,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 			Str("text", msg.Text).
 			Int("chunk_count", len(msg.Chunks)).
 			Msg("Skipping unsupported content type")
-		return
+		return false
 	}
 
 	portalIDStr := portalMIDForMessage(msg, opType)
@@ -164,7 +164,8 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 		}
 	}
 
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, remoteEvent)
+	result := lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, remoteEvent)
+	return result.Success && !result.Ignored
 }
 
 // isBridgeableContentType reports whether an inbound LINE message should be
