@@ -99,10 +99,12 @@ func (lc *LineConnector) GetConfig() (example string, data any, upgrader configu
 
 func (lc *LineConnector) GetDBMetaTypes() database.MetaTypes {
 	return database.MetaTypes{
-		Portal:   nil,
-		Ghost:    nil,
-		Message:  nil,
-		Reaction: nil,
+		Portal:  nil,
+		Ghost:   nil,
+		Message: nil,
+		Reaction: func() any {
+			return &ReactionMetadata{}
+		},
 		UserLogin: func() any {
 			return &UserLoginMetadata{}
 		},

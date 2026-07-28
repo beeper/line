@@ -2061,126 +2061,82 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 }
 
 func (lc *LineClient) handlePaidReaction(ctx context.Context, op line.Operation, param2 *line.ReactionPayload) {
-	prt := param2.Curr.PaidReactionType
-	mxc, err := lc.getPaidReactionMXC(ctx, prt)
+	ts, _ := op.CreatedTime.Int64()
+	reaction, err := lc.convertReaction(
+		ctx,
+		line.ReactionType{PaidReactionType: param2.Curr.PaidReactionType},
+		lc.eventSenderForMID(op.Param3),
+		time.UnixMilli(ts),
+	)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to prepare paid reaction icon")
 		return
 	}
-	portalKey := networkid.PortalKey{ID: makePortalID(param2.ChatMid), Receiver: lc.UserLogin.ID}
-
-	// A fresh add invalidates any prior remove-dedup entries for this
-	// message — otherwise a later removal would be silently skipped.
-	lc.clearReactionDedupEntries(op.Param1, true)
-
-	ts, _ := op.CreatedTime.Int64()
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventReaction,
-			PortalKey: portalKey,
-			Timestamp: time.UnixMilli(ts),
-			Sender:    lc.eventSenderForMID(op.Param3),
-		},
-		TargetMessage: networkid.MessageID(op.Param1),
-		Emoji:         mxc,
-	})
+	lc.UserLogin.Bridge.QueueRemoteEvent(
+		lc.UserLogin,
+		lc.liveReactionSyncEvent(op, param2.ChatMid, reaction.Sender.Sender, reaction),
+	)
 }
 
 func (lc *LineClient) handlePredefinedReaction(ctx context.Context, op line.Operation, chatMid string, prt int) {
-	if prt < 2 || prt > 7 {
-		lc.UserLogin.Bridge.Log.Error().Int("predefined_reaction_type", prt).Msg("Unknown predefined reaction type")
-		return
-	}
-
-	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
-
-	mxc, err := lc.getPredefinedReactionMXC(ctx, prt)
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Error().Err(err).Int("prt", prt).Msg("Failed to prepare predefined reaction icon")
-		return
-	}
-
-	dedupKey := op.Param1 + "\x00" + mxc
-	if _, loaded := lc.recentReactions.LoadOrStore(dedupKey, struct{}{}); loaded {
-		lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Msg("Skipping duplicate predefined reaction")
-		return
-	}
-
-	// A fresh add invalidates any prior remove-dedup entries for this
-	// message — otherwise a later removal of this (or a replacement)
-	// reaction would be silently skipped.
-	lc.clearReactionDedupEntries(op.Param1, true)
-
 	ts, _ := op.CreatedTime.Int64()
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
+	reaction, err := lc.convertReaction(
+		ctx,
+		line.ReactionType{PredefinedReactionType: prt},
+		lc.eventSenderForMID(op.Param3),
+		time.UnixMilli(ts),
+	)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Error().Err(err).Int("predefined_reaction_type", prt).Msg("Failed to prepare predefined reaction icon")
+		return
+	}
+	lc.UserLogin.Bridge.QueueRemoteEvent(
+		lc.UserLogin,
+		lc.liveReactionSyncEvent(op, chatMid, reaction.Sender.Sender, reaction),
+	)
+}
+
+func (lc *LineClient) liveReactionSyncEvent(
+	op line.Operation,
+	chatMid string,
+	sender networkid.UserID,
+	reaction *bridgev2.BackfillReaction,
+) *simplevent.ReactionSync {
+	ts, _ := op.CreatedTime.Int64()
+	reactions := []*bridgev2.BackfillReaction(nil)
+	if reaction != nil {
+		reactions = []*bridgev2.BackfillReaction{reaction}
+	}
+	return &simplevent.ReactionSync{
 		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventReaction,
-			PortalKey: portalKey,
+			Type:      bridgev2.RemoteEventReactionSync,
+			PortalKey: networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID},
 			Timestamp: time.UnixMilli(ts),
-			Sender:    lc.eventSenderForMID(op.Param3),
 		},
 		TargetMessage: networkid.MessageID(op.Param1),
-		Emoji:         mxc,
-	})
-}
-
-// handleReactionRemove queues a RemoteEventReactionRemove for each candidate
-// sender. Reactions are stored with EmojiID="" (see handlePaidReaction /
-// handlePredefinedReaction), so the framework's reaction lookup finds the
-// single row keyed by (target_message, sender) and redacts it. A miss is
-// silently ignored by bridgev2, which lets callers safely queue multiple
-// sender candidates when the previous reaction's actor is ambiguous.
-//
-// It also evicts stale add-dedup entries for the target message so that
-// re-adding the same emoji after a clear isn't silently dropped by the
-// recentReactions sync.Map.
-func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, senders []networkid.UserID) {
-	ts, _ := op.CreatedTime.Int64()
-	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
-
-	for _, sender := range senders {
-		dedupKey := op.Param1 + "\x00remove\x00" + string(sender)
-		if _, loaded := lc.recentReactions.LoadOrStore(dedupKey, struct{}{}); loaded {
-			lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("sender", string(sender)).Msg("Skipping duplicate reaction removal")
-			continue
-		}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventReactionRemove,
-				PortalKey: portalKey,
-				Timestamp: time.UnixMilli(ts),
-				Sender:    lc.eventSenderForMID(string(sender)),
+		Reactions: &bridgev2.ReactionSyncData{
+			Users: map[networkid.UserID]*bridgev2.ReactionSyncUser{
+				sender: {
+					Reactions:       reactions,
+					HasAllReactions: true,
+				},
 			},
-			TargetMessage: networkid.MessageID(op.Param1),
-		})
+			HasAllUsers: false,
+		},
 	}
-
-	lc.clearReactionDedupEntries(op.Param1, false)
 }
 
-// clearReactionDedupEntries evicts recentReactions entries for the given
-// message. The recentReactions sync.Map dedups concurrent 139/140 events
-// from LINE; without periodic cleanup, the keys accumulate and silently
-// block legitimate later events (e.g. add → remove → add of the same
-// emoji, or remove → add → remove sequences). We use the inverse-direction
-// event as the cleanup trigger: an add clears stale remove-dedup entries
-// (removeOnly=true), a remove clears stale add-dedup entries
-// (removeOnly=false).
-func (lc *LineClient) clearReactionDedupEntries(msgID string, removeOnly bool) {
-	prefix := msgID + "\x00"
-	lc.recentReactions.Range(func(k, _ any) bool {
-		ks, ok := k.(string)
-		if !ok {
-			return true
-		}
-		if !strings.HasPrefix(ks, prefix) {
-			return true
-		}
-		if strings.Contains(ks, "\x00remove\x00") == removeOnly {
-			lc.recentReactions.Delete(ks)
-		}
-		return true
-	})
+// handleReactionRemove queues an authoritative empty reaction sync for each
+// candidate sender. LINE only allows one reaction per sender, so this removes
+// both legacy empty-ID rows and stable paid/predefined reaction IDs without
+// needing the previous reaction type.
+func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, senders []networkid.UserID) {
+	for _, sender := range senders {
+		lc.UserLogin.Bridge.QueueRemoteEvent(
+			lc.UserLogin,
+			lc.liveReactionSyncEvent(op, chatMid, sender, nil),
+		)
+	}
 }
 
 func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
