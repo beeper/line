@@ -80,7 +80,6 @@ type LineClient struct {
 	knownMemberChatMIDs     map[string]struct{} // chatMid -> current member chats returned by getAllChatMids
 	reactionIconMXC         map[int]string      // predefinedReactionType -> cached MXC URI
 	paidReactionIconMXC     map[string]string   // LINE sticon URL -> cached MXC URI
-	recentReactions         sync.Map            // "msgID\x00emoji" -> struct{} to dedup concurrent 139/140 events
 	unblockBackfills        sync.Map            // chat MID -> *unblockBackfillState while unblock history restoration is active
 
 	wg sync.WaitGroup

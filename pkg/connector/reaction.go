@@ -36,8 +36,13 @@ type linePaidReactionRef struct {
 	Version      int
 }
 
-func (ref linePaidReactionRef) networkEmojiID() networkid.EmojiID {
-	return networkid.EmojiID("paid:" + ref.ProductID + ":" + ref.EmojiID)
+type lineReactionRef struct {
+	typ line.ReactionType
+}
+
+type ReactionMetadata struct {
+	MatrixKey    string            `json:"matrix_key,omitempty"`
+	ReactionType line.ReactionType `json:"reaction_type"`
 }
 
 func (ref linePaidReactionRef) reactionType() line.ReactionType {
@@ -48,6 +53,61 @@ func (ref linePaidReactionRef) reactionType() line.ReactionType {
 			ResourceType: ref.ResourceType,
 			Version:      ref.Version,
 		},
+	}
+}
+
+func cloneLineReactionType(typ line.ReactionType) line.ReactionType {
+	cloned := line.ReactionType{
+		PredefinedReactionType: typ.PredefinedReactionType,
+	}
+	if typ.PaidReactionType != nil {
+		paid := *typ.PaidReactionType
+		cloned.PaidReactionType = &paid
+	}
+	return cloned
+}
+
+func newLineReactionRef(typ line.ReactionType) (lineReactionRef, error) {
+	hasPredefined := typ.PredefinedReactionType != 0
+	hasPaid := typ.PaidReactionType != nil
+	if hasPredefined == hasPaid {
+		return lineReactionRef{}, errors.New("reaction type must contain exactly one predefined or paid reaction")
+	}
+	if hasPredefined {
+		if _, ok := line.PredefinedReactionEmoji[typ.PredefinedReactionType]; !ok {
+			return lineReactionRef{}, fmt.Errorf("unknown predefined reaction type %d", typ.PredefinedReactionType)
+		}
+	} else if typ.PaidReactionType.ProductID == "" || typ.PaidReactionType.EmojiID == "" {
+		return lineReactionRef{}, errors.New("paid reaction is missing product or emoji ID")
+	}
+	return lineReactionRef{typ: cloneLineReactionType(typ)}, nil
+}
+
+func (ref lineReactionRef) reactionType() line.ReactionType {
+	return cloneLineReactionType(ref.typ)
+}
+
+func (ref lineReactionRef) networkEmojiID() networkid.EmojiID {
+	if ref.typ.PaidReactionType != nil {
+		return networkid.EmojiID("paid:" + ref.typ.PaidReactionType.ProductID + ":" + ref.typ.PaidReactionType.EmojiID)
+	}
+	return networkid.EmojiID("predefined:" + strconv.Itoa(ref.typ.PredefinedReactionType))
+}
+
+func (ref lineReactionRef) equal(other lineReactionRef) bool {
+	if ref.typ.PredefinedReactionType != other.typ.PredefinedReactionType {
+		return false
+	}
+	if ref.typ.PaidReactionType == nil || other.typ.PaidReactionType == nil {
+		return ref.typ.PaidReactionType == nil && other.typ.PaidReactionType == nil
+	}
+	return *ref.typ.PaidReactionType == *other.typ.PaidReactionType
+}
+
+func (ref lineReactionRef) metadata(matrixKey string) *ReactionMetadata {
+	return &ReactionMetadata{
+		MatrixKey:    matrixKey,
+		ReactionType: ref.reactionType(),
 	}
 }
 
@@ -302,6 +362,36 @@ func (lc *LineClient) getPaidReactionMXC(ctx context.Context, prt *line.PaidReac
 	return mxc, nil
 }
 
+func (lc *LineClient) convertReaction(
+	ctx context.Context,
+	typ line.ReactionType,
+	sender bridgev2.EventSender,
+	timestamp time.Time,
+) (*bridgev2.BackfillReaction, error) {
+	ref, err := newLineReactionRef(typ)
+	if err != nil {
+		return nil, err
+	}
+
+	var mxc string
+	if ref.typ.PaidReactionType != nil {
+		mxc, err = lc.getPaidReactionMXC(ctx, ref.typ.PaidReactionType)
+	} else {
+		mxc, err = lc.getPredefinedReactionMXC(ctx, ref.typ.PredefinedReactionType)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &bridgev2.BackfillReaction{
+		Timestamp:  timestamp,
+		Sender:     sender,
+		EmojiID:    ref.networkEmojiID(),
+		Emoji:      mxc,
+		DBMetadata: ref.metadata(mxc),
+	}, nil
+}
+
 func (lc *LineClient) convertMessageReactions(ctx context.Context, msg *line.Message) ([]*bridgev2.BackfillReaction, bool) {
 	if msg == nil || msg.Reactions == nil {
 		return nil, false
@@ -319,18 +409,16 @@ func (lc *LineClient) convertMessageReactions(ctx context.Context, msg *line.Mes
 			continue
 		}
 
-		var (
-			mxc string
-			err error
-		)
-		switch {
-		case reaction.ReactionType.PaidReactionType != nil:
-			mxc, err = lc.getPaidReactionMXC(ctx, reaction.ReactionType.PaidReactionType)
-		case reaction.ReactionType.PredefinedReactionType != 0:
-			mxc, err = lc.getPredefinedReactionMXC(ctx, reaction.ReactionType.PredefinedReactionType)
-		default:
-			err = errors.New("reaction type is missing")
+		var timestamp time.Time
+		if timestampMillis, err := reaction.AtMillis.Int64(); err == nil && timestampMillis > 0 {
+			timestamp = time.UnixMilli(timestampMillis)
 		}
+		convertedReaction, err := lc.convertReaction(
+			ctx,
+			reaction.ReactionType,
+			lc.eventSenderForMID(reaction.FromUserMID),
+			timestamp,
+		)
 		if err != nil {
 			complete = false
 			lc.UserLogin.Bridge.Log.Warn().
@@ -340,16 +428,7 @@ func (lc *LineClient) convertMessageReactions(ctx context.Context, msg *line.Mes
 				Msg("Skipping unsupported historical reaction")
 			continue
 		}
-
-		var timestamp time.Time
-		if timestampMillis, err := reaction.AtMillis.Int64(); err == nil && timestampMillis > 0 {
-			timestamp = time.UnixMilli(timestampMillis)
-		}
-		converted = append(converted, &bridgev2.BackfillReaction{
-			Timestamp: timestamp,
-			Sender:    lc.eventSenderForMID(reaction.FromUserMID),
-			Emoji:     mxc,
-		})
+		converted = append(converted, convertedReaction)
 	}
 	return converted, complete
 }
@@ -455,6 +534,61 @@ func linePaidReactionForMatrixEmoji(key string) (linePaidReactionRef, bool) {
 		return linePaidReactionRef{}, false
 	}
 	return ref, true
+}
+
+func storedLineReactionForMatrixKey(key string, reactions []*database.Reaction) (lineReactionRef, bool) {
+	var (
+		found    lineReactionRef
+		hasFound bool
+	)
+	for _, reaction := range reactions {
+		meta, ok := reaction.Metadata.(*ReactionMetadata)
+		if !ok || meta == nil || meta.MatrixKey != key {
+			continue
+		}
+		ref, err := newLineReactionRef(meta.ReactionType)
+		if err != nil || (reaction.EmojiID != "" && reaction.EmojiID != ref.networkEmojiID()) {
+			continue
+		}
+		if hasFound && !found.equal(ref) {
+			return lineReactionRef{}, false
+		}
+		found = ref
+		hasFound = true
+	}
+	return found, hasFound
+}
+
+func (lc *LineClient) resolveMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (lineReactionRef, error) {
+	key := msg.Content.RelatesTo.GetAnnotationKey()
+	if paidRef, ok := linePaidReactionForMatrixEmoji(key); ok {
+		ref, err := newLineReactionRef(paidRef.reactionType())
+		if err != nil {
+			return lineReactionRef{}, err
+		}
+		return ref, nil
+	}
+	if !strings.HasPrefix(key, "mxc://") {
+		return lineReactionRef{}, unsupportedMatrixReactionError(key)
+	}
+	if msg.TargetMessage == nil || msg.Portal == nil || msg.Portal.Bridge == nil || msg.Portal.Bridge.DB == nil {
+		return lineReactionRef{}, errors.New("reaction target database context is missing")
+	}
+
+	reactions, err := msg.Portal.Bridge.DB.Reaction.GetAllToMessagePart(
+		ctx,
+		msg.Portal.Receiver,
+		msg.TargetMessage.ID,
+		msg.TargetMessage.PartID,
+	)
+	if err != nil {
+		return lineReactionRef{}, fmt.Errorf("get target message reactions: %w", err)
+	}
+	ref, ok := storedLineReactionForMatrixKey(key, reactions)
+	if !ok {
+		return lineReactionRef{}, unsupportedMatrixReactionError(key)
+	}
+	return ref, nil
 }
 
 func unsupportedMatrixReactionError(key string) error {
@@ -572,9 +706,9 @@ func (lc *LineClient) consumeSentReqSeq(reqSeq int) bool {
 
 func (lc *LineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
 	key := msg.Content.RelatesTo.GetAnnotationKey()
-	ref, ok := linePaidReactionForMatrixEmoji(key)
-	if !ok {
-		return bridgev2.MatrixReactionPreResponse{}, unsupportedMatrixReactionError(key)
+	ref, err := lc.resolveMatrixReaction(ctx, msg)
+	if err != nil {
+		return bridgev2.MatrixReactionPreResponse{}, err
 	}
 	return bridgev2.MatrixReactionPreResponse{
 		SenderID:     makeUserID(string(lc.UserLogin.ID)),
@@ -586,9 +720,9 @@ func (lc *LineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2
 
 func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
 	key := msg.Content.RelatesTo.GetAnnotationKey()
-	ref, ok := linePaidReactionForMatrixEmoji(key)
-	if !ok {
-		return nil, unsupportedMatrixReactionError(key)
+	ref, err := lc.resolveMatrixReaction(ctx, msg)
+	if err != nil {
+		return nil, err
 	}
 	targetID, err := parseReactionTargetMessageID(msg.TargetMessage.ID)
 	if err != nil {
@@ -610,8 +744,9 @@ func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Ma
 	}
 
 	return &database.Reaction{
-		EmojiID: ref.networkEmojiID(),
-		Emoji:   key,
+		EmojiID:  ref.networkEmojiID(),
+		Emoji:    key,
+		Metadata: ref.metadata(key),
 	}, nil
 }
 

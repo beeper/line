@@ -31,6 +31,9 @@ func TestCapabilitiesAdvertiseSupportedReactions(t *testing.T) {
 	if caps.ReactionCount != 1 {
 		t.Fatalf("ReactionCount = %d, want 1", caps.ReactionCount)
 	}
+	if caps.CustomEmojiReactions {
+		t.Fatal("CustomEmojiReactions must stay disabled because arbitrary Matrix custom emojis are unsupported")
+	}
 	if len(caps.AllowedReactions) != len(lineEmojiReactionURLs) {
 		t.Fatalf("AllowedReactions has %d entries, want %d", len(caps.AllowedReactions), len(lineEmojiReactionURLs))
 	}
@@ -431,6 +434,170 @@ func TestLinePaidReactionForMatrixEmoji(t *testing.T) {
 	}
 }
 
+func TestLineReactionRefIdentityAndMetadata(t *testing.T) {
+	paidType := line.ReactionType{PaidReactionType: &line.PaidReactionType{
+		ProductID:    "product",
+		EmojiID:      "emoji",
+		ResourceType: 2,
+		Version:      7,
+	}}
+	paidRef, err := newLineReactionRef(paidType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paidRef.networkEmojiID() != "paid:product:emoji" {
+		t.Fatalf("paid EmojiID = %q", paidRef.networkEmojiID())
+	}
+
+	meta := paidRef.metadata("mxc://line/custom")
+	paidType.PaidReactionType.Version = 99
+	if meta.MatrixKey != "mxc://line/custom" || meta.ReactionType.PaidReactionType.Version != 7 {
+		t.Fatalf("paid metadata = %#v", meta)
+	}
+
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ReactionMetadata
+	if err = json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	decodedRef, err := newLineReactionRef(decoded.ReactionType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !paidRef.equal(decodedRef) {
+		t.Fatalf("decoded ref = %#v, want %#v", decodedRef, paidRef)
+	}
+
+	predefinedRef, err := newLineReactionRef(line.ReactionType{PredefinedReactionType: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if predefinedRef.networkEmojiID() != "predefined:2" {
+		t.Fatalf("predefined EmojiID = %q", predefinedRef.networkEmojiID())
+	}
+
+	for _, invalid := range []line.ReactionType{
+		{},
+		{PredefinedReactionType: 1},
+		{PaidReactionType: &line.PaidReactionType{}},
+		{
+			PredefinedReactionType: 2,
+			PaidReactionType:       &line.PaidReactionType{ProductID: "product", EmojiID: "emoji"},
+		},
+	} {
+		if _, err = newLineReactionRef(invalid); err == nil {
+			t.Fatalf("invalid reaction type was accepted: %#v", invalid)
+		}
+	}
+
+	metaFactory := (&LineConnector{}).GetDBMetaTypes().Reaction
+	if metaFactory == nil {
+		t.Fatal("reaction metadata type is not registered")
+	}
+	if _, ok := metaFactory().(*ReactionMetadata); !ok {
+		t.Fatalf("reaction metadata factory returned %T", metaFactory())
+	}
+}
+
+func TestStoredLineReactionForMatrixKey(t *testing.T) {
+	key := "mxc://line/custom"
+	paidType := line.ReactionType{PaidReactionType: &line.PaidReactionType{
+		ProductID:    "product",
+		EmojiID:      "emoji",
+		ResourceType: 2,
+		Version:      7,
+	}}
+	valid := &database.Reaction{
+		EmojiID: "paid:product:emoji",
+		Metadata: &ReactionMetadata{
+			MatrixKey:    key,
+			ReactionType: paidType,
+		},
+	}
+	same := &database.Reaction{
+		EmojiID: "paid:product:emoji",
+		Metadata: &ReactionMetadata{
+			MatrixKey:    key,
+			ReactionType: cloneLineReactionType(paidType),
+		},
+	}
+	unrelated := &database.Reaction{
+		EmojiID: "predefined:2",
+		Metadata: &ReactionMetadata{
+			MatrixKey:    "mxc://line/other",
+			ReactionType: line.ReactionType{PredefinedReactionType: 2},
+		},
+	}
+
+	ref, ok := storedLineReactionForMatrixKey(key, []*database.Reaction{valid, same, unrelated})
+	if !ok || ref.networkEmojiID() != "paid:product:emoji" {
+		t.Fatalf("stored reaction = %#v, %v", ref, ok)
+	}
+	malformed := &database.Reaction{
+		EmojiID: "predefined:999",
+		Metadata: &ReactionMetadata{
+			MatrixKey:    key,
+			ReactionType: line.ReactionType{PredefinedReactionType: 999},
+		},
+	}
+	mismatched := &database.Reaction{
+		EmojiID:  "paid:different:id",
+		Metadata: valid.Metadata,
+	}
+	ref, ok = storedLineReactionForMatrixKey(key, []*database.Reaction{malformed, mismatched, valid})
+	if !ok || ref.networkEmojiID() != "paid:product:emoji" {
+		t.Fatalf("stored reaction after malformed rows = %#v, %v", ref, ok)
+	}
+	if _, ok = storedLineReactionForMatrixKey("mxc://line/arbitrary", []*database.Reaction{valid}); ok {
+		t.Fatal("arbitrary MXC was accepted")
+	}
+	if _, ok = storedLineReactionForMatrixKey(key, []*database.Reaction{{
+		Emoji: key,
+	}}); ok {
+		t.Fatal("legacy reaction without metadata was accepted")
+	}
+	if _, ok = storedLineReactionForMatrixKey(key, []*database.Reaction{valid, {
+		EmojiID: "predefined:2",
+		Metadata: &ReactionMetadata{
+			MatrixKey:    key,
+			ReactionType: line.ReactionType{PredefinedReactionType: 2},
+		},
+	}}); ok {
+		t.Fatal("conflicting LINE reaction metadata was accepted")
+	}
+	if _, ok = storedLineReactionForMatrixKey(key, []*database.Reaction{{
+		EmojiID:  "paid:different:id",
+		Metadata: valid.Metadata,
+	}}); ok {
+		t.Fatal("reaction metadata with a mismatched stable ID was accepted")
+	}
+}
+
+func TestPreHandleMatrixReactionKeepsUnicodeBehavior(t *testing.T) {
+	lc := &LineClient{UserLogin: &bridgev2.UserLogin{
+		UserLogin: &database.UserLogin{ID: "Uself"},
+	}}
+	msg := &bridgev2.MatrixReaction{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.ReactionEventContent]{
+			Content: &event.ReactionEventContent{RelatesTo: event.RelatesTo{
+				Type: event.RelAnnotation,
+				Key:  "\U0001F44D\uFE0F",
+			}},
+		},
+	}
+
+	resp, err := lc.PreHandleMatrixReaction(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.SenderID != "Uself" || resp.EmojiID == "" || resp.Emoji != "\U0001F44D\uFE0F" || resp.MaxReactions != 1 {
+		t.Fatalf("pre-handle response = %#v", resp)
+	}
+}
+
 func TestParseReactionTargetMessageID(t *testing.T) {
 	messageID, err := parseReactionTargetMessageID(networkid.MessageID("616934195205767730"))
 	if err != nil {
@@ -565,11 +732,28 @@ func TestConvertMessageReactionsUsesEmbeddedHistory(t *testing.T) {
 	if reactions[0].Emoji != "mxc://line/like" || reactions[0].Sender.Sender != "Uself" || !reactions[0].Sender.IsFromMe {
 		t.Fatalf("predefined reaction = %#v", reactions[0])
 	}
+	if reactions[0].EmojiID != "predefined:2" {
+		t.Fatalf("predefined reaction EmojiID = %q", reactions[0].EmojiID)
+	}
+	predefinedMeta, ok := reactions[0].DBMetadata.(*ReactionMetadata)
+	if !ok || predefinedMeta.MatrixKey != reactions[0].Emoji || predefinedMeta.ReactionType.PredefinedReactionType != 2 {
+		t.Fatalf("predefined reaction metadata = %#v", reactions[0].DBMetadata)
+	}
 	if want := time.UnixMilli(1784930400123); !reactions[0].Timestamp.Equal(want) {
 		t.Fatalf("predefined reaction timestamp = %s, want %s", reactions[0].Timestamp, want)
 	}
 	if reactions[1].Emoji != "mxc://line/paid" || reactions[1].Sender.Sender != "Uother" || reactions[1].Sender.IsFromMe {
 		t.Fatalf("paid reaction = %#v", reactions[1])
+	}
+	if reactions[1].EmojiID != "paid:paid-product:paid-emoji" {
+		t.Fatalf("paid reaction EmojiID = %q", reactions[1].EmojiID)
+	}
+	paidMeta, ok := reactions[1].DBMetadata.(*ReactionMetadata)
+	if !ok || paidMeta.MatrixKey != reactions[1].Emoji ||
+		paidMeta.ReactionType.PaidReactionType == nil ||
+		paidMeta.ReactionType.PaidReactionType.ProductID != paidType.ProductID ||
+		paidMeta.ReactionType.PaidReactionType.EmojiID != paidType.EmojiID {
+		t.Fatalf("paid reaction metadata = %#v", reactions[1].DBMetadata)
 	}
 }
 
@@ -600,6 +784,45 @@ func TestQueueMessageReactionSyncSkipsSystemMarkers(t *testing.T) {
 
 	if lc.queueMessageReactionSync(context.Background(), "Cgroup", msg) {
 		t.Fatal("system-message marker unexpectedly queued a reaction sync")
+	}
+}
+
+func TestLiveReactionSyncEventIsSenderAuthoritative(t *testing.T) {
+	lc := &LineClient{UserLogin: &bridgev2.UserLogin{
+		UserLogin: &database.UserLogin{ID: "Uself"},
+	}}
+	op := line.Operation{
+		Param1:      "616934195205767730",
+		CreatedTime: json.Number("1784930400123"),
+	}
+	reaction := &bridgev2.BackfillReaction{
+		Sender:  lc.eventSenderForMID("Uother"),
+		EmojiID: "paid:product:emoji",
+		Emoji:   "mxc://line/custom",
+	}
+
+	add := lc.liveReactionSyncEvent(op, "Cgroup", "Uother", reaction)
+	if add.Type != bridgev2.RemoteEventReactionSync ||
+		add.PortalKey.ID != makePortalID("Cgroup") ||
+		add.PortalKey.Receiver != "Uself" ||
+		add.TargetMessage != "616934195205767730" {
+		t.Fatalf("add sync metadata = %#v", add)
+	}
+	if add.Reactions.HasAllUsers {
+		t.Fatal("single-sender live sync was marked authoritative for all users")
+	}
+	userSync := add.Reactions.Users["Uother"]
+	if userSync == nil || !userSync.HasAllReactions || len(userSync.Reactions) != 1 || userSync.Reactions[0] != reaction {
+		t.Fatalf("add user sync = %#v", userSync)
+	}
+	if want := time.UnixMilli(1784930400123); !add.Timestamp.Equal(want) {
+		t.Fatalf("add timestamp = %s, want %s", add.Timestamp, want)
+	}
+
+	remove := lc.liveReactionSyncEvent(op, "Cgroup", "Uother", nil)
+	userSync = remove.Reactions.Users["Uother"]
+	if userSync == nil || !userSync.HasAllReactions || len(userSync.Reactions) != 0 {
+		t.Fatalf("remove user sync = %#v", userSync)
 	}
 }
 
