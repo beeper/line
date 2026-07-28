@@ -548,7 +548,7 @@ func storedLineReactionForMatrixKey(key string, reactions []*database.Reaction) 
 		}
 		ref, err := newLineReactionRef(meta.ReactionType)
 		if err != nil || (reaction.EmojiID != "" && reaction.EmojiID != ref.networkEmojiID()) {
-			return lineReactionRef{}, false
+			continue
 		}
 		if hasFound && !found.equal(ref) {
 			return lineReactionRef{}, false

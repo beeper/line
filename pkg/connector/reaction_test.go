@@ -536,6 +536,21 @@ func TestStoredLineReactionForMatrixKey(t *testing.T) {
 	if !ok || ref.networkEmojiID() != "paid:product:emoji" {
 		t.Fatalf("stored reaction = %#v, %v", ref, ok)
 	}
+	malformed := &database.Reaction{
+		EmojiID: "predefined:999",
+		Metadata: &ReactionMetadata{
+			MatrixKey:    key,
+			ReactionType: line.ReactionType{PredefinedReactionType: 999},
+		},
+	}
+	mismatched := &database.Reaction{
+		EmojiID:  "paid:different:id",
+		Metadata: valid.Metadata,
+	}
+	ref, ok = storedLineReactionForMatrixKey(key, []*database.Reaction{malformed, mismatched, valid})
+	if !ok || ref.networkEmojiID() != "paid:product:emoji" {
+		t.Fatalf("stored reaction after malformed rows = %#v, %v", ref, ok)
+	}
 	if _, ok = storedLineReactionForMatrixKey("mxc://line/arbitrary", []*database.Reaction{valid}); ok {
 		t.Fatal("arbitrary MXC was accepted")
 	}
