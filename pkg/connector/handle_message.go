@@ -38,6 +38,7 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 		HandleLoggedOut:   lc.markLoggedOutByOtherClient,
 		NewClient:         func() *line.Client { return lc.newClient() },
 		DecryptMedia:      lc.decryptImageData,
+		DecryptVideoMedia: lc.decryptVideoData,
 	}
 }
 

@@ -87,10 +87,10 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 		if encKM := data.ContentMetadata["ENC_KM"]; encKM != "" && len(audioData) > 32 {
 			decryptedAudio, err := h.DecryptMedia(audioData, encKM)
 			if err != nil {
-				h.Log.Warn().Err(err).Msg("ENC_KM fallback decrypt failed, sending raw audio")
-			} else {
-				audioData = decryptedAudio
+				h.Log.Error().Err(err).Msg("ENC_KM fallback decrypt failed")
+				return nil, fmt.Errorf("failed to decrypt audio data from ENC_KM: %w", err)
 			}
+			audioData = decryptedAudio
 		}
 	}
 

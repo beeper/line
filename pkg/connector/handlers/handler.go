@@ -37,6 +37,8 @@ type Handler struct {
 
 	// DecryptMedia decrypts E2EE encrypted media data using the given key material.
 	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
+	// DecryptVideoMedia decrypts E2EE encrypted video data, whose HMAC covers chunk hashes.
+	DecryptVideoMedia func(data []byte, keyMaterial string) ([]byte, error)
 }
 
 func (h *Handler) downloadAlbumPreview(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error) {

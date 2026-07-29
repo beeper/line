@@ -78,7 +78,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 				Str("file_name", decryptInfo.FileName).
 				Msg("Decrypting E2EE video")
 
-			decryptedVideo, err := h.DecryptMedia(videoData, decryptInfo.KeyMaterial)
+			decryptedVideo, err := h.DecryptVideoMedia(videoData, decryptInfo.KeyMaterial)
 			if err != nil {
 				h.Log.Error().Err(err).Msg("Failed to decrypt video data")
 				return nil, fmt.Errorf("failed to decrypt video data: %w", err)
@@ -98,13 +98,13 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 				Str("enc_km_preview", encKM[:min(20, len(encKM))]+"...").
 				Msg("Decrypting video using ENC_KM from metadata (fallback)")
 
-			decryptedVideo, err := h.DecryptMedia(videoData, encKM)
+			decryptedVideo, err := h.DecryptVideoMedia(videoData, encKM)
 			if err != nil {
-				h.Log.Warn().Err(err).Msg("ENC_KM fallback decrypt failed, sending raw video")
-			} else {
-				videoData = decryptedVideo
-				h.Log.Info().Int("decrypted_size", len(videoData)).Msg("Successfully decrypted video from ENC_KM")
+				h.Log.Error().Err(err).Msg("ENC_KM fallback decrypt failed")
+				return nil, fmt.Errorf("failed to decrypt video data from ENC_KM: %w", err)
 			}
+			videoData = decryptedVideo
+			h.Log.Info().Int("decrypted_size", len(videoData)).Msg("Successfully decrypted video from ENC_KM")
 		}
 	}
 
