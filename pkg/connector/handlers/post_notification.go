@@ -211,15 +211,17 @@ func (h *Handler) convertAlbumPreview(
 		previewContext.ChatID,
 		previewContext.AlbumID,
 	)
-	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
+	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
+		client = newClient
 		imageData, err = h.downloadAlbumPreview(
 			ctx,
-			newClient,
+			client,
 			media.OID,
 			previewContext.ChatID,
 			previewContext.AlbumID,
 		)
 	}
+	h.handleFinalAuthError(ctx, client, err)
 	if errors.Is(err, line.ErrOBSObjectNotFound) {
 		h.Log.Warn().
 			Str("msg_id", messageID).

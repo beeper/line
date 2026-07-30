@@ -90,9 +90,12 @@ func TestCallLineWithRecovery(t *testing.T) {
 				newClient: func() *line.Client {
 					return line.NewClient("token")
 				},
-				recover: func(context.Context) error {
+				recover: func(context.Context, *line.Client, error) (*line.Client, error) {
 					recoveries++
-					return tt.recoverErr
+					if tt.recoverErr != nil {
+						return nil, tt.recoverErr
+					}
+					return line.NewClient("recovered"), nil
 				},
 				isAuthError: line.IsAuthError,
 				call: func(*line.Client) (struct{}, error) {
@@ -138,8 +141,8 @@ func TestCallLineWithRecoveryReusesClientUntilRecovery(t *testing.T) {
 			newClients++
 			return refreshedClient
 		},
-		recover: func(context.Context) error {
-			return nil
+		recover: func(context.Context, *line.Client, error) (*line.Client, error) {
+			return refreshedClient, nil
 		},
 		isAuthError: line.IsAuthError,
 		call: func(client *line.Client) (struct{}, error) {
@@ -156,8 +159,8 @@ func TestCallLineWithRecoveryReusesClientUntilRecovery(t *testing.T) {
 	if client != refreshedClient {
 		t.Fatal("expected recovered client to be returned")
 	}
-	if newClients != 1 {
-		t.Fatalf("new clients = %d, want 1", newClients)
+	if newClients != 0 {
+		t.Fatalf("new clients = %d, want 0 because recovery returned the retry client", newClients)
 	}
 	if len(calls) != 2 || calls[0] != "initial" || calls[1] != "refreshed" {
 		t.Fatalf("calls used clients %v, want [initial refreshed]", calls)
@@ -174,7 +177,9 @@ func TestCallLineWithRecoveryUsesProvidedClientWithoutRecreating(t *testing.T) {
 			newClients++
 			return line.NewClient("unexpected")
 		},
-		recover:     func(context.Context) error { return nil },
+		recover: func(context.Context, *line.Client, error) (*line.Client, error) {
+			return line.NewClient("unexpected"), nil
+		},
 		isAuthError: line.IsAuthError,
 		call: func(client *line.Client) (struct{}, error) {
 			if client.AccessToken != "initial" {
@@ -194,16 +199,16 @@ func TestCallLineWithRecoveryUsesProvidedClientWithoutRecreating(t *testing.T) {
 	}
 }
 
-func TestLineClientIsTokenErrorExcludesNonRecoverableErrors(t *testing.T) {
+func TestLineClientIsTokenErrorClassifiesRecoverableErrors(t *testing.T) {
 	lc := &LineClient{}
 	if !lc.isTokenError(errAuthRequired) {
 		t.Fatal("expected auth-required error to be classified as token error")
 	}
-	if lc.isTokenError(errLoggedOut) {
-		t.Fatal("logged-out sessions must not trigger token recovery")
+	if !lc.isTokenError(errLoggedOut) {
+		t.Fatal("logged-out sessions must reach source-aware auth handling")
 	}
-	if lc.isTokenError(errSenderKey) {
-		t.Fatal("invalid sender key sessions must not trigger token recovery")
+	if !lc.isTokenError(errSenderKey) {
+		t.Fatal("invalid sender key sessions must reach source-aware auth handling")
 	}
 	lc.sessionInvalidated = true
 	if lc.isTokenError(errAuthRequired) {
@@ -215,6 +220,125 @@ func TestLineClientIsTokenErrorExcludesNonRecoverableErrors(t *testing.T) {
 	}
 	if lc.isTokenError(line.ErrNoUsableE2EEPublicKey) {
 		t.Fatal("E2EE public key errors must not trigger token recovery")
+	}
+}
+
+func TestCallLineUsingRetriesStaleLogoutWithCurrentToken(t *testing.T) {
+	lc := &LineClient{AccessToken: "current-token"}
+	var calls []string
+	client, err := lc.callLineUsing(context.Background(), line.NewClient("old-token"), func(client *line.Client) error {
+		calls = append(calls, client.AccessToken)
+		if client.AccessToken == "old-token" {
+			return errLoggedOut
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("callLineUsing returned error: %v", err)
+	}
+	if client == nil || client.AccessToken != "current-token" {
+		t.Fatalf("client = %#v, want current-token", client)
+	}
+	if len(calls) != 2 || calls[0] != "old-token" || calls[1] != "current-token" {
+		t.Fatalf("call tokens = %v, want [old-token current-token]", calls)
+	}
+	if lc.isSessionInvalidated() {
+		t.Fatal("stale logout invalidated the current session")
+	}
+}
+
+func TestRecoveryLoggedOutErrorInvalidatesCurrentSession(t *testing.T) {
+	oldRecover := recoverLineToken
+	t.Cleanup(func() {
+		recoverLineToken = oldRecover
+	})
+	recoverLineToken = func(*LineClient, context.Context) error {
+		return errLoggedOut
+	}
+
+	lc := &LineClient{AccessToken: "current-token"}
+	retryClient, err := lc.recoverClientAfterAuthError(context.Background(), line.NewClient("current-token"), errAuthRequired)
+	if err != nil {
+		t.Fatalf("recoverClientAfterAuthError returned error: %v", err)
+	}
+	if retryClient != nil {
+		t.Fatalf("retry client = %#v, want nil", retryClient)
+	}
+	if lc.hasAccessToken() || !lc.isSessionInvalidated() {
+		t.Fatal("logged-out recovery error did not invalidate the current session")
+	}
+}
+
+func TestConcurrentOldTokenFailuresWaitForSingleRecovery(t *testing.T) {
+	oldRecover := recoverLineToken
+	t.Cleanup(func() {
+		recoverLineToken = oldRecover
+	})
+
+	lc := &LineClient{AccessToken: "old-token"}
+	recoveryStarted := make(chan struct{})
+	allowRecovery := make(chan struct{})
+	var recoveryCalls atomic.Int32
+	recoverLineToken = func(lc *LineClient, ctx context.Context) error {
+		return lc.runTokenRecovery(ctx, func(context.Context) error {
+			if recoveryCalls.Add(1) == 1 {
+				close(recoveryStarted)
+			}
+			<-allowRecovery
+			lc.setTokens("new-token", "")
+			return nil
+		})
+	}
+
+	primaryDone := make(chan error, 1)
+	go func() {
+		_, err := lc.callLineUsing(context.Background(), line.NewClient("old-token"), func(client *line.Client) error {
+			if client.AccessToken == "old-token" {
+				return errAuthRequired
+			}
+			return nil
+		})
+		primaryDone <- err
+	}()
+
+	select {
+	case <-recoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("primary recovery did not start")
+	}
+
+	const staleCalls = 8
+	var started sync.WaitGroup
+	started.Add(staleCalls)
+	staleDone := make(chan error, staleCalls)
+	for range staleCalls {
+		go func() {
+			_, err := lc.callLineUsing(context.Background(), line.NewClient("old-token"), func(client *line.Client) error {
+				if client.AccessToken == "old-token" {
+					started.Done()
+					return errLoggedOut
+				}
+				return nil
+			})
+			staleDone <- err
+		}()
+	}
+	started.Wait()
+	close(allowRecovery)
+
+	if err := <-primaryDone; err != nil {
+		t.Fatalf("primary call returned error: %v", err)
+	}
+	for range staleCalls {
+		if err := <-staleDone; err != nil {
+			t.Fatalf("stale call returned error: %v", err)
+		}
+	}
+	if got := recoveryCalls.Load(); got != 1 {
+		t.Fatalf("recovery calls = %d, want 1", got)
+	}
+	if lc.getAccessToken() != "new-token" || lc.isSessionInvalidated() {
+		t.Fatal("concurrent stale failures clobbered the recovered session")
 	}
 }
 
@@ -308,8 +432,15 @@ func TestRecoverTokenDoesNotReloginAfterCancellation(t *testing.T) {
 	}
 }
 
-func TestForcedLogoutWinsOverInFlightRecovery(t *testing.T) {
+func TestStaleForcedLogoutDoesNotClobberInFlightRecovery(t *testing.T) {
 	lc := &LineClient{AccessToken: "old-token"}
+	runCtx, _, started := lc.beginRun(context.Background())
+	if !started {
+		t.Fatal("beginRun unexpectedly rejected startup")
+	}
+	defer lc.wg.Done()
+	defer lc.cancelActiveRun()
+
 	recoveryStarted := make(chan struct{})
 	allowRecovery := make(chan struct{})
 	recoveryDone := make(chan error, 1)
@@ -323,10 +454,14 @@ func TestForcedLogoutWinsOverInFlightRecovery(t *testing.T) {
 	}()
 	<-recoveryStarted
 
-	logoutDone := make(chan struct{})
+	type recoveryResult struct {
+		client *line.Client
+		err    error
+	}
+	logoutDone := make(chan recoveryResult, 1)
 	go func() {
-		lc.markLoggedOutByOtherClient(context.Background(), errLoggedOut)
-		close(logoutDone)
+		client, err := lc.recoverClientAfterAuthError(context.Background(), line.NewClient("old-token"), errLoggedOut)
+		logoutDone <- recoveryResult{client: client, err: err}
 	}()
 	close(allowRecovery)
 
@@ -334,15 +469,52 @@ func TestForcedLogoutWinsOverInFlightRecovery(t *testing.T) {
 		t.Fatalf("recovery returned error: %v", err)
 	}
 	select {
-	case <-logoutDone:
+	case result := <-logoutDone:
+		if result.err != nil {
+			t.Fatalf("stale logout handling returned error: %v", result.err)
+		}
+		if result.client == nil || result.client.AccessToken != "recovered-token" {
+			t.Fatalf("retry client = %#v, want recovered-token", result.client)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("forced logout did not complete after recovery")
+		t.Fatal("stale logout handling did not complete after recovery")
 	}
-	if lc.hasAccessToken() {
-		t.Fatal("in-flight recovery resurrected the invalidated session")
+	if lc.getAccessToken() != "recovered-token" {
+		t.Fatalf("access token = %q, want recovered-token", lc.getAccessToken())
 	}
-	if !lc.isSessionInvalidated() {
-		t.Fatal("session was not invalidated after in-flight recovery")
+	if lc.isSessionInvalidated() {
+		t.Fatal("stale logout invalidated the recovered session")
+	}
+	select {
+	case <-runCtx.Done():
+		t.Fatal("stale logout canceled the active run")
+	default:
+	}
+}
+
+func TestCurrentTokenLoggedOutErrorsInvalidateSession(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "client logged out", err: errLoggedOut},
+		{name: "invalid sender key", err: errSenderKey},
+		{name: "request need login", err: errors.New(`SSE error: 401: {"code":10004,"message":"REQUEST_NEED_LOGIN"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lc := &LineClient{AccessToken: "current-token"}
+			retryClient, err := lc.recoverClientAfterAuthError(context.Background(), line.NewClient("current-token"), tt.err)
+			if err != nil {
+				t.Fatalf("recoverClientAfterAuthError returned error: %v", err)
+			}
+			if retryClient != nil {
+				t.Fatalf("retry client = %#v, want nil", retryClient)
+			}
+			if lc.hasAccessToken() || !lc.isSessionInvalidated() {
+				t.Fatal("current-token logout did not invalidate the session")
+			}
+		})
 	}
 }
 

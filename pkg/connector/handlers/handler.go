@@ -19,12 +19,9 @@ type Handler struct {
 	Log        zerolog.Logger
 	HTTPClient *http.Client
 
-	// RecoverToken attempts to restore a valid session by refreshing or re-logging in.
-	RecoverToken      func(ctx context.Context) error
-	ShouldRecover     func(ctx context.Context, err error) bool
-	IsRefreshRequired func(err error) bool
-	IsLoggedOut       func(err error) bool
-	HandleLoggedOut   func(ctx context.Context, err error)
+	// RecoverClient classifies auth errors using the client that made the failed
+	// request, and returns a client that may be used for one retry.
+	RecoverClient func(ctx context.Context, failedClient *line.Client, err error) (*line.Client, error)
 
 	// NewClient creates a new LINE API client with the current access token.
 	NewClient func() *line.Client
@@ -77,26 +74,26 @@ func mediaDownloadFailure(kind string, err error, relatesTo *event.RelatesTo) (*
 
 // tryRecoverClient attempts token recovery on auth errors and returns a fresh client.
 // Returns (newClient, true) on success, (nil, false) if recovery was not needed or failed.
-func (h *Handler) tryRecoverClient(ctx context.Context, err error) (*line.Client, bool) {
-	if err == nil {
+func (h *Handler) tryRecoverClient(ctx context.Context, failedClient *line.Client, err error) (*line.Client, bool) {
+	if err == nil || h.RecoverClient == nil {
 		return nil, false
 	}
-	if h.IsLoggedOut(err) {
-		if h.HandleLoggedOut != nil {
-			h.HandleLoggedOut(ctx, err)
-		}
-		return nil, false
-	}
-	if h.ShouldRecover != nil {
-		if !h.ShouldRecover(ctx, err) {
-			return nil, false
-		}
-	} else if !line.IsUnauthorizedStatus(err) && !h.IsRefreshRequired(err) {
-		return nil, false
-	}
-	if errRecover := h.RecoverToken(ctx); errRecover != nil {
+	recoveredClient, errRecover := h.RecoverClient(ctx, failedClient, err)
+	if errRecover != nil {
 		h.Log.Warn().Err(errRecover).Msg("Failed to recover token for media download")
 		return nil, false
 	}
-	return h.NewClient(), true
+	return recoveredClient, recoveredClient != nil
+}
+
+// handleFinalAuthError applies forced-logout handling to the one allowed retry
+// without requesting another retry. Source-aware recovery will ignore the error
+// if another token rotation already made the retry client stale.
+func (h *Handler) handleFinalAuthError(ctx context.Context, failedClient *line.Client, err error) {
+	if !line.IsLoggedOut(err) || h.RecoverClient == nil {
+		return
+	}
+	if _, errRecover := h.RecoverClient(ctx, failedClient, err); errRecover != nil {
+		h.Log.Warn().Err(errRecover).Msg("Failed to handle LINE logout after media retry")
+	}
 }

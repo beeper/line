@@ -144,14 +144,9 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	mid := string(portal.ID)
 	lowerMid := strings.ToLower(mid)
 	if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
-		client := lc.newClient()
-		res, err := client.GetChats([]string{mid}, true, true)
-		if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = lc.newClient()
-				res, err = client.GetChats([]string{mid}, true, true)
-			}
-		}
+		_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+			return client.GetChats([]string{mid}, true, true)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -211,14 +206,9 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 
 	// Use GetProfile for our own user data
 	if mid == lc.Mid || mid == string(lc.UserLogin.ID) {
-		client := lc.newClient()
-		profile, err := client.GetProfile()
-		if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = lc.newClient()
-				profile, err = client.GetProfile()
-			}
-		}
+		_, profile, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Profile, error) {
+			return client.GetProfile()
+		})
 		if err == nil && profile != nil {
 			contact := line.Contact{Mid: mid, DisplayName: profile.DisplayName, PicturePath: profile.PicturePath}
 			lc.setCachedContact(mid, contact)
@@ -228,13 +218,9 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 	}
 
 	client := lc.newClient()
-	res, err := client.GetContactsV2([]string{mid})
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			res, err = client.GetContactsV2([]string{mid})
-		}
-	}
+	client, res, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.ContactsResponse, error) {
+		return client.GetContactsV2([]string{mid})
+	})
 	if err == nil && res != nil && res.Contacts != nil {
 		if wrapper, ok := res.Contacts[mid]; ok {
 			lc.setCachedContact(mid, wrapper.Contact)
@@ -244,13 +230,9 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 
 	// Fall back to BuddyService for official/business accounts
 	lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Msg("Contact not found via GetContactsV2, trying BuddyService")
-	buddy, err := client.GetBuddyProfile(mid)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			buddy, err = client.GetBuddyProfile(mid)
-		}
-	}
+	_, buddy, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.BuddyProfile, error) {
+		return client.GetBuddyProfile(mid)
+	})
 	if err == nil && buddy != nil {
 		lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Str("display_name", buddy.DisplayName).Str("picture_path", buddy.PicturePath).Msg("Got buddy profile")
 		contact := line.Contact{Mid: mid, DisplayName: buddy.DisplayName, PicturePath: buddy.PicturePath}
@@ -332,19 +314,12 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	}
 
 	// Search contacts by display name
-	client := lc.newClient()
-	allMids, err := client.GetAllContactIds()
+	client, allMids, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
+		return client.GetAllContactIds()
+	})
 	if err != nil {
-		if lc.shouldAttemptTokenRecovery(ctx, err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = lc.newClient()
-				allMids, err = client.GetAllContactIds()
-			}
-		}
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get all contact IDs for search")
-			return results, nil
-		}
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get all contact IDs for search")
+		return results, nil
 	}
 
 	// Fetch contacts in batches to check display names
@@ -378,18 +353,11 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 var _ bridgev2.UserSearchingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveIdentifierResponse, error) {
-	client := lc.newClient()
-	allMids, err := client.GetAllContactIds()
+	client, allMids, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
+		return client.GetAllContactIds()
+	})
 	if err != nil {
-		if lc.shouldAttemptTokenRecovery(ctx, err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = lc.newClient()
-				allMids, err = client.GetAllContactIds()
-			}
-		}
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	var results []*bridgev2.ResolveIdentifierResponse
