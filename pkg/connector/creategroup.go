@@ -32,18 +32,11 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 		name = params.Name.Name
 	}
 
-	client := lc.newClient()
-	var chat *line.Chat
-	var err error
 	chatType := 1 // ROOM: members join automatically.
 	lineName := name
-	chat, err = client.CreateChat(participantMids, lineName, chatType)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			chat, err = client.CreateChat(participantMids, lineName, chatType)
-		}
-	}
+	_, chat, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Chat, error) {
+		return client.CreateChat(participantMids, lineName, chatType)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LINE chat: %w", err)
 	}
@@ -274,16 +267,11 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	keyIds = append(keyIds, selfRawID)
 	encryptedKeys = append(encryptedKeys, selfEncryptedKey)
 
-	if err := client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys); err != nil {
-		if lc.shouldAttemptTokenRecovery(ctx, err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = lc.newClient()
-				err = client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys)
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("registerE2EEGroupKey failed: %w", err)
-		}
+	_, err = lc.callLineUsing(ctx, client, func(client *line.Client) error {
+		return client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys)
+	})
+	if err != nil {
+		return fmt.Errorf("registerE2EEGroupKey failed: %w", err)
 	}
 
 	lc.UserLogin.Bridge.Log.Info().

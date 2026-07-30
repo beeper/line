@@ -50,10 +50,11 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 	dlStart := time.Now()
 	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
-	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
+	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
 		client = newClient
 		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 	}
+	h.handleFinalAuthError(ctx, client, err)
 
 	if err != nil {
 		h.Log.Warn().

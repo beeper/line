@@ -310,12 +310,6 @@ func TestConvertPostNotificationCancelsQueuedAlbumPreviewsAfterFailure(t *testin
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		IsLoggedOut: func(error) bool {
-			return false
-		},
-		ShouldRecover: func(context.Context, error) bool {
-			return false
-		},
 		DownloadAlbumPreview: func(ctx context.Context, _ *line.Client, oid, _, _ string) ([]byte, error) {
 			calls.Add(1)
 			if oid == "fatal-oid" {
@@ -397,12 +391,6 @@ func TestConvertPostNotificationKeepsSuccessfulAlbumImagesWhenOneExpired(t *test
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		IsLoggedOut: func(error) bool {
-			return false
-		},
-		ShouldRecover: func(context.Context, error) bool {
-			return false
-		},
 		DownloadAlbumPreview: func(_ context.Context, _ *line.Client, oid, _, _ string) ([]byte, error) {
 			if oid == "expired-oid" {
 				return nil, line.ErrOBSObjectNotFound
@@ -439,12 +427,6 @@ func TestConvertPostNotificationLeavesTransientAlbumFailureRetryable(t *testing.
 	handler := &Handler{
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
-		},
-		IsLoggedOut: func(error) bool {
-			return false
-		},
-		ShouldRecover: func(context.Context, error) bool {
-			return false
 		},
 		DownloadAlbumPreview: func(context.Context, *line.Client, string, string, string) ([]byte, error) {
 			return nil, line.ErrOBSEncodingIncomplete

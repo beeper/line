@@ -848,7 +848,7 @@ func TestReceiveRequestNeedLoginMarksLoggedOutImmediately(t *testing.T) {
 	}
 
 	lc := &LineClient{AccessToken: "stale"}
-	stopped := lc.handleReceiveAuthError(context.Background(), errors.New(`SSE error: 401: {"code":10004,"message":"REQUEST_NEED_LOGIN"}`))
+	stopped := lc.handleReceiveAuthError(context.Background(), line.NewClient("stale"), errors.New(`SSE error: 401: {"code":10004,"message":"REQUEST_NEED_LOGIN"}`))
 
 	if !stopped {
 		t.Fatal("receive auth handler should stop on REQUEST_NEED_LOGIN")
@@ -877,7 +877,7 @@ func TestReceiveAuthErrorWithValidProfileDoesNotRecover(t *testing.T) {
 	}
 
 	lc := &LineClient{AccessToken: "valid"}
-	stopped := lc.handleReceiveAuthError(context.Background(), errors.New("SSE error: 401"))
+	stopped := lc.handleReceiveAuthError(context.Background(), line.NewClient("valid"), errors.New("SSE error: 401"))
 
 	if stopped {
 		t.Fatal("receive auth handler should reconnect without stopping when the profile probe succeeds")
@@ -890,6 +890,59 @@ func TestReceiveAuthErrorWithValidProfileDoesNotRecover(t *testing.T) {
 	}
 	if lc.isSessionInvalidated() {
 		t.Fatal("valid session was marked invalidated")
+	}
+}
+
+func TestReceiveAuthErrorFromStaleSSEClientReconnectsCurrentToken(t *testing.T) {
+	oldGetProfile := getProfileWithToken
+	t.Cleanup(func() {
+		getProfileWithToken = oldGetProfile
+	})
+
+	var profileCalls int
+	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
+		profileCalls++
+		if token != "current-token" {
+			t.Fatalf("profile token = %q, want current token", token)
+		}
+		return &line.Profile{}, nil
+	}
+
+	lc := &LineClient{AccessToken: "current-token"}
+	stopped := lc.handleReceiveAuthError(context.Background(), line.NewClient("old-token"), errors.New("SSE error: 401"))
+
+	if stopped {
+		t.Fatal("stale SSE auth error stopped the current session")
+	}
+	if profileCalls != 1 {
+		t.Fatalf("profile calls = %d, want 1", profileCalls)
+	}
+	if lc.getAccessToken() != "current-token" || lc.isSessionInvalidated() {
+		t.Fatal("stale SSE auth error changed current session state")
+	}
+}
+
+func TestReceiveAuthErrorFromStaleSSEClientClassifiesCurrentProbeLogout(t *testing.T) {
+	oldGetProfile := getProfileWithToken
+	t.Cleanup(func() {
+		getProfileWithToken = oldGetProfile
+	})
+
+	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
+		if token != "current-token" {
+			t.Fatalf("profile token = %q, want current token", token)
+		}
+		return nil, errLoggedOut
+	}
+
+	lc := &LineClient{AccessToken: "current-token"}
+	stopped := lc.handleReceiveAuthError(context.Background(), line.NewClient("old-token"), errors.New("SSE error: 401"))
+
+	if !stopped {
+		t.Fatal("current-token profile logout should stop the session")
+	}
+	if lc.hasAccessToken() || !lc.isSessionInvalidated() {
+		t.Fatal("current-token profile logout was misclassified as a stale SSE response")
 	}
 }
 
@@ -913,7 +966,7 @@ func TestReceiveAuthErrorCancellationDuringProfileDoesNotInvalidate(t *testing.T
 	lc := &LineClient{AccessToken: "valid"}
 	result := make(chan bool, 1)
 	go func() {
-		result <- lc.handleReceiveAuthError(ctx, errors.New("SSE error: 401"))
+		result <- lc.handleReceiveAuthError(ctx, line.NewClient("valid"), errors.New("SSE error: 401"))
 	}()
 	<-profileStarted
 	cancel()

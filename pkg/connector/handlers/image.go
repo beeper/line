@@ -50,7 +50,7 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	// Refresh token if we get a 401
-	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
+	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
 		client = newClient
 		if isPlainMedia {
 			imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, "m", downloadOptions)
@@ -58,6 +58,7 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			imgData, err = client.DownloadOBSWithOptions(ctx, oid, talkMetaMessageID, downloadOptions)
 		}
 	}
+	h.handleFinalAuthError(ctx, client, err)
 	downloadDuration := time.Since(dlStart)
 
 	if err != nil {

@@ -117,14 +117,9 @@ var (
 )
 
 func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
-	client := lc.newClient()
-	res, err := client.GetMessageBoxes(opts)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			res, err = client.GetMessageBoxes(opts)
-		}
-	}
+	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.MessageBoxesResponse, error) {
+		return client.GetMessageBoxes(opts)
+	})
 	return res, err
 }
 
@@ -157,14 +152,9 @@ func (lc *LineClient) fetchAllMessageBoxes(ctx context.Context, opts line.Messag
 }
 
 func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
-	client := lc.newClient()
-	blockedMIDs, err := client.GetBlockedContactIds()
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			blockedMIDs, err = client.GetBlockedContactIds()
-		}
-	}
+	_, blockedMIDs, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
+		return client.GetBlockedContactIds()
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -600,14 +590,9 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		limit = 50
 	}
 
-	client := lc.newClient()
-	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
-		}
-	}
+	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+		return client.GetRecentMessagesV2(chatMID, limit)
+	})
 	if err != nil {
 		if unblockState != nil {
 			unblockState.complete()
@@ -771,14 +756,9 @@ func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMI
 // (live) message path. Used by prefetchMessages on startup.
 func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) bool {
 	start := time.Now()
-	client := lc.newClient()
-	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
-		}
-	}
+	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+		return client.GetRecentMessagesV2(chatMID, limit)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
 		return false
@@ -845,14 +825,9 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 }
 
 func (lc *LineClient) syncChatsNow(ctx context.Context) {
-	client := lc.newClient()
-	midsResp, err := client.GetAllChatMids(true, true)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			midsResp, err = client.GetAllChatMids(true, true)
-		}
-	}
+	client, midsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetAllChatMidsResponse, error) {
+		return client.GetAllChatMids(true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch all chat mids")
 		return
@@ -877,13 +852,10 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 			end = len(allMids)
 		}
 		batch := allMids[i:end]
-		chatsResp, err := client.GetChats(batch, true, true)
-		if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = lc.newClient()
-				chatsResp, err = client.GetChats(batch, true, true)
-			}
-		}
+		var chatsResp *line.GetChatsResponse
+		client, chatsResp, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.GetChatsResponse, error) {
+			return client.GetChats(batch, true, true)
+		})
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch batch of chats")
 			continue
@@ -1210,14 +1182,9 @@ func (lc *LineClient) cacheGroupMembersFromRecentMessages(ctx context.Context, c
 	if len(lc.getCachedGroupMembers(chatMid)) > 1 {
 		return
 	}
-	client := lc.newClient()
-	msgs, err := client.GetRecentMessagesV2(chatMid, 50)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			msgs, err = client.GetRecentMessagesV2(chatMid, 50)
-		}
-	}
+	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+		return client.GetRecentMessagesV2(chatMid, 50)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Debug().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch recent messages for group member cache")
 		return
@@ -1552,20 +1519,13 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	client := lc.newClient()
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
-	rev, err := getLastOpRevisionWithClient(ctx, client)
-	if err != nil && lc.isLoggedOut(err) {
-		lc.markLoggedOutByOtherClient(ctx, err)
-		return
-	}
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			rev, err = getLastOpRevisionWithClient(ctx, client)
-		} else {
-			lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token for getLastOpRevision")
-		}
-	}
+	_, rev, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (int64, error) {
+		return getLastOpRevisionWithClient(ctx, client)
+	})
 	if err != nil {
+		if lc.isSessionInvalidated() {
+			return
+		}
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get last op revision")
 	} else {
 		localRev = rev
@@ -1677,13 +1637,8 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 					continue
 				}
 
-				if lc.isLoggedOut(err) {
-					lc.markLoggedOutByOtherClient(ctx, err)
-					return
-				}
-
-				if line.IsUnauthorizedStatus(err) {
-					if lc.handleReceiveAuthError(ctx, err) {
+				if line.IsAuthError(err) {
+					if lc.handleReceiveAuthError(ctx, client, err) {
 						return
 					}
 				}
@@ -1708,7 +1663,8 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 
 	// This is only a health probe. Keep localRev unchanged so the reconnected
 	// stream replays operations that arrived while the old stream was stalled.
-	_, probeErr := getLastOpRevisionWithClient(ctx, lc.newClient())
+	probeClient := lc.newClient()
+	_, probeErr := getLastOpRevisionWithClient(ctx, probeClient)
 	if probeErr == nil {
 		return false
 	}
@@ -1716,26 +1672,25 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 		return true
 	}
 
-	if lc.isLoggedOut(probeErr) {
-		lc.markLoggedOutByOtherClient(ctx, probeErr)
-		return true
-	}
-
 	if line.IsUnauthorizedStatus(probeErr) {
-		return lc.handleReceiveAuthError(ctx, probeErr)
+		return lc.handleReceiveAuthError(ctx, probeClient, probeErr)
 	}
 
-	if lc.shouldAttemptTokenRecovery(ctx, probeErr) {
-		if errRecover := lc.recoverToken(ctx); errRecover != nil {
-			if errors.Is(errRecover, errLineSessionInvalidated) || lc.isLoggedOut(errRecover) {
-				lc.markLoggedOutByOtherClient(ctx, errRecover)
-				return true
-			}
-			if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token after receive auth probe")
-			}
+	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, probeClient, probeErr)
+	if errRecover != nil {
+		if errors.Is(errRecover, errLineSessionInvalidated) || errors.Is(errRecover, errLineClientSuperseded) || ctx.Err() != nil {
+			return true
+		}
+		if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token after receive auth probe")
 		}
 		return false
+	}
+	if recoveredClient != nil {
+		return false
+	}
+	if lc.isSessionInvalidated() {
+		return true
 	}
 
 	if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
@@ -1747,50 +1702,61 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 // handleReceiveAuthError handles auth failures from /operation/receive. The
 // receive endpoint may return only a bare 401/403, so probe getProfile to reveal
 // the detailed forced-logout envelope before deciding whether recovery is safe.
-func (lc *LineClient) handleReceiveAuthError(ctx context.Context, err error) bool {
+func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *line.Client, err error) bool {
 	if lc.isLoggedOut(err) {
-		lc.markLoggedOutByOtherClient(ctx, err)
-		return true
+		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+		if errRecover != nil {
+			return true
+		}
+		return recoveredClient == nil
 	}
 
-	_, profileErr := getProfileWithToken(ctx, lc.getAccessToken())
+	profileToken := lc.getAccessToken()
+	if profileToken == "" && failedClient != nil {
+		profileToken = failedClient.AccessToken
+	}
+	profileClient := newLineAPIClient(profileToken)
+	_, profileErr := getProfileWithToken(ctx, profileToken)
 	if ctx.Err() != nil {
 		return true
 	}
 	if lc.isLoggedOut(profileErr) {
-		lc.markLoggedOutByOtherClient(ctx, profileErr)
-		return true
+		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, profileClient, profileErr)
+		if errRecover != nil {
+			return true
+		}
+		return recoveredClient == nil
 	}
 	if profileErr == nil {
 		return false
 	}
 
-	if !lc.shouldAttemptTokenRecovery(ctx, err) {
+	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+	if recoveredClient != nil {
+		return false
+	}
+	if errRecover == nil {
 		return true
 	}
 
-	if errRecover := lc.recoverToken(ctx); errRecover != nil {
-		if ctx.Err() != nil {
-			return true
-		}
-		if errors.Is(errRecover, errLineSessionInvalidated) || lc.isLoggedOut(errRecover) {
-			lc.markLoggedOutByOtherClient(ctx, errRecover)
-			return true
-		}
-		if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
-			lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
-		}
-		if lc.UserLogin != nil && lc.UserLogin.BridgeState != nil {
-			lc.UserLogin.BridgeState.Send(status.BridgeState{
-				StateEvent: status.StateBadCredentials,
-				Error:      "line-logged-out",
-				Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
-				UserAction: status.UserActionRelogin,
-			})
-		}
+	if ctx.Err() != nil {
 		return true
 	}
-	return false
+	if errors.Is(errRecover, errLineSessionInvalidated) || errors.Is(errRecover, errLineClientSuperseded) {
+		return true
+	}
+	if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
+	}
+	if lc.UserLogin != nil && lc.UserLogin.BridgeState != nil {
+		lc.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      "line-logged-out",
+			Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
+			UserAction: status.UserActionRelogin,
+		})
+	}
+	return true
 }
 
 func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
@@ -1979,7 +1945,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			// Curr == nil signals a reaction removal/clear from LINE.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (self)")
-				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(string(lc.UserLogin.ID))})
+				lc.handleReactionRemove(op, param2.ChatMid, makeUserID(string(lc.UserLogin.ID)))
 				return
 			}
 
@@ -2018,7 +1984,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			// use the type 140 actor from param3, so the sender is unambiguous.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (other)")
-				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(op.Param3)})
+				lc.handleReactionRemove(op, param2.ChatMid, makeUserID(op.Param3))
 				return
 			}
 
@@ -2126,29 +2092,21 @@ func (lc *LineClient) liveReactionSyncEvent(
 	}
 }
 
-// handleReactionRemove queues an authoritative empty reaction sync for each
-// candidate sender. LINE only allows one reaction per sender, so this removes
-// both legacy empty-ID rows and stable paid/predefined reaction IDs without
-// needing the previous reaction type.
-func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, senders []networkid.UserID) {
-	for _, sender := range senders {
-		lc.UserLogin.Bridge.QueueRemoteEvent(
-			lc.UserLogin,
-			lc.liveReactionSyncEvent(op, chatMid, sender, nil),
-		)
-	}
+// handleReactionRemove queues an authoritative empty reaction sync for the
+// sender, removing both legacy empty-ID rows and stable paid/predefined reaction
+// IDs without needing the previous reaction type.
+func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, sender networkid.UserID) {
+	lc.UserLogin.Bridge.QueueRemoteEvent(
+		lc.UserLogin,
+		lc.liveReactionSyncEvent(op, chatMid, sender, nil),
+	)
 }
 
 func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 	chatMid := op.Param1
-	client := lc.newClient()
-	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
-		}
-	}
+	_, chatsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+		return client.GetChats([]string{chatMid}, true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch chat info")
 		// Only emit leave if we confirm the user is definitively not a member
@@ -2202,14 +2160,9 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 // checkChatMembership calls GetAllChatMids to verify whether the bridge user
 // is a member or invitee of the given chat.
 func (lc *LineClient) checkChatMembership(ctx context.Context, chatMid string) (isMember, isInvitee bool) {
-	client := lc.newClient()
-	midsResp, err := client.GetAllChatMids(true, true)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			midsResp, err = client.GetAllChatMids(true, true)
-		}
-	}
+	_, midsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetAllChatMidsResponse, error) {
+		return client.GetAllChatMids(true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("checkChatMembership: GetAllChatMids failed")
 		return false, false
@@ -2329,14 +2282,9 @@ func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
 }
 
 func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType OperationType) {
-	client := lc.newClient()
-	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
-		}
-	}
+	_, chatsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+		return client.GetChats([]string{chatMid}, true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch chat info for invite")
 		return
@@ -2377,14 +2325,9 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType O
 }
 
 func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
-	client := lc.newClient()
-	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && lc.shouldAttemptTokenRecovery(ctx, err) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = lc.newClient()
-			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
-		}
-	}
+	_, chatsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+		return client.GetChats([]string{chatMid}, true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch invited chat info")
 		return

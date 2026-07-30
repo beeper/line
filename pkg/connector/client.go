@@ -307,35 +307,20 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	return nil
 }
 
-func (lc *LineClient) isRefreshRequired(err error) bool {
-	return line.IsRefreshRequired(err)
-}
-
 func (lc *LineClient) isLoggedOut(err error) bool {
 	return line.IsLoggedOut(err)
 }
 
-func (lc *LineClient) shouldAttemptTokenRecovery(ctx context.Context, err error) bool {
-	if err == nil {
-		return false
-	}
-	if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() {
-		return false
-	}
-	if lc.isLoggedOut(err) {
-		lc.markLoggedOutByOtherClient(ctx, err)
-		return false
-	}
-	return lc.isRefreshRequired(err) || line.IsUnauthorizedStatus(err)
-}
-
 func (lc *LineClient) markLoggedOutByOtherClient(ctx context.Context, err error) {
-	// Serialize invalidation with token recovery. If a refresh/re-login was
-	// already in flight, it may finish first, but this transition always runs
-	// afterward so recovery cannot resurrect a forcefully logged-out session.
 	lc.recoverMu.Lock()
 	defer lc.recoverMu.Unlock()
+	lc.markLoggedOutByOtherClientLocked(ctx, err)
+}
 
+// markLoggedOutByOtherClientLocked applies the persistent forced-logout
+// transition. The caller must hold recoverMu so token rotation and invalidation
+// cannot interleave.
+func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err error) {
 	if lc.UserLogin == nil {
 		lc.invalidateAccessToken()
 		line.InvalidateOBSTokenCache()
@@ -783,42 +768,20 @@ func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLogi
 }
 
 func (lc *LineClient) ensureValidToken(ctx context.Context) error {
-	return lc.ensureValidTokenWith(
-		ctx,
-		func(ctx context.Context) error {
-			_, err := getProfileWithToken(ctx, lc.getAccessToken())
-			return err
-		},
-		lc.refreshAndSave,
-		lc.tryLogin,
-	)
-}
-
-func (lc *LineClient) ensureValidTokenWith(
-	ctx context.Context,
-	profile func(context.Context) error,
-	refresh func(context.Context) error,
-	relogin func(context.Context) error,
-) error {
-	err := profile(ctx)
+	_, _, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Profile, error) {
+		return getProfileWithToken(ctx, client.AccessToken)
+	})
 	if err == nil {
 		return nil
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-
-	if lc.isLoggedOut(err) {
+	if line.IsAuthError(err) {
 		return err
 	}
-
-	if !lc.isRefreshRequired(err) {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("GetProfile failed with non-auth error, continuing anyway")
-		return nil
-	}
-
-	lc.UserLogin.Bridge.Log.Info().Msg("Access token expired, attempting refresh...")
-	return lc.recoverTokenWith(ctx, refresh, relogin)
+	lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("GetProfile failed with non-auth error, continuing anyway")
+	return nil
 }
 
 func (lc *LineClient) Disconnect() {
