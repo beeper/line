@@ -307,10 +307,6 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	return nil
 }
 
-func (lc *LineClient) isRefreshRequired(err error) bool {
-	return line.IsRefreshRequired(err)
-}
-
 func (lc *LineClient) isLoggedOut(err error) bool {
 	return line.IsLoggedOut(err)
 }
@@ -786,33 +782,6 @@ func (lc *LineClient) ensureValidToken(ctx context.Context) error {
 	}
 	lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("GetProfile failed with non-auth error, continuing anyway")
 	return nil
-}
-
-func (lc *LineClient) ensureValidTokenWith(
-	ctx context.Context,
-	profile func(context.Context) error,
-	refresh func(context.Context) error,
-	relogin func(context.Context) error,
-) error {
-	err := profile(ctx)
-	if err == nil {
-		return nil
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	if lc.isLoggedOut(err) {
-		return err
-	}
-
-	if !lc.isRefreshRequired(err) {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("GetProfile failed with non-auth error, continuing anyway")
-		return nil
-	}
-
-	lc.UserLogin.Bridge.Log.Info().Msg("Access token expired, attempting refresh...")
-	return lc.recoverTokenWith(ctx, refresh, relogin)
 }
 
 func (lc *LineClient) Disconnect() {

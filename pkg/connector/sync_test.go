@@ -902,10 +902,10 @@ func TestReceiveAuthErrorFromStaleSSEClientReconnectsCurrentToken(t *testing.T) 
 	var profileCalls int
 	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
 		profileCalls++
-		if token != "old-token" {
-			t.Fatalf("profile token = %q, want failed SSE token", token)
+		if token != "current-token" {
+			t.Fatalf("profile token = %q, want current token", token)
 		}
-		return nil, errLoggedOut
+		return &line.Profile{}, nil
 	}
 
 	lc := &LineClient{AccessToken: "current-token"}
@@ -919,6 +919,30 @@ func TestReceiveAuthErrorFromStaleSSEClientReconnectsCurrentToken(t *testing.T) 
 	}
 	if lc.getAccessToken() != "current-token" || lc.isSessionInvalidated() {
 		t.Fatal("stale SSE auth error changed current session state")
+	}
+}
+
+func TestReceiveAuthErrorFromStaleSSEClientClassifiesCurrentProbeLogout(t *testing.T) {
+	oldGetProfile := getProfileWithToken
+	t.Cleanup(func() {
+		getProfileWithToken = oldGetProfile
+	})
+
+	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
+		if token != "current-token" {
+			t.Fatalf("profile token = %q, want current token", token)
+		}
+		return nil, errLoggedOut
+	}
+
+	lc := &LineClient{AccessToken: "current-token"}
+	stopped := lc.handleReceiveAuthError(context.Background(), line.NewClient("old-token"), errors.New("SSE error: 401"))
+
+	if !stopped {
+		t.Fatal("current-token profile logout should stop the session")
+	}
+	if lc.hasAccessToken() || !lc.isSessionInvalidated() {
+		t.Fatal("current-token profile logout was misclassified as a stale SSE response")
 	}
 }
 

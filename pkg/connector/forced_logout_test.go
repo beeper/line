@@ -50,30 +50,57 @@ func TestEnsureValidTokenReturnsLoggedOutWithoutRelogin(t *testing.T) {
 }
 
 func TestEnsureValidTokenDoesNotReloginAfterLoggedOutRefresh(t *testing.T) {
+	oldGetProfile := getProfileWithToken
+	oldRecover := recoverLineToken
+	t.Cleanup(func() {
+		getProfileWithToken = oldGetProfile
+		recoverLineToken = oldRecover
+	})
+
 	lc := &LineClient{
+		AccessToken: "expired",
 		UserLogin: &bridgev2.UserLogin{
 			Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
 		},
 	}
 	var reloginCalls int
-	err := lc.ensureValidTokenWith(
-		context.Background(),
-		func(context.Context) error { return errAuthRequired },
-		func(context.Context) error { return errLoggedOut },
-		func(context.Context) error {
-			reloginCalls++
-			return nil
-		},
-	)
-	if !line.IsLoggedOut(err) {
-		t.Fatalf("ensureValidTokenWith error = %v, want logged-out error", err)
+	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
+		if token != "expired" {
+			t.Fatalf("profile token = %q, want expired", token)
+		}
+		return nil, errAuthRequired
+	}
+	recoverLineToken = func(lc *LineClient, ctx context.Context) error {
+		return lc.recoverTokenWith(
+			ctx,
+			func(context.Context) error { return errLoggedOut },
+			func(context.Context) error {
+				reloginCalls++
+				return nil
+			},
+		)
+	}
+
+	err := lc.ensureValidToken(context.Background())
+	if !line.IsAuthError(err) {
+		t.Fatalf("ensureValidToken error = %v, want auth error", err)
 	}
 	if reloginCalls != 0 {
 		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
 	}
+	if lc.hasAccessToken() || !lc.isSessionInvalidated() {
+		t.Fatal("logged-out refresh did not invalidate the session")
+	}
 }
 
 func TestForcedLogoutWinsOverEnsureValidTokenRefresh(t *testing.T) {
+	oldGetProfile := getProfileWithToken
+	oldRecover := recoverLineToken
+	t.Cleanup(func() {
+		getProfileWithToken = oldGetProfile
+		recoverLineToken = oldRecover
+	})
+
 	lc := &LineClient{
 		AccessToken: "old-token",
 		UserLogin: &bridgev2.UserLogin{
@@ -84,10 +111,18 @@ func TestForcedLogoutWinsOverEnsureValidTokenRefresh(t *testing.T) {
 	allowRefresh := make(chan struct{})
 	ensureDone := make(chan error, 1)
 	var reloginCalls int
-	go func() {
-		ensureDone <- lc.ensureValidTokenWith(
-			context.Background(),
-			func(context.Context) error { return errAuthRequired },
+	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
+		if token == "recovered-token" {
+			return &line.Profile{}, nil
+		}
+		if token != "old-token" {
+			t.Fatalf("profile token = %q, want old-token or recovered-token", token)
+		}
+		return nil, errAuthRequired
+	}
+	recoverLineToken = func(lc *LineClient, ctx context.Context) error {
+		return lc.recoverTokenWith(
+			ctx,
 			func(context.Context) error {
 				close(refreshStarted)
 				<-allowRefresh
@@ -99,6 +134,9 @@ func TestForcedLogoutWinsOverEnsureValidTokenRefresh(t *testing.T) {
 				return nil
 			},
 		)
+	}
+	go func() {
+		ensureDone <- lc.ensureValidToken(context.Background())
 	}()
 	<-refreshStarted
 
@@ -110,7 +148,7 @@ func TestForcedLogoutWinsOverEnsureValidTokenRefresh(t *testing.T) {
 	close(allowRefresh)
 
 	if err := <-ensureDone; err != nil {
-		t.Fatalf("ensureValidTokenWith returned error: %v", err)
+		t.Fatalf("ensureValidToken returned error: %v", err)
 	}
 	if reloginCalls != 0 {
 		t.Fatalf("relogin calls = %d, want 0", reloginCalls)

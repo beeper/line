@@ -1712,15 +1712,16 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *
 	}
 
 	profileToken := lc.getAccessToken()
-	if failedClient != nil && failedClient.AccessToken != "" {
+	if profileToken == "" && failedClient != nil {
 		profileToken = failedClient.AccessToken
 	}
+	profileClient := newLineAPIClient(profileToken)
 	_, profileErr := getProfileWithToken(ctx, profileToken)
 	if ctx.Err() != nil {
 		return true
 	}
 	if lc.isLoggedOut(profileErr) {
-		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, profileErr)
+		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, profileClient, profileErr)
 		if errRecover != nil {
 			return true
 		}
@@ -1944,7 +1945,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			// Curr == nil signals a reaction removal/clear from LINE.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (self)")
-				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(string(lc.UserLogin.ID))})
+				lc.handleReactionRemove(op, param2.ChatMid, makeUserID(string(lc.UserLogin.ID)))
 				return
 			}
 
@@ -1983,7 +1984,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			// use the type 140 actor from param3, so the sender is unambiguous.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (other)")
-				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(op.Param3)})
+				lc.handleReactionRemove(op, param2.ChatMid, makeUserID(op.Param3))
 				return
 			}
 
@@ -2091,17 +2092,14 @@ func (lc *LineClient) liveReactionSyncEvent(
 	}
 }
 
-// handleReactionRemove queues an authoritative empty reaction sync for each
-// candidate sender. LINE only allows one reaction per sender, so this removes
-// both legacy empty-ID rows and stable paid/predefined reaction IDs without
-// needing the previous reaction type.
-func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, senders []networkid.UserID) {
-	for _, sender := range senders {
-		lc.UserLogin.Bridge.QueueRemoteEvent(
-			lc.UserLogin,
-			lc.liveReactionSyncEvent(op, chatMid, sender, nil),
-		)
-	}
+// handleReactionRemove queues an authoritative empty reaction sync for the
+// sender, removing both legacy empty-ID rows and stable paid/predefined reaction
+// IDs without needing the previous reaction type.
+func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, sender networkid.UserID) {
+	lc.UserLogin.Bridge.QueueRemoteEvent(
+		lc.UserLogin,
+		lc.liveReactionSyncEvent(op, chatMid, sender, nil),
+	)
 }
 
 func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
