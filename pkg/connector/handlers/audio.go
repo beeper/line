@@ -15,6 +15,10 @@ import (
 
 // ConvertAudio converts a LINE audio message to a Matrix audio message.
 func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
+	}
+
 	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
@@ -93,6 +97,10 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 				audioData = decryptedAudio
 			}
 		}
+	}
+
+	if oversized := h.oversizedMediaNotice(int64(len(audioData)), "downloaded", relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
 	var duration int

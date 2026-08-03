@@ -16,6 +16,10 @@ import (
 
 // ConvertVideo converts a LINE video message to a Matrix video message.
 func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
+	}
+
 	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
@@ -107,6 +111,10 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 				h.Log.Info().Int("decrypted_size", len(videoData)).Msg("Successfully decrypted video from ENC_KM")
 			}
 		}
+	}
+
+	if oversized := h.oversizedMediaNotice(int64(len(videoData)), "downloaded", relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
 	fileName := data.ContentMetadata["FILE_NAME"]
