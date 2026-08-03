@@ -12,6 +12,11 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
+const (
+	BeeperMaxFileSize = 100 * 1024 * 1024
+	oversizedFileBody = "This file exceeds Beeper's 100MB file size limit. Open LINE, to view it."
+)
+
 // ConvertFile converts a LINE file message to a Matrix file message.
 func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
 	client := h.NewClient()
@@ -89,6 +94,14 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		}
 	}
 
+	if oversized := oversizedFileNotice(len(fileData), relatesTo); oversized != nil {
+		h.Log.Warn().
+			Int("size_bytes", len(fileData)).
+			Int("limit_bytes", BeeperMaxFileSize).
+			Msg("Skipping oversized LINE file upload")
+		return oversized, nil
+	}
+
 	if fileName == "" {
 		fileName = data.ContentMetadata["FILE_NAME"]
 	}
@@ -133,4 +146,22 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 			},
 		},
 	}, nil
+}
+
+func oversizedFileNotice(size int, relatesTo *event.RelatesTo) *bridgev2.ConvertedMessage {
+	if size <= BeeperMaxFileSize {
+		return nil
+	}
+	return &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{
+			{
+				Type: event.EventMessage,
+				Content: &event.MessageEventContent{
+					MsgType:   event.MsgNotice,
+					Body:      oversizedFileBody,
+					RelatesTo: relatesTo,
+				},
+			},
+		},
+	}
 }
