@@ -15,6 +15,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
@@ -64,6 +65,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 		File: event.FileFeatureMap{
 			event.MsgImage: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"image/jpeg":    event.CapLevelFullySupported,
 					"image/png":     event.CapLevelFullySupported,
@@ -80,6 +82,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.MsgFile: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"image/gif": event.CapLevelFullySupported,
 					"*/*":       event.CapLevelFullySupported,
@@ -87,6 +90,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.MsgVideo: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"video/mp4":        event.CapLevelFullySupported,
 					"video/webm":       event.CapLevelFullySupported,
@@ -100,6 +104,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.MsgAudio: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"audio/mpeg":  event.CapLevelFullySupported,
 					"audio/ogg":   event.CapLevelFullySupported,
@@ -117,6 +122,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.CapMsgVoice: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"audio/ogg":   event.CapLevelFullySupported,
 					"audio/mp4":   event.CapLevelFullySupported,

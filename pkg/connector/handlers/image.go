@@ -15,6 +15,10 @@ import (
 
 // ConvertImage converts a LINE image message to a Matrix image message.
 func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
+	}
+
 	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
@@ -93,6 +97,10 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			}
 			imgData = decryptedImg
 		}
+	}
+
+	if oversized := h.oversizedMediaNotice(int64(len(imgData)), "downloaded", relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
 	// Upload to Matrix
