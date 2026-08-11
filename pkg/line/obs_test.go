@@ -88,6 +88,73 @@ func TestDownloadOBSPlainMatchesChromeRequestFlow(t *testing.T) {
 	}
 }
 
+func TestDownloadOBSPublicResourceMatchesChromeRequestFlow(t *testing.T) {
+	var request *http.Request
+	client := NewClient("line-token-that-must-not-be-used")
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			request = req
+			return obsResponse(http.StatusOK, "business-image"), nil
+		}),
+	}
+
+	data, err := client.DownloadOBSPublicResource(
+		context.Background(),
+		"/r/official/image-id?public=resource",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "business-image" {
+		t.Fatalf("data = %q, want business-image", data)
+	}
+	if request == nil {
+		t.Fatal("public resource request was not made")
+	}
+	if request.URL.Scheme != "https" || request.URL.Host != "obs.line-apps.com" {
+		t.Fatalf("request URL origin = %s://%s", request.URL.Scheme, request.URL.Host)
+	}
+	if request.URL.Path != "/r/official/image-id" || request.URL.RawQuery != "public=resource" {
+		t.Fatalf("request URL = %s", request.URL.String())
+	}
+	if request.Header.Get("X-Line-Access") != "" {
+		t.Fatal("public resource request unexpectedly included X-Line-Access")
+	}
+	if request.Header.Get("X-Line-Application") != "" {
+		t.Fatal("public resource request unexpectedly included X-Line-Application")
+	}
+	if request.Header.Get("X-Talk-Meta") != "" {
+		t.Fatal("public resource request unexpectedly included X-Talk-Meta")
+	}
+}
+
+func TestDownloadOBSPublicResourceRejectsExternalURL(t *testing.T) {
+	client := NewClient("line-token")
+	for _, resourcePath := range []string{
+		"https://example.com/image",
+		"//example.com/image",
+		"relative/image",
+	} {
+		if _, err := client.DownloadOBSPublicResource(context.Background(), resourcePath); err == nil {
+			t.Fatalf("resource path %q was accepted", resourcePath)
+		}
+	}
+}
+
+func TestDownloadOBSPublicResourceClassifiesMissingObject(t *testing.T) {
+	client := NewClient("line-token")
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return obsResponse(http.StatusNotFound, "not found"), nil
+		}),
+	}
+
+	_, err := client.DownloadOBSPublicResource(context.Background(), "/r/official/missing")
+	if !errors.Is(err, ErrOBSObjectNotFound) {
+		t.Fatalf("err = %v, want ErrOBSObjectNotFound", err)
+	}
+}
+
 func TestDownloadOBSResourceUsesReceiveServiceAndSID(t *testing.T) {
 	installCachedOBSToken(t)
 

@@ -716,6 +716,45 @@ func (c *Client) DownloadOBSWithSIDOptions(ctx context.Context, oid string, mess
 	return c.downloadOBSWithServiceAndSIDOptions(ctx, "talk", sid, oid, messageID, opts)
 }
 
+// DownloadOBSPublicResource downloads a public OBS resource referenced by
+// message content metadata. LINE Chrome uses DOWNLOAD_URL directly and skips
+// object_info.obs and the private OBS authorization header mapper.
+func (c *Client) DownloadOBSPublicResource(ctx context.Context, resourcePath string) ([]byte, error) {
+	parsedPath, err := url.Parse(resourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse public OBS resource path: %w", err)
+	}
+	if parsedPath.IsAbs() || parsedPath.Host != "" || !strings.HasPrefix(parsedPath.Path, "/") {
+		return nil, errors.New("public OBS resource must be an absolute path")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, OBSBaseURL+resourcePath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create public OBS resource request: %w", err)
+	}
+	req.Header.Set("User-Agent", UserAgent)
+
+	resp, err := c.obsHTTPClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("public OBS resource request failed: %w", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read public OBS resource response: %w", readErr)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return body, nil
+	case http.StatusAccepted:
+		return nil, ErrOBSEncodingIncomplete
+	case http.StatusNotFound:
+		return nil, ErrOBSObjectNotFound
+	default:
+		return nil, fmt.Errorf("public OBS resource download failed (%d): %s", resp.StatusCode, string(body))
+	}
+}
+
 // DownloadOBSResource retrieves a non-talk resource using the service, SID,
 // and OID supplied by LINE metadata. Album post previews use service "album"
 // and SID "a".

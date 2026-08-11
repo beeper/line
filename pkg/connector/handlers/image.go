@@ -20,57 +20,56 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	client := h.NewClient()
-	oid := data.ContentMetadata["OID"]
-	isPlainMedia := oid == ""
-
-	// For plain media, the image is stored at r/talk/m/{messageID}
-	if isPlainMedia {
-		oid = data.ID
-	}
-
-	if oid == "" {
+	downloadSource := lineImageDownloadSource(data)
+	if downloadSource.publicPath == "" && downloadSource.oid == "" {
 		return nil, nil
 	}
 
 	mediaCategory := lineMediaCategory(data.ContentMetadata)
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, downloadSource.isPlainMedia)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, downloadSource.isPlainMedia)
 
 	var imgData []byte
 	var err error
 	dlStart := time.Now()
 	h.Log.Debug().
-		Str("oid", oid).
+		Str("oid", downloadSource.oid).
 		Str("msg_id", data.ID).
 		Str("tid", downloadOptions.TID).
 		Str("media_category", mediaCategory).
 		Bool("has_obs_pop", downloadOptions.OBSPop != "").
-		Bool("plain_media", isPlainMedia).
+		Bool("plain_media", downloadSource.isPlainMedia).
+		Bool("public_resource", downloadSource.publicPath != "").
 		Msg("Downloading image from LINE OBS")
-	if isPlainMedia {
-		imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, "m", downloadOptions)
+	if downloadSource.publicPath != "" {
+		imgData, err = client.DownloadOBSPublicResource(ctx, downloadSource.publicPath)
+	} else if downloadSource.isPlainMedia {
+		imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
 	} else {
-		imgData, err = client.DownloadOBSWithOptions(ctx, oid, talkMetaMessageID, downloadOptions)
+		imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
 	}
 
 	// Refresh token if we get a 401
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		if isPlainMedia {
-			imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, "m", downloadOptions)
-		} else {
-			imgData, err = client.DownloadOBSWithOptions(ctx, oid, talkMetaMessageID, downloadOptions)
+	if downloadSource.publicPath == "" {
+		if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
+			client = newClient
+			if downloadSource.isPlainMedia {
+				imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
+			} else {
+				imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
+			}
 		}
+		h.handleFinalAuthError(ctx, client, err)
 	}
-	h.handleFinalAuthError(ctx, client, err)
 	downloadDuration := time.Since(dlStart)
 
 	if err != nil {
 		h.Log.Warn().
 			Err(err).
-			Str("oid", oid).
+			Str("oid", downloadSource.oid).
 			Str("msg_id", data.ID).
-			Bool("plain_media", isPlainMedia).
+			Bool("plain_media", downloadSource.isPlainMedia).
+			Bool("public_resource", downloadSource.publicPath != "").
 			Dur("download_duration", downloadDuration).
 			Msg("Failed to download image from OBS")
 		return mediaDownloadFailure("Image", err, relatesTo)
@@ -145,6 +144,26 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			},
 		},
 	}, nil
+}
+
+type imageDownloadSource struct {
+	publicPath   string
+	oid          string
+	isPlainMedia bool
+}
+
+func lineImageDownloadSource(data line.Message) imageDownloadSource {
+	if publicPath := data.ContentMetadata["DOWNLOAD_URL"]; publicPath != "" {
+		return imageDownloadSource{publicPath: publicPath}
+	}
+
+	oid := data.ContentMetadata["OID"]
+	if oid != "" {
+		return imageDownloadSource{oid: oid}
+	}
+
+	// For plain media, the image is stored at r/talk/m/{messageID}.
+	return imageDownloadSource{oid: data.ID, isPlainMedia: true}
 }
 
 func lineMediaCategory(metadata map[string]string) string {
