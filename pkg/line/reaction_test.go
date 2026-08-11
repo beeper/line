@@ -101,6 +101,30 @@ func TestCancelReactionRequestBody(t *testing.T) {
 	}
 }
 
+func TestGetRecentMessagesV2AcceptsPaidReactionStringVersion(t *testing.T) {
+	client := newReactionTestClientWithResponse(
+		t,
+		"/api/talk/thrift/Talk/TalkService/getRecentMessagesV2",
+		`{"code":0,"message":"ok","data":[
+			{"id":"newer"},
+			{"id":"affected","reactions":[{"fromUserMid":"U-paid","atMillis":"1784930400456","reactionType":{"paidReactionType":{"productId":"product","emojiId":"143","resourceType":1,"version":"1"}}}]}
+		]}`,
+		nil,
+	)
+
+	messages, err := client.GetRecentMessagesV2("U-chat", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("message count = %d, want 2", len(messages))
+	}
+	paid := messages[1].Reactions[0].ReactionType.PaidReactionType
+	if paid == nil || paid.Version != 1 {
+		t.Fatalf("paid reaction = %#v, want version 1", paid)
+	}
+}
+
 func TestReactNonZeroWrapperKeepsInvalidPaidReactionDetails(t *testing.T) {
 	client := newReactionTestClientWithResponse(t, "/api/talk/thrift/Talk/TalkService/react", `{"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":0,"reason":"Invalid paidReactionType in reactionType","parameterMap":null}}`, nil)
 	err := client.React(123, "616934195205767730", ReactionType{
