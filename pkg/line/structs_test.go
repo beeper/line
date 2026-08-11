@@ -64,7 +64,7 @@ func TestMessageUnmarshalsRecentMessageReactions(t *testing.T) {
 						"productId":"670e0cce840a8236ddd4ee4c",
 						"emojiId":"143",
 						"resourceType":1,
-						"version":1
+						"version":"1"
 					}
 				}
 			}
@@ -85,8 +85,19 @@ func TestMessageUnmarshalsRecentMessageReactions(t *testing.T) {
 	if paid.FromUserMID != "U-paid" || paid.AtMillis.String() != "1784930400456" ||
 		paid.ReactionType.PaidReactionType == nil ||
 		paid.ReactionType.PaidReactionType.ProductID != "670e0cce840a8236ddd4ee4c" ||
-		paid.ReactionType.PaidReactionType.EmojiID != "143" {
+		paid.ReactionType.PaidReactionType.EmojiID != "143" ||
+		paid.ReactionType.PaidReactionType.Version != 1 {
 		t.Fatalf("paid reaction = %#v", paid)
+	}
+}
+
+func TestPaidReactionTypeUnmarshalsNumericVersion(t *testing.T) {
+	var reaction PaidReactionType
+	if err := json.Unmarshal([]byte(`{"version":1}`), &reaction); err != nil {
+		t.Fatal(err)
+	}
+	if reaction.Version != 1 {
+		t.Fatalf("version = %d, want 1", reaction.Version)
 	}
 }
 
