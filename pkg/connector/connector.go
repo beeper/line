@@ -145,15 +145,20 @@ func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.User
 	return nil
 }
 
+const LoginFlowIDEmail = "dev.highest.matrix.line.email_login"
+
 func (lc *LineConnector) GetLoginFlows() []bridgev2.LoginFlow {
 	return []bridgev2.LoginFlow{{
 		Name:        "Login",
 		Description: "Login with your LINE Email and Password",
-		ID:          "dev.highest.matrix.line.email_login",
+		ID:          LoginFlowIDEmail,
 	}}
 }
 
 func (lc *LineConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
+	if flowID != LoginFlowIDEmail {
+		return nil, bridgev2.ErrInvalidLoginFlowID
+	}
 	return &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu}, nil
 }
 
@@ -233,7 +238,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 		ll.logLoginFailure(err, "reconnect")
 		reason := loginErrorReason(err)
 		if reason == "" {
-			reason = fmt.Sprintf("Login failed: %v", err)
+			reason = genericLoginFailureReason
 		}
 		return ll.loginErrorStep(reason), nil
 	}
@@ -260,7 +265,7 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 		ll.logLoginFailure(err, "credentials")
 		reason := loginErrorReason(err)
 		if reason == "" {
-			reason = fmt.Sprintf("Login failed: %v", err)
+			reason = genericLoginFailureReason
 		}
 		return ll.loginErrorStep(reason), nil
 	}
@@ -456,10 +461,10 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 			if res.AuthToken != "" {
 				return ll.finishLogin(ctx, res)
 			}
-			return nil, fmt.Errorf("verification failed: no auth token received")
+			return nil, ErrLoginVerificationFailed
 		case err := <-ll.pollErr:
 			ll.logLoginFailure(err, "verification_poll")
-			return nil, fmt.Errorf("verification failed: %w", err)
+			return nil, wrapLineLoginError(err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -469,7 +474,7 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 		res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)
 		if err != nil {
 			ll.logLoginFailure(err, "pin_continuation")
-			return nil, fmt.Errorf("login failed: %w", err)
+			return nil, wrapLineLoginError(err)
 		}
 		return ll.handleLoginResponse(ctx, res)
 	}
@@ -581,7 +586,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		ll.User.Bridge.Log.Info().Int("keys", len(meta.ExportedKeyMap)).Msg("Preserved existing E2EE keys after re-login")
 	}
 	if !res.NoE2EE && len(meta.ExportedKeyMap) == 0 {
-		return nil, fmt.Errorf("LINE login completed without E2EE keychain; please reconnect again and complete the LINE verification prompt")
+		return nil, ErrLoginNoKeychain
 	}
 
 	detectedLineID := networkid.UserLoginID(mid)
