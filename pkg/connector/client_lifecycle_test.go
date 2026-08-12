@@ -78,11 +78,11 @@ func TestLineClientDisconnectBeforeConnectRejectsStartup(t *testing.T) {
 
 func TestCreateLoginSharesFinalizationLock(t *testing.T) {
 	connector := &LineConnector{}
-	firstProcess, err := connector.CreateLogin(context.Background(), nil, "")
+	firstProcess, err := connector.CreateLogin(context.Background(), nil, LoginFlowIDEmail)
 	if err != nil {
 		t.Fatalf("first CreateLogin returned error: %v", err)
 	}
-	secondProcess, err := connector.CreateLogin(context.Background(), nil, "")
+	secondProcess, err := connector.CreateLogin(context.Background(), nil, LoginFlowIDEmail)
 	if err != nil {
 		t.Fatalf("second CreateLogin returned error: %v", err)
 	}
