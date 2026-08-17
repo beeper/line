@@ -3,6 +3,7 @@ package ltsm
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"testing"
 )
 
@@ -19,6 +20,35 @@ func initModule(t *testing.T) (*Module, *Imports) {
 	mod.fT()
 
 	return mod, imp
+}
+
+func TestAbortPanicIsClassifiable(t *testing.T) {
+	defer func() {
+		recovered := recover()
+		err, ok := recovered.(error)
+		if !ok || !errors.Is(err, ErrAbort) {
+			t.Fatalf("unexpected recovered abort: %#v", recovered)
+		}
+	}()
+	new(Imports).Import_m()
+}
+
+func TestDestroyDispatchesRegisteredDestructor(t *testing.T) {
+	_, imp := initModule(t)
+	strPtr := imp.writeStdString("wODdrvWqmdP4Zliay-iF3cz3KZcK0ekrial868apg06TXeCo7A1hIQO0ESElHg6D")
+	skPtr, err := imp.CallStatic("SecureKey", "loadToken", strPtr)
+	if err != nil {
+		t.Fatalf("SecureKey.loadToken failed: %v", err)
+	}
+	if err = imp.Destroy("SecureKey", skPtr); err != nil {
+		t.Fatalf("SecureKey destructor failed: %v", err)
+	}
+	if err = imp.Destroy("SecureKey", 0); err != nil {
+		t.Fatalf("zero pointer destruction failed: %v", err)
+	}
+	if err = imp.Destroy("MissingClass", skPtr); err == nil {
+		t.Fatal("destroying an unknown class succeeded")
+	}
 }
 
 func TestEmbindInit(t *testing.T) {

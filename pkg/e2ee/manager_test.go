@@ -2,11 +2,28 @@ package e2ee
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
 )
+
+func TestIsFatalLTSMError(t *testing.T) {
+	if !isFatalLTSMError(ltsm.ErrAbort) {
+		t.Fatal("direct LTSM abort was not classified as fatal")
+	}
+	if !isFatalLTSMError(fmt.Errorf("decrypt failed: %w", ltsm.ErrAbort)) {
+		t.Fatal("wrapped LTSM abort was not classified as fatal")
+	}
+	if !isFatalLTSMError(fmt.Errorf("V2 failed: %w; V1 fallback failed: %w", errors.New("invalid V2 ciphertext"), ltsm.ErrAbort)) {
+		t.Fatal("LTSM abort in a combined fallback error was not classified as fatal")
+	}
+	if isFatalLTSMError(errors.New("authentication failed")) {
+		t.Fatal("ordinary decryption error was classified as fatal")
+	}
+}
 
 func TestUnwrapGroupSharedKeyReturnsMissingOwnPrivateKey(t *testing.T) {
 	manager := &Manager{

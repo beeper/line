@@ -1,11 +1,15 @@
 package line
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
 )
 
 func TestBuildLoginSecretMatchesNodeAlgorithm(t *testing.T) {
@@ -117,9 +121,74 @@ func TestGetSignatureFromRunner(t *testing.T) {
 		t.Fatalf("GetSignature failed: %v", err)
 	}
 
-	const want = "HivdBfCU/jXr3qqNDr68RScS2jp4FR2SYGZcL9wbw0k="
+	const want = "e4Qtp1IpDvrJIOZMyj364UwWINt5qhNxx5p3a+XM7Co="
 	if signature != want {
 		t.Fatalf("unexpected signature: got %q want %q", signature, want)
+	}
+}
+
+func newSigningTestRunner(t *testing.T) *Runner {
+	t.Helper()
+	const token = "wODdrvWqmdP4Zliay-iF3cz3KZcK0ekrial868apg06TXeCo7A1hIQO0ESElHg6D"
+	rt, err := ltsm.NewRuntime()
+	if err != nil {
+		t.Fatalf("NewRuntime failed: %v", err)
+	}
+	skPtr, err := rt.SecureKeyLoadToken(token)
+	if err != nil {
+		t.Fatalf("SecureKeyLoadToken failed: %v", err)
+	}
+	return &Runner{
+		rt:              rt,
+		token:           token,
+		clientVersion:   "3.7.2",
+		skPtr:           skPtr,
+		signingContexts: make(map[[sha256.Size]byte]signingContext),
+	}
+}
+
+func TestGetSignatureReusesSigningContext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping runner integration test in short mode")
+	}
+	r := newSigningTestRunner(t)
+	var want string
+	for i := 0; i < 6000; i++ {
+		signature, err := r.GetSignature("/api/test", "{}", "token")
+		if err != nil {
+			t.Fatalf("signature %d failed: %v", i+1, err)
+		}
+		if i == 0 {
+			want = signature
+		} else if signature != want {
+			t.Fatalf("signature %d changed: got %q want %q", i+1, signature, want)
+		}
+	}
+	if got := len(r.signingContexts); got != 1 {
+		t.Fatalf("unexpected signing cache size: got %d want 1", got)
+	}
+}
+
+func TestGetSignatureEvictsSigningContexts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping runner integration test in short mode")
+	}
+	r := newSigningTestRunner(t)
+	wantByToken := make(map[string]string)
+	for i := 0; i < 6000; i++ {
+		token := fmt.Sprintf("token-%d", i%(signingCacheCapacity+2))
+		signature, err := r.GetSignature("/api/test", "{}", token)
+		if err != nil {
+			t.Fatalf("signature %d failed: %v", i+1, err)
+		}
+		if want, ok := wantByToken[token]; !ok {
+			wantByToken[token] = signature
+		} else if signature != want {
+			t.Fatalf("signature for %q changed: got %q want %q", token, signature, want)
+		}
+	}
+	if got := len(r.signingContexts); got != signingCacheCapacity {
+		t.Fatalf("unexpected signing cache size: got %d want %d", got, signingCacheCapacity)
 	}
 }
 

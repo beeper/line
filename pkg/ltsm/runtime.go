@@ -105,6 +105,10 @@ func (rt *Runtime) MarkSecureKeyExportable(ptr uint32) {
 	rt.imp.MarkSecureKeyExportable(ptr)
 }
 
+func (rt *Runtime) SecureKeyDestroy(ptr uint32) error {
+	return rt.imp.Destroy("SecureKey", ptr)
+}
+
 // --- Hmac ---
 
 func (rt *Runtime) HmacNew(dkPtr uint32) (uint32, error) {
@@ -123,12 +127,16 @@ func (rt *Runtime) HmacDigest(hmacPtr uint32, data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ltsm: Hmac.digest failed: %w", err)
 	}
+	defer rt.imp.emval.DecRef(handle)
 	result, err := rt.imp.ReadEmvalBytes(handle)
 	if err != nil {
 		return nil, fmt.Errorf("ltsm: failed to read digest result: %w", err)
 	}
-	rt.imp.emval.DecRef(handle)
 	return result, nil
+}
+
+func (rt *Runtime) HmacDestroy(ptr uint32) error {
+	return rt.imp.Destroy("Hmac", ptr)
 }
 
 // --- AesKey ---
@@ -427,6 +435,7 @@ func (rt *Runtime) Sign(token, clientVersion, accessToken, reqPath, body string)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = rt.SecureKeyDestroy(skPtr) }()
 
 	cvHash := sha256.Sum256([]byte(clientVersion))
 	atHash := sha256.Sum256([]byte(accessToken))
@@ -435,11 +444,13 @@ func (rt *Runtime) Sign(token, clientVersion, accessToken, reqPath, body string)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = rt.SecureKeyDestroy(dkPtr) }()
 
 	hmacPtr, err := rt.HmacNew(dkPtr)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = rt.HmacDestroy(hmacPtr) }()
 
 	dataToSign := []byte(reqPath + body)
 	sigBytes, err := rt.HmacDigest(hmacPtr, dataToSign)

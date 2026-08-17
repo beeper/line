@@ -58,39 +58,22 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		return mediaDownloadFailure("File", err, relatesTo)
 	}
 
-	// Try to decrypt using keyMaterial from encrypted payload
 	var fileName string
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-			FileName    string `json:"fileName"`
+	if strings.Contains(decryptedBody, "fileName") {
+		var fileInfo struct {
+			FileName string `json:"fileName"`
 		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err != nil {
+		if err := json.Unmarshal([]byte(decryptedBody), &fileInfo); err != nil {
 			h.Log.Error().Err(err).Msg("Failed to parse file payload JSON")
 			return nil, fmt.Errorf("failed to parse file payload: %w", err)
 		}
+		fileName = fileInfo.FileName
+	}
 
-		if decryptInfo.KeyMaterial != "" {
-			keyPreview := decryptInfo.KeyMaterial
-			if len(keyPreview) > 20 {
-				keyPreview = keyPreview[:20] + "..."
-			}
-			h.Log.Debug().
-				Str("key_material_preview", keyPreview).
-				Msg("Decrypting file using keyMaterial from payload")
-
-			decryptedFile, err := h.DecryptMedia(fileData, decryptInfo.KeyMaterial)
-			if err != nil {
-				h.Log.Error().Err(err).Msg("Failed to decrypt file data")
-				return nil, fmt.Errorf("failed to decrypt file data: %w", err)
-			}
-			fileData = decryptedFile
-			h.Log.Info().Int("decrypted_size", len(fileData)).Msg("Successfully decrypted file")
-		}
-
-		if decryptInfo.FileName != "" {
-			fileName = decryptInfo.FileName
-		}
+	fileData, err = h.decryptDownloadedMedia(fileData, decryptedBody, data.ContentMetadata, "file")
+	if err != nil {
+		h.Log.Error().Err(err).Msg("Failed to decrypt file data")
+		return nil, err
 	}
 
 	if oversized := h.oversizedMediaNotice(int64(len(fileData)), "downloaded", relatesTo); oversized != nil {

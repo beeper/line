@@ -15,12 +15,17 @@ import (
 
 	gen "github.com/highesttt/matrix-line-messenger/pkg"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
 )
 
 var (
 	ErrMissingOwnPrivateKey = errors.New("missing my private key")
 	ErrGroupKeyNotLoaded    = errors.New("e2ee key not loaded")
 )
+
+func isFatalLTSMError(err error) bool {
+	return errors.Is(err, ltsm.ErrAbort)
+}
 
 /*
 This wraps the JS runner to perform storage init, key/channel handling, and e2ee encrypt/decrypt.
@@ -246,6 +251,9 @@ func (m *Manager) EncryptMessageV2Raw(chatID, from string, myKeyID int, peerPubK
 
 	ctB64, err := m.runner.ChannelEncryptV2(chanID, chatID, from, senderKeyID, receiverKeyID, contentType, seq, string(payloadJSON))
 	if err != nil {
+		if isFatalLTSMError(err) {
+			return nil, err
+		}
 		// Fall back to V1 encryption (some clients like iOS still use V1).
 		return m.encryptV1Chunks(chanID, senderKeyID, receiverKeyID, payloadJSON)
 	}
@@ -410,6 +418,9 @@ func (m *Manager) DecryptMessageV2(msg *line.Message) (string, error) {
 
 	pt, _, err := m.runner.ChannelDecryptV2(chanID, msg.To, msg.From, senderKeyID, receiverKeyID, msg.ContentType, base64.StdEncoding.EncodeToString(cipher))
 	if err != nil {
+		if isFatalLTSMError(err) {
+			return "", err
+		}
 		// V2 decrypt failed, try V1 as fallback (some clients like iOS still use V1)
 		cipherV1, err2 := assembleCipherV1(msg.Chunks)
 		if err2 != nil {
@@ -417,7 +428,7 @@ func (m *Manager) DecryptMessageV2(msg *line.Message) (string, error) {
 		}
 		ptV1, _, err2 := m.runner.ChannelDecryptV1(chanID, senderKeyID, receiverKeyID, base64.StdEncoding.EncodeToString(cipherV1))
 		if err2 != nil {
-			return "", fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %v", err, err2)
+			return "", fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %w", err, err2)
 		}
 		return ptV1, nil
 	}
@@ -564,6 +575,9 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 
 	pt, _, err := m.runner.ChannelDecryptV2(chanID, msg.To, msg.From, senderKeyID, groupKeyID, msg.ContentType, base64.StdEncoding.EncodeToString(cipher))
 	if err != nil {
+		if isFatalLTSMError(err) {
+			return "", groupKeyID, err
+		}
 		// V2 decrypt failed, try V1 as fallback (some clients like iOS still use V1)
 		cipherV1, err2 := assembleCipherV1(msg.Chunks)
 		if err2 != nil {
@@ -571,7 +585,7 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 		}
 		ptV1, _, err2 := m.runner.ChannelDecryptV1(chanID, senderKeyID, groupKeyID, base64.StdEncoding.EncodeToString(cipherV1))
 		if err2 != nil {
-			return "", groupKeyID, fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %v", err, err2)
+			return "", groupKeyID, fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %w", err, err2)
 		}
 		return ptV1, groupKeyID, nil
 	}
@@ -640,6 +654,9 @@ func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType in
 
 	ctB64, err := m.runner.ChannelEncryptV2(chanID, chatMid, fromMid, myKeyID, groupKeyID, contentType, seq, string(payload))
 	if err != nil {
+		if isFatalLTSMError(err) {
+			return nil, err
+		}
 		// V2 failed, fall back to V1 (some clients like iOS still use V1)
 		return m.encryptV1Chunks(chanID, myKeyID, groupKeyID, payload)
 	}
