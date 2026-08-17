@@ -21,6 +21,7 @@ import (
 
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
 )
 
 type mentionEntry struct {
@@ -582,6 +583,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if isGroup {
 			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
+				if errors.Is(errFetch, ltsm.ErrAbort) {
+					return nil, errFetch
+				}
 				if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
 					return nil, errFetch
 				}
@@ -592,14 +596,22 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 			}
 			if err != nil {
+				if errors.Is(err, ltsm.ErrAbort) {
+					return nil, err
+				}
 				if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch == nil {
 					if contentType != int(ContentText) {
 						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 					} else {
 						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 					}
+				} else if errors.Is(errFetch, ltsm.ErrAbort) {
+					return nil, errFetch
 				} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
 					return nil, errFetch
+				}
+				if errors.Is(err, ltsm.ErrAbort) {
+					return nil, err
 				}
 				if err != nil {
 					// E2EE setup failed — fall back to plain text

@@ -71,46 +71,10 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		return mediaDownloadFailure("Video", err, relatesTo)
 	}
 
-	decrypted := false
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-			FileName    string `json:"fileName"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.KeyMaterial != "" {
-			h.Log.Debug().
-				Str("key_material_len", fmt.Sprintf("%d", len(decryptInfo.KeyMaterial))).
-				Str("file_name", decryptInfo.FileName).
-				Msg("Decrypting E2EE video")
-
-			decryptedVideo, err := h.DecryptMedia(videoData, decryptInfo.KeyMaterial)
-			if err != nil {
-				h.Log.Error().Err(err).Msg("Failed to decrypt video data")
-				return nil, fmt.Errorf("failed to decrypt video data: %w", err)
-			}
-			videoData = decryptedVideo
-			decrypted = true
-			h.Log.Info().Int("decrypted_size", len(videoData)).Msg("Successfully decrypted video")
-		}
-	}
-
-	// ENC_KM is a fallback when the in-body keyMaterial path didn't decrypt
-	// (e.g. E2EE chunk decryption failed). Running it unconditionally would
-	// double-decrypt for bridge-sent LSON videos and corrupt the bytes.
-	if !decrypted {
-		if encKM := data.ContentMetadata["ENC_KM"]; encKM != "" && len(videoData) > 32 {
-			h.Log.Debug().
-				Str("enc_km_preview", encKM[:min(20, len(encKM))]+"...").
-				Msg("Decrypting video using ENC_KM from metadata (fallback)")
-
-			decryptedVideo, err := h.DecryptMedia(videoData, encKM)
-			if err != nil {
-				h.Log.Warn().Err(err).Msg("ENC_KM fallback decrypt failed, sending raw video")
-			} else {
-				videoData = decryptedVideo
-				h.Log.Info().Int("decrypted_size", len(videoData)).Msg("Successfully decrypted video from ENC_KM")
-			}
-		}
+	videoData, err = h.decryptDownloadedMedia(videoData, decryptedBody, data.ContentMetadata, "video")
+	if err != nil {
+		h.Log.Error().Err(err).Msg("Failed to decrypt video data")
+		return nil, err
 	}
 
 	if oversized := h.oversizedMediaNotice(int64(len(videoData)), "downloaded", relatesTo); oversized != nil {

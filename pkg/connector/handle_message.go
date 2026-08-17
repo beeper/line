@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"sort"
@@ -20,6 +21,7 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
 )
 
 const (
@@ -265,8 +267,8 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 					decryptionFailed = false
 				} else {
 					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
-						Msg("DecryptGroupMessage failed, trying to fetch key")
-					if keyID != 0 {
+						Msg("DecryptGroupMessage failed")
+					if !errors.Is(err, ltsm.ErrAbort) && keyID != 0 {
 						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Failed to fetch/unwrap group key")
@@ -287,7 +289,10 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 				} else {
 					directDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
 						Msg("DecryptMessageV2 failed on first attempt")
-					if _, _, errKey := lc.E2EE.MyKeyIDs(); errKey != nil {
+					if errors.Is(err, ltsm.ErrAbort) {
+						directDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(err), msg, portalIDStr, opType).
+							Msg("LTSM runtime aborted; skipping key refresh")
+					} else if _, _, errKey := lc.E2EE.MyKeyIDs(); errKey != nil {
 						directDecryptLogContext(lc.UserLogin.Bridge.Log.Error().Err(errKey), msg, portalIDStr, opType).
 							Msg("E2EE own key not loaded; cannot decrypt any messages. Re-login required")
 						lc.markMissingE2EEKey(context.Background(), fmt.Errorf("%w: %v", e2ee.ErrMissingOwnPrivateKey, errKey))

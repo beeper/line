@@ -68,35 +68,10 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 		return mediaDownloadFailure("Audio", err, relatesTo)
 	}
 
-	// Decrypt audio if it has keyMaterial (E2EE)
-	decrypted := false
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.KeyMaterial != "" {
-			decryptedAudio, err := h.DecryptMedia(audioData, decryptInfo.KeyMaterial)
-			if err != nil {
-				h.Log.Error().Err(err).Msg("Failed to decrypt audio data")
-				return nil, fmt.Errorf("failed to decrypt audio data: %w", err)
-			}
-			audioData = decryptedAudio
-			decrypted = true
-		}
-	}
-
-	// ENC_KM is a fallback when the in-body keyMaterial path didn't decrypt
-	// (e.g. E2EE chunk decryption failed). Running it unconditionally would
-	// double-decrypt for bridge-sent LSON audio and corrupt the bytes.
-	if !decrypted {
-		if encKM := data.ContentMetadata["ENC_KM"]; encKM != "" && len(audioData) > 32 {
-			decryptedAudio, err := h.DecryptMedia(audioData, encKM)
-			if err != nil {
-				h.Log.Warn().Err(err).Msg("ENC_KM fallback decrypt failed, sending raw audio")
-			} else {
-				audioData = decryptedAudio
-			}
-		}
+	audioData, err = h.decryptDownloadedMedia(audioData, decryptedBody, data.ContentMetadata, "audio")
+	if err != nil {
+		h.Log.Error().Err(err).Msg("Failed to decrypt audio data")
+		return nil, err
 	}
 
 	if oversized := h.oversizedMediaNotice(int64(len(audioData)), "downloaded", relatesTo); oversized != nil {

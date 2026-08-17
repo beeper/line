@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -34,6 +35,51 @@ type Handler struct {
 
 	// DecryptMedia decrypts E2EE encrypted media data using the given key material.
 	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
+}
+
+func (h *Handler) decryptDownloadedMedia(data []byte, decryptedBody string, metadata map[string]string, kind string) ([]byte, error) {
+	var bodyKey string
+	var bodyKeyDeclared bool
+	if strings.Contains(decryptedBody, "keyMaterial") {
+		var decryptInfo map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err != nil {
+			return nil, fmt.Errorf("%w: failed to parse encrypted %s payload: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), err)
+		}
+		if rawKey, ok := decryptInfo["keyMaterial"]; ok {
+			bodyKeyDeclared = true
+			if err := json.Unmarshal(rawKey, &bodyKey); err != nil {
+				return nil, fmt.Errorf("%w: failed to parse encrypted %s key material: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), err)
+			}
+		}
+	}
+
+	keys := make([]string, 0, 2)
+	if bodyKey != "" {
+		keys = append(keys, bodyKey)
+	}
+	encKM, metadataKeyDeclared := metadata["ENC_KM"]
+	if encKM != "" && encKM != bodyKey {
+		keys = append(keys, encKM)
+	}
+	if len(keys) == 0 {
+		if bodyKeyDeclared || metadataKeyDeclared {
+			return nil, fmt.Errorf("%w: encrypted %s has no usable media key", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))
+		}
+		return data, nil
+	}
+	if h.DecryptMedia == nil {
+		return nil, fmt.Errorf("%w: encrypted %s has no media decryptor", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))
+	}
+
+	decryptErrors := make([]error, 0, len(keys))
+	for _, key := range keys {
+		decrypted, err := h.DecryptMedia(data, key)
+		if err == nil {
+			return decrypted, nil
+		}
+		decryptErrors = append(decryptErrors, err)
+	}
+	return nil, fmt.Errorf("%w: failed to decrypt %s data: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), errors.Join(decryptErrors...))
 }
 
 func (h *Handler) downloadAlbumPreview(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error) {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -76,27 +75,17 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return mediaDownloadFailure("Image", err, relatesTo)
 	}
 
-	// Decrypt image if it has keyMaterial (E2EE)
-	var decryptDuration time.Duration
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-			FileName    string `json:"fileName"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.KeyMaterial != "" {
-			decryptStart := time.Now()
-			decryptedImg, err := h.DecryptMedia(imgData, decryptInfo.KeyMaterial)
-			decryptDuration = time.Since(decryptStart)
-			if err != nil {
-				h.Log.Error().
-					Err(err).
-					Dur("download_duration", downloadDuration).
-					Dur("decrypt_duration", decryptDuration).
-					Msg("Failed to decrypt image data")
-				return nil, fmt.Errorf("failed to decrypt image data: %w", err)
-			}
-			imgData = decryptedImg
-		}
+	// Decrypt encrypted media before it can reach Matrix.
+	decryptStart := time.Now()
+	imgData, err = h.decryptDownloadedMedia(imgData, decryptedBody, data.ContentMetadata, "image")
+	decryptDuration := time.Since(decryptStart)
+	if err != nil {
+		h.Log.Error().
+			Err(err).
+			Dur("download_duration", downloadDuration).
+			Dur("decrypt_duration", decryptDuration).
+			Msg("Failed to decrypt image data")
+		return nil, err
 	}
 
 	if oversized := h.oversizedMediaNotice(int64(len(imgData)), "downloaded", relatesTo); oversized != nil {
