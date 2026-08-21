@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -15,93 +14,81 @@ import (
 
 // ConvertImage converts a LINE image message to a Matrix image message.
 func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
-	client := h.NewClient()
-	oid := data.ContentMetadata["OID"]
-	isPlainMedia := oid == ""
-
-	// For plain media, the image is stored at r/talk/m/{messageID}
-	if isPlainMedia {
-		oid = data.ID
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
-	if oid == "" {
+	client := h.NewClient()
+	downloadSource := lineImageDownloadSource(data)
+	if downloadSource.publicPath == "" && downloadSource.oid == "" {
 		return nil, nil
 	}
 
 	mediaCategory := lineMediaCategory(data.ContentMetadata)
-	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
+	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, downloadSource.isPlainMedia)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, downloadSource.isPlainMedia)
 
 	var imgData []byte
 	var err error
 	dlStart := time.Now()
 	h.Log.Debug().
-		Str("oid", oid).
+		Str("oid", downloadSource.oid).
 		Str("msg_id", data.ID).
 		Str("tid", downloadOptions.TID).
 		Str("media_category", mediaCategory).
 		Bool("has_obs_pop", downloadOptions.OBSPop != "").
-		Bool("plain_media", isPlainMedia).
+		Bool("plain_media", downloadSource.isPlainMedia).
+		Bool("public_resource", downloadSource.publicPath != "").
 		Msg("Downloading image from LINE OBS")
-	if isPlainMedia {
-		imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, "m", downloadOptions)
+	if downloadSource.publicPath != "" {
+		imgData, err = client.DownloadOBSPublicResource(ctx, downloadSource.publicPath)
+	} else if downloadSource.isPlainMedia {
+		imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
 	} else {
-		imgData, err = client.DownloadOBSWithOptions(ctx, oid, data.ID, downloadOptions)
+		imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
 	}
 
 	// Refresh token if we get a 401
-	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
-		client = newClient
-		if isPlainMedia {
-			imgData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, "m", downloadOptions)
-		} else {
-			imgData, err = client.DownloadOBSWithOptions(ctx, oid, data.ID, downloadOptions)
+	if downloadSource.publicPath == "" {
+		if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
+			client = newClient
+			if downloadSource.isPlainMedia {
+				imgData, err = client.DownloadOBSWithSIDOptions(ctx, downloadSource.oid, talkMetaMessageID, "m", downloadOptions)
+			} else {
+				imgData, err = client.DownloadOBSWithOptions(ctx, downloadSource.oid, talkMetaMessageID, downloadOptions)
+			}
 		}
+		h.handleFinalAuthError(ctx, client, err)
 	}
 	downloadDuration := time.Since(dlStart)
 
 	if err != nil {
 		h.Log.Warn().
 			Err(err).
-			Str("oid", oid).
+			Str("oid", downloadSource.oid).
 			Str("msg_id", data.ID).
-			Bool("plain_media", isPlainMedia).
+			Bool("plain_media", downloadSource.isPlainMedia).
+			Bool("public_resource", downloadSource.publicPath != "").
 			Dur("download_duration", downloadDuration).
-			Msg("Failed to download image from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[Image unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download image from OBS")
+		return mediaDownloadFailure("Image", err, relatesTo)
 	}
 
-	// Decrypt image if it has keyMaterial (E2EE)
-	var decryptDuration time.Duration
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-			FileName    string `json:"fileName"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.KeyMaterial != "" {
-			decryptStart := time.Now()
-			decryptedImg, err := h.DecryptMedia(imgData, decryptInfo.KeyMaterial)
-			decryptDuration = time.Since(decryptStart)
-			if err != nil {
-				h.Log.Error().
-					Err(err).
-					Dur("download_duration", downloadDuration).
-					Dur("decrypt_duration", decryptDuration).
-					Msg("Failed to decrypt image data")
-				return nil, fmt.Errorf("failed to decrypt image data: %w", err)
-			}
-			imgData = decryptedImg
-		}
+	// Decrypt encrypted media before it can reach Matrix.
+	decryptStart := time.Now()
+	imgData, err = h.decryptDownloadedMedia(imgData, decryptedBody, data.ContentMetadata, "image")
+	decryptDuration := time.Since(decryptStart)
+	if err != nil {
+		h.Log.Error().
+			Err(err).
+			Dur("download_duration", downloadDuration).
+			Dur("decrypt_duration", decryptDuration).
+			Msg("Failed to decrypt image data")
+		return nil, err
+	}
+
+	if oversized := h.oversizedMediaNotice(int64(len(imgData)), "downloaded", relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
 	// Upload to Matrix
@@ -146,6 +133,26 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			},
 		},
 	}, nil
+}
+
+type imageDownloadSource struct {
+	publicPath   string
+	oid          string
+	isPlainMedia bool
+}
+
+func lineImageDownloadSource(data line.Message) imageDownloadSource {
+	if publicPath := data.ContentMetadata["DOWNLOAD_URL"]; publicPath != "" {
+		return imageDownloadSource{publicPath: publicPath}
+	}
+
+	oid := data.ContentMetadata["OID"]
+	if oid != "" {
+		return imageDownloadSource{oid: oid}
+	}
+
+	// For plain media, the image is stored at r/talk/m/{messageID}.
+	return imageDownloadSource{oid: data.ID, isPlainMedia: true}
 }
 
 func lineMediaCategory(metadata map[string]string) string {

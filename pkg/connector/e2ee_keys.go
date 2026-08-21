@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,22 @@ import (
 
 const noE2EETTL = 1 * time.Hour
 
+var (
+	negotiateE2EEPublicKeyWithClient = func(client *line.Client, mid string) (*line.E2EEPublicKey, error) {
+		return client.NegotiateE2EEPublicKey(mid)
+	}
+	getE2EEPublicKeyWithClient = func(client *line.Client, mid string, keyVersion, keyID int) (*line.E2EEPublicKey, error) {
+		return client.GetE2EEPublicKey(mid, keyVersion, keyID)
+	}
+)
+
+func groupKeyFetchError(groupKeyID int, err error) error {
+	if groupKeyID == 0 && line.IsNotAMemberError(err) {
+		return fmt.Errorf("%w: latest group key lookup reported not a member: %w", line.ErrNoUsableE2EEGroupKey, err)
+	}
+	return err
+}
+
 // fetchAndUnwrapGroupKey retrieves a specific group key (or the latest when groupKeyID == 0)
 // and unwraps it so the E2EE manager can encrypt/decrypt group messages.
 // If no group key exists yet (TalkException code 5), it auto-registers one and retries.
@@ -21,34 +38,29 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 		return fmt.Errorf("E2EE manager not initialized")
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	fetch := func() (*line.E2EEGroupSharedKey, error) {
+	client := lc.newClient()
+	fetch := func(client *line.Client) (*line.E2EEGroupSharedKey, error) {
+		var sharedKey *line.E2EEGroupSharedKey
+		var err error
 		if groupKeyID > 0 {
-			return client.GetE2EEGroupSharedKey(chatMid, groupKeyID)
+			sharedKey, err = client.GetE2EEGroupSharedKey(chatMid, groupKeyID)
+		} else {
+			sharedKey, err = client.GetLastE2EEGroupSharedKey(chatMid)
 		}
-		return client.GetLastE2EEGroupSharedKey(chatMid)
+		return sharedKey, groupKeyFetchError(groupKeyID, err)
 	}
 
-	sharedKey, err := fetch()
+	client, sharedKey, err := callLineResultUsing(lc, ctx, client, fetch)
 	// No group key exists yet — auto-register one so the group can use E2EE.
 	if err != nil && line.IsGroupKeyNotFound(err) {
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", chatMid).
 			Msg("No group key found, auto-registering")
 		if registerErr := lc.autoRegisterGroupKey(ctx, chatMid); registerErr != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(registerErr).Str("chat_mid", chatMid).
-				Msg("Auto-register group key failed, returning original error")
-			return err
+				Msg("Auto-register group key failed")
+			return fmt.Errorf("auto-register group key: %w", registerErr)
 		}
-		sharedKey, err = fetch()
-	}
-	// Token recovery for other error types
-	if err != nil && !line.IsNoUsableE2EEGroupKey(err) && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			sharedKey, err = fetch()
-		} else {
-			return fmt.Errorf("failed to recover token before fetching group key: %w", errRecover)
-		}
+		client, sharedKey, err = callLineResultUsing(lc, ctx, client, fetch)
 	}
 	if err != nil {
 		return err
@@ -57,36 +69,57 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 		return fmt.Errorf("no group shared key returned for %s", chatMid)
 	}
 
-	lc.UserLogin.Bridge.Log.Debug().
-		Str("chat_mid", chatMid).
-		Int("group_key_id", sharedKey.GroupKeyID).
-		Int("creator_key_id", sharedKey.CreatorKeyID).
-		Int("receiver_key_id", sharedKey.ReceiverKeyID).
-		Msg("Fetched group shared key")
+	unwrap := func(sharedKey *line.E2EEGroupSharedKey) error {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("chat_mid", chatMid).
+			Int("group_key_id", sharedKey.GroupKeyID).
+			Int("creator_key_id", sharedKey.CreatorKeyID).
+			Int("receiver_key_id", sharedKey.ReceiverKeyID).
+			Msg("Fetched group shared key")
 
-	if _, _, err := lc.ensurePeerKey(ctx, sharedKey.Creator); err != nil {
-		return fmt.Errorf("failed to ensure creator key: %w", err)
+		if _, _, err := lc.ensurePeerKey(ctx, sharedKey.Creator); err != nil {
+			return fmt.Errorf("failed to ensure creator key: %w", err)
+		}
+		if _, _, err := lc.ensurePeerKeyByID(ctx, sharedKey.Creator, sharedKey.CreatorKeyID); err != nil {
+			return fmt.Errorf("failed to ensure creator key id %d: %w", sharedKey.CreatorKeyID, err)
+		}
+
+		unwrappedID, err := lc.E2EE.UnwrapGroupSharedKey(chatMid, sharedKey)
+		if err != nil {
+			return fmt.Errorf("failed to unwrap group key: %w", err)
+		}
+
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("chat_mid", chatMid).
+			Int("group_key_id", sharedKey.GroupKeyID).
+			Int("receiver_key_id", sharedKey.ReceiverKeyID).
+			Int("unwrapped_id", unwrappedID).
+			Msg("Unwrapped group shared key")
+
+		return nil
 	}
-	if _, _, err := lc.ensurePeerKeyByID(ctx, sharedKey.Creator, sharedKey.CreatorKeyID); err != nil {
-		return fmt.Errorf("failed to ensure creator key id %d: %w", sharedKey.CreatorKeyID, err)
+
+	err = unwrap(sharedKey)
+	if groupKeyID == 0 && errors.Is(err, e2ee.ErrMissingOwnPrivateKey) {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
+			Msg("Latest group key targets a missing private key, registering a fresh group key")
+		if registerErr := lc.autoRegisterGroupKey(ctx, chatMid); registerErr != nil {
+			return fmt.Errorf("%w (fresh group key registration failed: %v)", err, registerErr)
+		}
+		_, sharedKey, err = callLineResultUsing(lc, ctx, client, fetch)
+		if err != nil {
+			return fmt.Errorf("failed to fetch fresh group key after registration: %w", err)
+		}
+		if sharedKey == nil {
+			return fmt.Errorf("no fresh group shared key returned for %s", chatMid)
+		}
+		err = unwrap(sharedKey)
 	}
 
-	unwrappedID, err := lc.E2EE.UnwrapGroupSharedKey(chatMid, sharedKey)
-	if err != nil {
-		return fmt.Errorf("failed to unwrap group key: %w", err)
-	}
-
-	lc.UserLogin.Bridge.Log.Debug().
-		Str("chat_mid", chatMid).
-		Int("group_key_id", sharedKey.GroupKeyID).
-		Int("receiver_key_id", sharedKey.ReceiverKeyID).
-		Int("unwrapped_id", unwrappedID).
-		Msg("Unwrapped group shared key")
-
-	return nil
+	return err
 }
 
-func (lc *LineClient) ensurePeerKey(_ context.Context, mid string) (int, string, error) {
+func (lc *LineClient) ensurePeerKey(ctx context.Context, mid string) (int, string, error) {
 	lc.cacheMu.Lock()
 	if lc.peerKeys == nil {
 		lc.peerKeys = make(map[string]peerKeyInfo)
@@ -107,8 +140,9 @@ func (lc *LineClient) ensurePeerKey(_ context.Context, mid string) (int, string,
 			return cached.raw, cached.pub, nil
 		}
 	}
-	client := line.NewClient(lc.AccessToken)
-	res, err := client.NegotiateE2EEPublicKey(mid)
+	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.E2EEPublicKey, error) {
+		return negotiateE2EEPublicKeyWithClient(client, mid)
+	})
 	if err != nil {
 		// Cache negative result so we don't keep hitting the API
 		if line.IsNoUsableE2EEPublicKey(err) {
@@ -161,64 +195,74 @@ func (lc *LineClient) clearGroupNoE2EE(chatMid string) {
 	delete(lc.noE2EEGroups, chatMid)
 }
 
-// getChatMemberMIDs fetches the member and invitee MIDs for a group chat via GetChats.
-// Invitees are included because group key registration must happen before they accept,
-// otherwise the key won't be available when they start sending messages.
-func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]string, error) {
-	client := line.NewClient(lc.AccessToken)
-	chats, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				chats, err = client.GetChats([]string{chatMid}, true, true)
+func (lc *LineClient) cacheGroupMemberMIDs(chatMid string, mids []string) {
+	// A self-only result is ambiguous: LINE sometimes returns an empty member
+	// map for active groups. Keep a previously complete list for fallback.
+	if len(mids) <= 1 {
+		return
+	}
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	if lc.groupMemberCache == nil {
+		lc.groupMemberCache = make(map[string][]string)
+	}
+	lc.groupMemberCache[chatMid] = append([]string(nil), mids...)
+}
+
+func joinedGroupMemberMIDs(group *line.GroupExtra, ownMID string) ([]string, bool) {
+	seen := make(map[string]struct{})
+	if group != nil {
+		for mid := range group.MemberMids {
+			if isUserMID(mid) {
+				seen[mid] = struct{}{}
 			}
 		}
-		if err != nil {
-			return nil, fmt.Errorf("getChats failed for %s: %w", chatMid, err)
-		}
 	}
-	if len(chats.Chats) == 0 {
-		return nil, fmt.Errorf("chat %s not found", chatMid)
+	if isUserMID(ownMID) {
+		seen[ownMID] = struct{}{}
 	}
-	chat := chats.Chats[0]
-	if chat.Extra.GroupExtra == nil {
-		return nil, fmt.Errorf("chat %s has no group extra", chatMid)
-	}
-	seen := make(map[string]struct{})
-	for mid := range chat.Extra.GroupExtra.MemberMids {
-		seen[mid] = struct{}{}
-	}
-	for mid := range chat.Extra.GroupExtra.InviteeMids {
-		seen[mid] = struct{}{}
-	}
-	// Always include the bridge user's own MID since we're definitely a member
-	if _, ok := seen[lc.Mid]; !ok {
-		seen[lc.Mid] = struct{}{}
-	}
+
 	mids := make([]string, 0, len(seen))
 	for mid := range seen {
 		mids = append(mids, mid)
 	}
+	return mids, group != nil && len(group.InviteeMids) > 0
+}
+
+// getChatMemberMIDs fetches joined member MIDs for a group chat via GetChats.
+// Pending invitees are deliberately excluded: LINE validates group keys against the
+// current joined-member set and rejects keys that include invitees.
+func (lc *LineClient) getChatMemberMIDs(ctx context.Context, chatMid string) ([]string, bool, error) {
+	_, chats, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+		return client.GetChats([]string{chatMid}, true, true)
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("getChats failed for %s: %w", chatMid, err)
+	}
+	if len(chats.Chats) == 0 {
+		return nil, false, fmt.Errorf("chat %s not found", chatMid)
+	}
+	chat := chats.Chats[0]
+	if chat.Extra.GroupExtra == nil {
+		return nil, false, fmt.Errorf("chat %s has no group extra", chatMid)
+	}
+	group := chat.Extra.GroupExtra
+	mids, hasPendingInvitees := joinedGroupMemberMIDs(group, lc.Mid)
 	if len(mids) == 0 {
-		return nil, fmt.Errorf("chat %s has no members or invitees", chatMid)
+		return nil, hasPendingInvitees, fmt.Errorf("chat %s has no joined members", chatMid)
 	}
 
-	// Cache the successful result for fallback use.
-	lc.cacheMu.Lock()
-	if lc.groupMemberCache == nil {
-		lc.groupMemberCache = make(map[string][]string)
-	}
-	lc.groupMemberCache[chatMid] = mids
-	lc.cacheMu.Unlock()
+	// Cache complete results for fallback use. Do not replace a richer cached
+	// list when LINE returns only the caller.
+	lc.cacheGroupMemberMIDs(chatMid, mids)
 
-	return mids, nil
+	return mids, hasPendingInvitees, nil
 }
 
 // autoRegisterGroupKey fetches group members, then registers a new E2EE group key
 // for the chat. This is called when fetchAndUnwrapGroupKey finds no key exists.
 func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) error {
-	members, err := lc.getChatMemberMIDs(ctx, chatMid)
+	members, hasPendingInvitees, err := lc.getChatMemberMIDs(ctx, chatMid)
 	if err != nil {
 		return fmt.Errorf("getChatMemberMIDs: %w", err)
 	}
@@ -226,9 +270,10 @@ func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) 
 	// If getChatMemberMIDs returned only ourself, the server likely returned
 	// an empty MemberMids map (known LINE API issue). Fall back to cached
 	// member list from CreateGroup or a prior successful fetch.
-	if len(members) == 1 && members[0] == lc.Mid {
+	if len(members) == 1 && members[0] == lc.Mid && !hasPendingInvitees {
 		lc.cacheMu.Lock()
 		cached, ok := lc.groupMemberCache[chatMid]
+		cached = append([]string(nil), cached...)
 		lc.cacheMu.Unlock()
 		if ok && len(cached) > 1 {
 			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", chatMid).
@@ -238,7 +283,7 @@ func (lc *LineClient) autoRegisterGroupKey(ctx context.Context, chatMid string) 
 	}
 
 	// Last resort: query Matrix room members via the bridge API.
-	if len(members) == 1 && members[0] == lc.Mid {
+	if len(members) == 1 && members[0] == lc.Mid && !hasPendingInvitees {
 		matrixMembers, err := lc.getGroupMemberMIDsViaMatrix(ctx, chatMid)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
@@ -276,6 +321,7 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 	}
 
 	mids := make([]string, 0, len(matrixMembers))
+	seen := make(map[string]struct{}, len(matrixMembers)+1)
 	for mxid := range matrixMembers {
 		// Skip the bridge user's own Matrix account if present.
 		if mxid == lc.UserLogin.UserMXID {
@@ -284,7 +330,11 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 		// Parse the ghost MXID back to a network ID (LINE MID).
 		if netID, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(mxid); ok {
 			mid := string(netID)
-			if mid != lc.Mid && mid != string(lc.UserLogin.ID) {
+			if isUserMID(mid) && !lc.isOwnMID(mid) {
+				if _, exists := seen[mid]; exists {
+					continue
+				}
+				seen[mid] = struct{}{}
 				mids = append(mids, mid)
 			}
 		}
@@ -294,8 +344,10 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 		return nil, fmt.Errorf("no LINE members found via Matrix")
 	}
 
-	// Always include the bridge user's own MID.
-	mids = append(mids, lc.Mid)
+	// Include the bridge user's MID when it has a valid user prefix.
+	if isUserMID(lc.Mid) {
+		mids = append(mids, lc.Mid)
+	}
 
 	lc.UserLogin.Bridge.Log.Debug().Str("chat_mid", chatMid).
 		Int("matrix_members", len(matrixMembers)).
@@ -305,7 +357,7 @@ func (lc *LineClient) getGroupMemberMIDsViaMatrix(ctx context.Context, chatMid s
 	return mids, nil
 }
 
-func (lc *LineClient) ensurePeerKeyByID(_ context.Context, mid string, keyID int) (int, string, error) {
+func (lc *LineClient) ensurePeerKeyByID(ctx context.Context, mid string, keyID int) (int, string, error) {
 	lc.cacheMu.Lock()
 	if lc.peerKeys == nil {
 		lc.peerKeys = make(map[string]peerKeyInfo)
@@ -319,9 +371,10 @@ func (lc *LineClient) ensurePeerKeyByID(_ context.Context, mid string, keyID int
 		return cached.raw, cached.pub, nil
 	}
 
-	client := line.NewClient(lc.AccessToken)
 	// keyVersion 1
-	res, err := client.GetE2EEPublicKey(mid, 1, keyID)
+	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.E2EEPublicKey, error) {
+		return getE2EEPublicKeyWithClient(client, mid, 1, keyID)
+	})
 	if err != nil {
 		return 0, "", err
 	}

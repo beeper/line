@@ -14,6 +14,10 @@ import (
 
 // ConvertFile converts a LINE file message to a Matrix file message.
 func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
+	}
+
 	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
@@ -36,60 +40,44 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
+
+	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
+		client = newClient
+		fileData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
+	}
+	h.handleFinalAuthError(ctx, client, err)
+
 	if err != nil {
 		h.Log.Warn().
 			Err(err).
 			Str("oid", oid).
 			Bool("plain_media", isPlainMedia).
-			Msg("Failed to download file from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[File unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download file from OBS")
+		return mediaDownloadFailure("File", err, relatesTo)
 	}
 
-	// Try to decrypt using keyMaterial from encrypted payload
 	var fileName string
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-			FileName    string `json:"fileName"`
+	if strings.Contains(decryptedBody, "fileName") {
+		var fileInfo struct {
+			FileName string `json:"fileName"`
 		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err != nil {
+		if err := json.Unmarshal([]byte(decryptedBody), &fileInfo); err != nil {
 			h.Log.Error().Err(err).Msg("Failed to parse file payload JSON")
 			return nil, fmt.Errorf("failed to parse file payload: %w", err)
 		}
+		fileName = fileInfo.FileName
+	}
 
-		if decryptInfo.KeyMaterial != "" {
-			keyPreview := decryptInfo.KeyMaterial
-			if len(keyPreview) > 20 {
-				keyPreview = keyPreview[:20] + "..."
-			}
-			h.Log.Debug().
-				Str("key_material_preview", keyPreview).
-				Msg("Decrypting file using keyMaterial from payload")
+	fileData, err = h.decryptDownloadedMedia(fileData, decryptedBody, data.ContentMetadata, "file")
+	if err != nil {
+		h.Log.Error().Err(err).Msg("Failed to decrypt file data")
+		return nil, err
+	}
 
-			decryptedFile, err := h.DecryptMedia(fileData, decryptInfo.KeyMaterial)
-			if err != nil {
-				h.Log.Error().Err(err).Msg("Failed to decrypt file data")
-				return nil, fmt.Errorf("failed to decrypt file data: %w", err)
-			}
-			fileData = decryptedFile
-			h.Log.Info().Int("decrypted_size", len(fileData)).Msg("Successfully decrypted file")
-		}
-
-		if decryptInfo.FileName != "" {
-			fileName = decryptInfo.FileName
-		}
+	if oversized := h.oversizedMediaNotice(int64(len(fileData)), "downloaded", relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
 	if fileName == "" {

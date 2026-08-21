@@ -3,16 +3,34 @@ package line
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // sseHTTPClient is a dedicated HTTP client for SSE connections with no timeout.
 // Reused across reconnects to avoid allocating a new transport pool each time.
 var sseHTTPClient = &http.Client{}
+
+var ErrSSEIdleTimeout = errors.New("SSE idle timeout")
+
+const maxSSEErrorBodyBytes = 4096
+
+// LINE advertises a 140s polling timeout. The extra 10s lets a normal
+// server-driven close arrive before the bridge declares the stream idle.
+const defaultSSEIdleTimeout = 150 * time.Second
+
+var sseIdleTimeout = defaultSSEIdleTimeout
+
+func IsSSEIdleTimeout(err error) bool {
+	return errors.Is(err, ErrSSEIdleTimeout)
+}
 
 // ListenSSE connects to the Event Stream and blocks
 func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(event, data string)) error {
@@ -45,10 +63,28 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSEErrorBodyBytes))
+		if bodyText := strings.TrimSpace(string(body)); bodyText != "" {
+			return fmt.Errorf("SSE error: %d: %s", resp.StatusCode, bodyText)
+		}
 		return fmt.Errorf("SSE error: %d", resp.StatusCode)
 	}
 
 	reader := bufio.NewReader(resp.Body)
+	idleTimeout := sseIdleTimeout
+	var idleTimedOut atomic.Bool
+	var idleTimer *time.Timer
+	if idleTimeout > 0 {
+		idleTimer = time.AfterFunc(idleTimeout, func() {
+			idleTimedOut.Store(true)
+			_ = resp.Body.Close()
+		})
+		defer idleTimer.Stop()
+	}
+	stopContextClose := context.AfterFunc(ctx, func() {
+		_ = resp.Body.Close()
+	})
+	defer stopContextClose()
 
 	var currentEvent string
 	var dataLines []string
@@ -72,7 +108,16 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 	for {
 		lineBytes, err := reader.ReadBytes('\n')
 		if err != nil {
+			if idleTimedOut.Load() {
+				return fmt.Errorf("%w after %s", ErrSSEIdleTimeout, idleTimeout)
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
+		}
+		if idleTimer != nil {
+			idleTimer.Reset(idleTimeout)
 		}
 
 		line := strings.TrimRight(string(lineBytes), "\r\n")

@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -18,35 +22,228 @@ import (
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/id"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
+const (
+	prefetchMessagesConcurrency               = 4
+	messageBoxPageLimit                       = 100
+	startupBackfillMessageLimit               = 50
+	unblockBackfillPortalWaitTimeout          = time.Minute
+	unblockBackfillPortalPollInterval         = 500 * time.Millisecond
+	unblockBackfillFrameworkGrace             = 10 * time.Second
+	unblockBackfillFrameworkCompletionTimeout = 2 * time.Minute
+	groupPortalCreateWait                     = 30 * time.Second
+	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
+	defaultReceiveAuthProbeInterval           = 150 * time.Second
+)
+
+var (
+	errReceiveAuthProbeDue               = errors.New("receive auth probe due")
+	errUnblockBackfillHandledByFramework = errors.New("unblock backfill handled by framework")
+)
+
+type unblockBackfillOwner uint8
+
+const (
+	unblockBackfillOwnerNone unblockBackfillOwner = iota
+	unblockBackfillOwnerFramework
+	unblockBackfillOwnerManual
+)
+
+// unblockBackfillState gives either bridgev2's normal forward backfill or the
+// manual silent fallback exclusive ownership of one unblocked chat.
+type unblockBackfillState struct {
+	mu               sync.Mutex
+	owner            unblockBackfillOwner
+	frameworkStarted chan struct{}
+	done             chan struct{}
+	doneOnce         sync.Once
+}
+
+func newUnblockBackfillState() *unblockBackfillState {
+	return &unblockBackfillState{
+		frameworkStarted: make(chan struct{}),
+		done:             make(chan struct{}),
+	}
+}
+
+func (state *unblockBackfillState) claimFramework() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.owner != unblockBackfillOwnerNone {
+		return false
+	}
+	state.owner = unblockBackfillOwnerFramework
+	close(state.frameworkStarted)
+	return true
+}
+
+func (state *unblockBackfillState) claimManual() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.owner != unblockBackfillOwnerNone {
+		return false
+	}
+	state.owner = unblockBackfillOwnerManual
+	return true
+}
+
+func (state *unblockBackfillState) complete() {
+	state.doneOnce.Do(func() {
+		close(state.done)
+	})
+}
+
+type manualUnblockBackfillContextKey struct{}
+
+var (
+	getLastOpRevisionWithClient = func(ctx context.Context, client *line.Client) (int64, error) {
+		return client.GetLastOpRevisionContext(ctx)
+	}
+	listenSSEWithClient = func(client *line.Client, ctx context.Context, localRev int64, handler func(eventType, data string)) error {
+		return client.ListenSSE(ctx, localRev, handler)
+	}
+	sseReconnectDelay          = 3 * time.Second
+	receiveAuthProbeInterval   = defaultReceiveAuthProbeInterval
+	receiveAuthProbeNow        = time.Now
+	newReceiveAuthProbeContext = func(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+		return context.WithDeadlineCause(parent, deadline, errReceiveAuthProbeDue)
+	}
+	runSilentUnblockBackfill = func(ctx context.Context, lc *LineClient, mid string) {
+		lc.silentBackfillRecentMessages(ctx, mid, startupBackfillMessageLimit)
+	}
+)
+
+func (lc *LineClient) getMessageBoxesWithRecovery(ctx context.Context, opts line.MessageBoxesOptions) (*line.MessageBoxesResponse, error) {
+	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.MessageBoxesResponse, error) {
+		return client.GetMessageBoxes(opts)
+	})
+	return res, err
+}
+
+func (lc *LineClient) fetchAllMessageBoxes(ctx context.Context, opts line.MessageBoxesOptions) ([]line.MessageBox, error) {
+	var boxes []line.MessageBox
+	seenCursors := make(map[string]struct{})
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		res, err := lc.getMessageBoxesWithRecovery(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		boxes = append(boxes, res.MessageBoxes...)
+		if !res.HasNext || len(res.MessageBoxes) == 0 {
+			return boxes, nil
+		}
+
+		nextCursor := res.MessageBoxes[len(res.MessageBoxes)-1].ID
+		if nextCursor == "" {
+			return boxes, nil
+		}
+		if _, ok := seenCursors[nextCursor]; ok {
+			return boxes, nil
+		}
+		seenCursors[nextCursor] = struct{}{}
+		opts.MinChatID = nextCursor
+	}
+}
+
+func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, error) {
+	_, blockedMIDs, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
+		return client.GetBlockedContactIds()
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	blockedUsers := make(map[string]bool, len(blockedMIDs))
+	for _, mid := range blockedMIDs {
+		blockedUsers[mid] = true
+	}
+
+	metadataBlockedUsers := lc.metadataBlockedContacts()
+	lc.cacheMu.Lock()
+	previousBlockedUsers := make(map[string]bool, len(lc.blockedUsers)+len(metadataBlockedUsers))
+	for mid := range lc.blockedUsers {
+		previousBlockedUsers[mid] = true
+	}
+	for mid := range metadataBlockedUsers {
+		previousBlockedUsers[mid] = true
+	}
+	var newlyUnblocked []string
+	for mid := range previousBlockedUsers {
+		if !blockedUsers[mid] {
+			newlyUnblocked = append(newlyUnblocked, mid)
+		}
+	}
+	lc.blockedUsers = blockedUsers
+	lc.cacheMu.Unlock()
+
+	lc.saveBlockedContacts(ctx, blockedUsers)
+	lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedMIDs)).Msg("Refreshed blocked contacts")
+	return newlyUnblocked, nil
+}
+
+func (lc *LineClient) metadataBlockedContacts() map[string]bool {
+	blockedUsers := make(map[string]bool)
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return blockedUsers
+	}
+	for _, mid := range meta.BlockedMIDs {
+		blockedUsers[mid] = true
+	}
+	return blockedUsers
+}
+
+func (lc *LineClient) saveBlockedContacts(ctx context.Context, blockedUsers map[string]bool) {
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return
+	}
+
+	mids := make([]string, 0, len(blockedUsers))
+	for mid := range blockedUsers {
+		mids = append(mids, mid)
+	}
+	sort.Strings(mids)
+	meta.BlockedMIDs = mids
+	if err := lc.UserLogin.Save(ctx); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save blocked contacts snapshot")
+	}
+}
+
+func (lc *LineClient) saveBlockedContactsSnapshot(ctx context.Context) {
+	lc.cacheMu.Lock()
+	blockedUsers := make(map[string]bool, len(lc.blockedUsers))
+	for mid := range lc.blockedUsers {
+		blockedUsers[mid] = true
+	}
+	lc.cacheMu.Unlock()
+
+	lc.saveBlockedContacts(ctx, blockedUsers)
+}
+
 func (lc *LineClient) syncDMChats(ctx context.Context) {
 	defer lc.wg.Done()
 
-	client := line.NewClient(lc.AccessToken)
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
-		MessageBoxCountLimit:           100,
+		MessageBoxCountLimit:           messageBoxPageLimit,
 		WithUnreadCount:                false,
 		LastMessagesPerMessageBoxCount: 0,
 	}
 
-	res, err := client.GetMessageBoxes(opts)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			res, err = client.GetMessageBoxes(opts)
-		}
-	}
+	messageBoxes, err := lc.fetchAllMessageBoxes(ctx, opts)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch message boxes for DM sync")
 		return
 	}
 
-	for _, box := range res.MessageBoxes {
+	for _, box := range messageBoxes {
 		mid := box.ID
 		lowerMid := strings.ToLower(mid)
 		// Skip group chats — they're handled by syncChats
@@ -59,18 +256,26 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 			continue
 		}
 
-		lc.queueDMChatResync(ctx, mid, false)
+		lc.queueDMChatResync(ctx, mid, false, false)
 	}
 }
 
 // queueDMChatResync emits a ChatResync event with full DM ChatInfo.
 // If createPortal is true, the framework will create the portal when it
 // doesn't already exist (e.g. after the DM was deleted on block).
-func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createPortal bool) {
+// If forceBackfill is true, an existing portal will run a forward backfill, and
+// a newly-created portal will backfill immediately after Matrix room creation.
+func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createPortal, forceBackfill bool) {
 	contact := lc.getContact(ctx, mid)
 	dmType := database.RoomTypeDM
 	chatName := contact.EffectiveDisplayName()
 	portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
+	var checkNeedsBackfill func(ctx context.Context, latestMessage *database.Message) (bool, error)
+	if forceBackfill {
+		checkNeedsBackfill = func(ctx context.Context, latestMessage *database.Message) (bool, error) {
+			return true, nil
+		}
+	}
 	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
@@ -79,9 +284,10 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 			CreatePortal: createPortal,
 		},
 		ChatInfo: &bridgev2.ChatInfo{
-			Type:   &dmType,
-			Name:   &chatName,
-			Avatar: lc.avatarFromPicturePath(contact.PicturePath),
+			Type:        &dmType,
+			Name:        &chatName,
+			Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
+			CanBackfill: forceBackfill,
 			Members: &bridgev2.ChatMemberList{
 				IsFull:                     true,
 				ExcludeChangesFromTimeline: true,
@@ -105,32 +311,256 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 			},
 			ExcludeChangesFromTimeline: true,
 		},
+		CheckNeedsBackfillFunc: checkNeedsBackfill,
 	})
 }
 
-// queueDMBackfill asks the framework to backfill a DM portal's recent history.
-// It must run after the portal already exists (e.g. right after queueDMChatResync
-// recreated it on unblock), because the framework skips the backfill check on the
-// resync that creates a portal. CheckNeedsBackfillFunc forces a forward backfill,
-// which goes through FetchMessages and is batch-sent silently — no per-message
-// notifications.
-func (lc *LineClient) queueDMBackfill(mid string) {
-	portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventChatResync,
-			PortalKey: portalKey,
-			Timestamp: time.Now(),
+func (lc *LineClient) beginUnblockBackfill(mid string) (*unblockBackfillState, bool) {
+	state := newUnblockBackfillState()
+	actual, loaded := lc.unblockBackfills.LoadOrStore(mid, state)
+	if loaded {
+		return actual.(*unblockBackfillState), false
+	}
+	return state, true
+}
+
+func (lc *LineClient) getUnblockBackfill(mid string) *unblockBackfillState {
+	state, ok := lc.unblockBackfills.Load(mid)
+	if !ok {
+		return nil
+	}
+	return state.(*unblockBackfillState)
+}
+
+func (lc *LineClient) finishUnblockBackfill(mid string, state *unblockBackfillState) {
+	lc.unblockBackfills.CompareAndDelete(mid, state)
+}
+
+func waitForUnblockBackfillPortal(
+	ctx context.Context,
+	timeout time.Duration,
+	pollInterval time.Duration,
+	frameworkStarted <-chan struct{},
+	lookup func(context.Context) (*bridgev2.Portal, error),
+) (*bridgev2.Portal, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	var lastLookupErr error
+	for {
+		select {
+		case <-frameworkStarted:
+			return nil, errUnblockBackfillHandledByFramework
+		default:
+		}
+
+		portal, err := lookup(waitCtx)
+		if err != nil {
+			lastLookupErr = err
+		} else if portal != nil && portal.MXID != "" {
+			return portal, nil
+		}
+
+		select {
+		case <-frameworkStarted:
+			return nil, errUnblockBackfillHandledByFramework
+		case <-waitCtx.Done():
+			if lastLookupErr != nil {
+				return nil, fmt.Errorf("portal did not become ready after lookup error: %w", lastLookupErr)
+			}
+			return nil, waitCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (lc *LineClient) waitForFrameworkUnblockBackfill(ctx context.Context, log zerolog.Logger, state *unblockBackfillState) {
+	timer := time.NewTimer(unblockBackfillFrameworkCompletionTimeout)
+	defer timer.Stop()
+	select {
+	case <-state.done:
+		log.Debug().Msg("Framework unblock backfill finished")
+	case <-ctx.Done():
+	case <-timer.C:
+		log.Warn().Msg("Timed out waiting for framework unblock backfill to finish")
+	}
+}
+
+func (lc *LineClient) silentBackfillRecentMessages(ctx context.Context, chatMID string, limit int) {
+	log := lc.UserLogin.Bridge.Log.With().
+		Str("chat_mid", chatMID).
+		Str("action", "silent unblock backfill").
+		Logger()
+	ctx = log.WithContext(ctx)
+
+	state := lc.getUnblockBackfill(chatMID)
+	var frameworkStarted <-chan struct{}
+	if state != nil {
+		frameworkStarted = state.frameworkStarted
+	}
+	portalKey := networkid.PortalKey{ID: makePortalID(chatMID), Receiver: lc.UserLogin.ID}
+	portal, err := waitForUnblockBackfillPortal(
+		ctx,
+		unblockBackfillPortalWaitTimeout,
+		unblockBackfillPortalPollInterval,
+		frameworkStarted,
+		func(ctx context.Context) (*bridgev2.Portal, error) {
+			return lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
 		},
-		CheckNeedsBackfillFunc: func(ctx context.Context, latestMessage *database.Message) (bool, error) {
-			return true, nil
-		},
+	)
+	if errors.Is(err, errUnblockBackfillHandledByFramework) {
+		log.Debug().Msg("Skipping manual unblock backfill because framework backfill started")
+		lc.waitForFrameworkUnblockBackfill(ctx, log, state)
+		return
+	} else if err != nil {
+		if ctx.Err() != nil {
+			log.Debug().Err(ctx.Err()).Msg("Stopped waiting for restored portal")
+		} else {
+			log.Warn().Err(err).Dur("wait_timeout", unblockBackfillPortalWaitTimeout).Msg("Restored portal did not become ready for silent unblock backfill")
+		}
+		return
+	}
+
+	if state != nil {
+		timer := time.NewTimer(unblockBackfillFrameworkGrace)
+		select {
+		case <-state.frameworkStarted:
+			timer.Stop()
+			log.Debug().Msg("Skipping manual unblock backfill because framework backfill started")
+			lc.waitForFrameworkUnblockBackfill(ctx, log, state)
+			return
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if !state.claimManual() {
+			log.Debug().Msg("Skipping manual unblock backfill because another backfill claimed the chat")
+			lc.waitForFrameworkUnblockBackfill(ctx, log, state)
+			return
+		}
+	}
+
+	if lc.isUserBlocked(chatMID) {
+		log.Debug().Msg("Skipping silent unblock backfill because contact is blocked again")
+		return
+	}
+
+	capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
+	if capabilities == nil || !capabilities.BatchSending {
+		log.Debug().Msg("Skipping unblock fallback because silent batch sending is unavailable")
+		return
+	}
+	log.Info().Msg("Running silent unblock fallback backfill")
+	ctx = context.WithValue(ctx, manualUnblockBackfillContextKey{}, true)
+
+	resp, err := lc.FetchMessages(ctx, bridgev2.FetchMessagesParams{
+		Portal:  portal,
+		Forward: true,
+		Count:   limit,
 	})
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to fetch messages for silent unblock backfill")
+		return
+	} else if resp == nil {
+		log.Warn().Msg("No response returned for silent unblock backfill")
+		return
+	} else if len(resp.Messages) == 0 {
+		if resp.CompleteCallback != nil {
+			resp.CompleteCallback()
+		}
+		log.Debug().Msg("No messages found for silent unblock backfill")
+		return
+	}
+
+	latestMessage, err := lc.UserLogin.Bridge.DB.Message.GetLastPartAtOrBeforeTime(
+		ctx,
+		portal.PortalKey,
+		time.Now().Add(10*time.Second),
+	)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get latest message before silent unblock backfill")
+		return
+	}
+	// bridgev2 does not expose a public API for forcing a silent forward backfill
+	// when the normal resync path is disabled by the runtime backfill config.
+	//lint:ignore SA1019 The fallback must use bridgev2's batch backfill internals to remain notification-free.
+	portalInternals := portal.Internal()
+	resp.Messages = portalInternals.CutoffMessages(ctx, resp.Messages, true, true, latestMessage)
+	if len(resp.Messages) == 0 {
+		if resp.CompleteCallback != nil {
+			resp.CompleteCallback()
+		}
+		log.Debug().Msg("No new messages left for silent unblock backfill")
+		return
+	}
+
+	messageCount := len(resp.Messages)
+	complete := resp.CompleteCallback
+	log.Info().Int("message_count", messageCount).Msg("Sending silent unblock backfill")
+	portalInternals.SendBackfill(ctx, lc.UserLogin, resp.Messages, true, true, false, func() {
+		if complete != nil {
+			complete()
+		}
+		log.Info().Int("message_count", messageCount).Msg("Finished silent unblock backfill")
+	})
+}
+
+func (lc *LineClient) runUnblockBackfillFallback(ctx context.Context, mid string) {
+	if lc.isUserBlocked(mid) {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("mid", mid).
+			Msg("Skipping unblock fallback backfill because contact is blocked again")
+		return
+	}
+
+	runSilentUnblockBackfill(ctx, lc, mid)
+}
+
+func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid string) {
+	state := lc.getUnblockBackfill(mid)
+	lc.wg.Add(1)
+	go func() {
+		defer lc.wg.Done()
+		if state != nil {
+			defer lc.finishUnblockBackfill(mid, state)
+		}
+		lc.runUnblockBackfillFallback(ctx, mid)
+	}()
+}
+
+func (lc *LineClient) queueUnblockedDMRestore(ctx context.Context, mid, reason string) {
+	if isChatMID(mid) {
+		return
+	}
+	capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
+	if capabilities == nil || !capabilities.BatchSending {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("mid", mid).
+			Msg("Restoring unblocked DM without history because silent batch sending is unavailable")
+		lc.queueDMChatResync(ctx, mid, true, false)
+		return
+	}
+	_, queued := lc.beginUnblockBackfill(mid)
+	if !queued {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("mid", mid).
+			Msg("Unblock backfill is already queued")
+		return
+	}
+	lc.UserLogin.Bridge.Log.Info().
+		Str("mid", mid).
+		Str("reason", reason).
+		Msg("Restoring unblocked DM with backfill")
+	lc.queueDMChatResync(ctx, mid, true, true)
+	lc.queueUnblockBackfillFallback(ctx, mid)
 }
 
 // FetchMessages implements bridgev2.BackfillingNetworkAPI. It powers silent,
 // batch-sent history backfill. It is currently triggered when a DM portal is
-// recreated after the contact is unblocked (see queueDMBackfill), repopulating
+// recreated after the contact is unblocked (see queueDMChatResync), repopulating
 // the restored chat's recent history without notifying for every old message.
 // Only the newest params.Count messages are returned; there is no older-history
 // pagination, so backward fetches return an empty, final batch.
@@ -141,20 +571,32 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	}
 
 	chatMID := string(params.Portal.PortalKey.ID)
+	unblockState := lc.getUnblockBackfill(chatMID)
+	manualUnblockBackfill, _ := ctx.Value(manualUnblockBackfillContextKey{}).(bool)
+	if unblockState != nil && !manualUnblockBackfill {
+		capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
+		if capabilities == nil || !capabilities.BatchSending {
+			return &bridgev2.FetchMessagesResponse{HasMore: false, MarkRead: true}, nil
+		}
+		if !unblockState.claimFramework() {
+			lc.UserLogin.Bridge.Log.Debug().
+				Str("chat_mid", chatMID).
+				Msg("Skipping duplicate unblock backfill fetch")
+			return &bridgev2.FetchMessagesResponse{HasMore: false, MarkRead: true}, nil
+		}
+	}
 	limit := params.Count
 	if limit <= 0 {
 		limit = 50
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			msgs, err = client.GetRecentMessagesV2(chatMID, limit)
-		}
-	}
+	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+		return client.GetRecentMessagesV2(chatMID, limit)
+	})
 	if err != nil {
+		if unblockState != nil {
+			unblockState.complete()
+		}
 		return nil, fmt.Errorf("failed to fetch recent messages for backfill: %w", err)
 	}
 
@@ -162,9 +604,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	backfillMsgs := make([]*bridgev2.BackfillMessage, 0, len(msgs))
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
-		if msg.ContentType == 18 {
-			lc.cacheGroupMembersFromSystemMessage(msg)
-		}
+		lc.cacheGroupMembersFromMessage(chatMID, msg)
 		if !isBridgeableContentType(msg) {
 			continue
 		}
@@ -182,8 +622,8 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		if msg.From == lc.Mid {
 			opType = OpSendMessage
 		}
-		bodyText, unwrappedText := lc.decryptMessageBody(msg, chatMID, int(opType))
-		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText)
+		bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, chatMID, int(opType))
+		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText, decryptionFailed)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
 			continue
@@ -192,17 +632,24 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 			continue
 		}
 
+		reactions, _ := lc.convertMessageReactions(ctx, msg)
 		backfillMsgs = append(backfillMsgs, &bridgev2.BackfillMessage{
 			ConvertedMessage: converted,
 			Sender:           sender,
 			ID:               networkid.MessageID(msg.ID),
 			Timestamp:        lc.parseMessageTimestamp(msg),
+			Reactions:        reactions,
 		})
 	}
 
+	var completeCallback func()
+	if unblockState != nil {
+		completeCallback = unblockState.complete
+	}
 	return &bridgev2.FetchMessagesResponse{
-		Messages: backfillMsgs,
-		HasMore:  false,
+		Messages:         backfillMsgs,
+		HasMore:          false,
+		CompleteCallback: completeCallback,
 		// Mark the restored chat as read so the silent backfill doesn't leave a
 		// stale unread badge — and so the forward batch send never notifies.
 		MarkRead: true,
@@ -212,74 +659,175 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	defer lc.wg.Done()
 
-	client := line.NewClient(lc.AccessToken)
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
-		MessageBoxCountLimit:           100,
+		MessageBoxCountLimit:           messageBoxPageLimit,
 		WithUnreadCount:                true,
 		LastMessagesPerMessageBoxCount: 0,
 	}
 
-	res, err := client.GetMessageBoxes(opts)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			res, err = client.GetMessageBoxes(opts)
-		}
-	}
+	messageBoxes, err := lc.fetchAllMessageBoxes(ctx, opts)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to prefetch message boxes")
 		return
 	}
+	chatMIDs := collectStartupBackfillChatMIDs(messageBoxes, lc.getKnownMemberChatMIDs(), lc.isUserBlocked)
 
-	for _, box := range res.MessageBoxes {
-		lc.backfillRecentMessages(ctx, box.ID, 50)
+	workerCount := prefetchMessagesConcurrency
+	if len(chatMIDs) < workerCount {
+		workerCount = len(chatMIDs)
 	}
+	if workerCount == 0 {
+		return
+	}
+
+	lc.UserLogin.Bridge.Log.Info().
+		Int("message_box_count", len(messageBoxes)).
+		Int("chat_count", len(chatMIDs)).
+		Int("concurrency", workerCount).
+		Msg("Prefetching recent messages")
+
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	var backfilledSystemEvents atomic.Bool
+	workers.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer workers.Done()
+			for chatMID := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				if lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit) {
+					backfilledSystemEvents.Store(true)
+				}
+			}
+		}()
+	}
+
+	for _, chatMID := range chatMIDs {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return
+		case jobs <- chatMID:
+		}
+	}
+	close(jobs)
+	workers.Wait()
+
+	// Historical membership/name events are real state events. Replay them in
+	// timestamp order, then restore LINE's current authoritative chat state in
+	// a hidden resync so a truncated recent-message window cannot leave a room
+	// at an old membership or name.
+	if backfilledSystemEvents.Load() && ctx.Err() == nil {
+		lc.syncChatsNow(ctx)
+	}
+}
+
+func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMIDs []string, isBlocked func(string) bool) []string {
+	seen := make(map[string]struct{}, len(messageBoxes)+len(memberChatMIDs))
+	chatMIDs := make([]string, 0, len(messageBoxes)+len(memberChatMIDs))
+	add := func(mid string) {
+		if mid == "" {
+			return
+		}
+		if isBlocked != nil && isBlocked(mid) {
+			return
+		}
+		if _, ok := seen[mid]; ok {
+			return
+		}
+		seen[mid] = struct{}{}
+		chatMIDs = append(chatMIDs, mid)
+	}
+	for _, box := range messageBoxes {
+		add(box.ID)
+	}
+	for _, mid := range memberChatMIDs {
+		add(mid)
+	}
+	return chatMIDs
 }
 
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
-// (live) message path. Used by prefetchMessages on startup. Note that this
-// notifies for any not-yet-bridged messages; the silent backfill path used on
-// unblock goes through FetchMessages instead.
-func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) {
-	client := line.NewClient(lc.AccessToken)
-	msgs, err := client.GetRecentMessagesV2(chatMID, limit)
+// (live) message path. Used by prefetchMessages on startup.
+func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) bool {
+	start := time.Now()
+	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+		return client.GetRecentMessagesV2(chatMID, limit)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
-		return
+		return false
 	}
+	queued := 0
+	skippedExisting := 0
+	reactionSyncs := 0
+	systemEvents := 0
 	// Reverse messages to process oldest first
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
-		if msg.ContentType == 18 {
-			lc.cacheGroupMembersFromSystemMessage(msg)
-		}
+		lc.cacheGroupMembersFromMessage(chatMID, msg)
 
 		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
 		if err == nil && existing != nil {
+			skippedExisting++
+			if lc.queueMessageReactionSync(ctx, chatMID, msg) {
+				reactionSyncs++
+			}
 			continue
+		} else if err != nil {
+			lc.UserLogin.Bridge.Log.Warn().
+				Err(err).
+				Str("chat_mid", chatMID).
+				Str("msg_id", msg.ID).
+				Msg("Failed to check whether recent message already exists")
 		}
 
 		opType := OpReceiveMessage
 		if msg.From == lc.Mid {
 			opType = OpSendMessage
 		}
-		lc.queueIncomingMessage(msg, int(opType))
+		var didQueue bool
+		if ContentType(msg.ContentType) == ContentSystem {
+			didQueue = lc.queueHistoricalSystemMessage(msg, int(opType))
+		} else {
+			didQueue = lc.queueIncomingMessage(msg, int(opType))
+		}
+		if didQueue {
+			queued++
+			if ContentType(msg.ContentType) == ContentSystem {
+				systemEvents++
+			}
+			if lc.queueMessageReactionSync(ctx, chatMID, msg) {
+				reactionSyncs++
+			}
+		}
 	}
+	lc.UserLogin.Bridge.Log.Debug().
+		Str("chat_mid", chatMID).
+		Int("fetched", len(msgs)).
+		Int("queued", queued).
+		Int("system_events", systemEvents).
+		Int("reaction_syncs", reactionSyncs).
+		Int("skipped_existing", skippedExisting).
+		Dur("duration", time.Since(start)).
+		Msg("Finished recent-message backfill")
+	return systemEvents > 0
 }
 
 func (lc *LineClient) syncChats(ctx context.Context) {
 	defer lc.wg.Done()
+	lc.syncChatsNow(ctx)
+}
 
-	client := line.NewClient(lc.AccessToken)
-	midsResp, err := client.GetAllChatMids(true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			midsResp, err = client.GetAllChatMids(true, true)
-		}
-	}
+func (lc *LineClient) syncChatsNow(ctx context.Context) {
+	client, midsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetAllChatMidsResponse, error) {
+		return client.GetAllChatMids(true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch all chat mids")
 		return
@@ -287,8 +835,15 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 
 	allMids := append(midsResp.MemberChatMids, midsResp.InvitedChatMids...)
 	if len(allMids) == 0 {
+		lc.setKnownMemberChatMIDs(nil)
 		return
 	}
+	lc.setKnownMemberChatMIDs(midsResp.MemberChatMids)
+	memberChatMids := make(map[string]struct{}, len(midsResp.MemberChatMids))
+	for _, mid := range midsResp.MemberChatMids {
+		memberChatMids[mid] = struct{}{}
+	}
+	var pendingPortalCreates []*bridgev2.Portal
 
 	chunkSize := 20
 	for i := 0; i < len(allMids); i += chunkSize {
@@ -297,13 +852,10 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 			end = len(allMids)
 		}
 		batch := allMids[i:end]
-		chatsResp, err := client.GetChats(batch, true, true)
-		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				chatsResp, err = client.GetChats(batch, true, true)
-			}
-		}
+		var chatsResp *line.GetChatsResponse
+		client, chatsResp, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.GetChatsResponse, error) {
+			return client.GetChats(batch, true, true)
+		})
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch batch of chats")
 			continue
@@ -312,11 +864,25 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 		for _, chat := range chatsResp.Chats {
 			portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
 
+			existingPortal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+			if err != nil {
+				lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chat.ChatMid).Msg("Failed to find existing group portal before sync")
+			}
+
 			info := lc.chatToChatInfo(ctx, &chat, true)
-			// Member chats are created lazily on their first message; invited (not-yet-joined)
-			// chats have no incoming messages, so create their portal here so the pending
-			// invite surfaces as a Request even when it was outstanding before this sync.
+			// Existing member groups must have their Matrix portal before prefetch/SSE can
+			// deliver messages. If the first message creates the portal, bridgev2 has to
+			// join the sender ghost on demand and Beeper shows that old membership as a
+			// fresh "joined the chat" event. Invited (not-yet-joined) chats are also
+			// created so the pending invite surfaces as a Request.
 			createPortal := info.MessageRequest != nil && *info.MessageRequest
+			_, isMemberChat := memberChatMids[chat.ChatMid]
+			if isMemberChat {
+				createPortal = true
+			}
+			if createPortal && isMemberChat && (existingPortal == nil || existingPortal.MXID == "") {
+				lc.stripRemoteMembersFromInitialChatInfo(info)
+			}
 			lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
 				EventMeta: simplevent.EventMeta{
 					Type:         bridgev2.RemoteEventChatResync,
@@ -326,8 +892,60 @@ func (lc *LineClient) syncChats(ctx context.Context) {
 				},
 				ChatInfo: info,
 			})
+			if createPortal {
+				portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+				if err != nil {
+					lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chat.ChatMid).Msg("Failed to find group portal after queueing create")
+				} else if portal != nil && portal.MXID == "" {
+					pendingPortalCreates = append(pendingPortalCreates, portal)
+				}
+			}
 		}
 	}
+
+	lc.waitForGroupPortalCreates(ctx, pendingPortalCreates)
+}
+
+func (lc *LineClient) waitForGroupPortalCreates(ctx context.Context, portals []*bridgev2.Portal) {
+	if len(portals) == 0 {
+		return
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, groupPortalCreateWait)
+	defer cancel()
+	for _, portal := range portals {
+		if portal == nil || portal.MXID != "" || portal.RoomCreated.IsSet() {
+			continue
+		}
+		if err := portal.RoomCreated.Wait(waitCtx); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().
+				Err(err).
+				Object("portal_key", portal.PortalKey).
+				Msg("Timed out waiting for startup group portal creation")
+			return
+		}
+	}
+}
+
+func (lc *LineClient) setKnownMemberChatMIDs(mids []string) {
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	lc.knownMemberChatMIDs = make(map[string]struct{}, len(mids))
+	for _, mid := range mids {
+		if isChatMID(mid) {
+			lc.knownMemberChatMIDs[mid] = struct{}{}
+		}
+	}
+}
+
+func (lc *LineClient) getKnownMemberChatMIDs() []string {
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	mids := make([]string, 0, len(lc.knownMemberChatMIDs))
+	for mid := range lc.knownMemberChatMIDs {
+		mids = append(mids, mid)
+	}
+	sort.Strings(mids)
+	return mids
 }
 
 func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, excludeFromTimeline bool) *bridgev2.ChatInfo {
@@ -365,7 +983,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		// returns empty MemberMids (known LINE API issue).
 		allMemberMids := make([]string, 0, len(chat.Extra.GroupExtra.MemberMids))
 		for m := range chat.Extra.GroupExtra.MemberMids {
-			if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+			if !isUserMID(m) || lc.isOwnMID(m) {
 				continue
 			}
 			allMemberMids = append(allMemberMids, m)
@@ -373,11 +991,12 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
-				Membership: event.MembershipJoin,
+				Membership:       event.MembershipJoin,
+				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
 		}
 		for m := range chat.Extra.GroupExtra.InviteeMids {
-			if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+			if !isUserMID(m) || lc.isOwnMID(m) {
 				continue
 			}
 			allMemberMids = append(allMemberMids, m)
@@ -389,13 +1008,14 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
-				Membership: membership,
+				Membership:       membership,
+				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
 		}
 		if len(allMemberMids) == 0 {
 			lc.cacheGroupMembersFromRecentMessages(ctx, chat.ChatMid)
 			for _, m := range lc.getCachedGroupMembers(chat.ChatMid) {
-				if m == lc.Mid || m == string(lc.UserLogin.ID) || strings.HasPrefix(m, "c") || strings.HasPrefix(m, "r") {
+				if !isUserMID(m) || lc.isOwnMID(m) {
 					continue
 				}
 				allMemberMids = append(allMemberMids, m)
@@ -403,7 +1023,8 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 					EventSender: bridgev2.EventSender{
 						Sender: makeUserID(m),
 					},
-					Membership: event.MembershipJoin,
+					Membership:       event.MembershipJoin,
+					MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 				})
 			}
 		}
@@ -411,14 +1032,11 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		groupMemberMids = make([]string, 0, len(allMemberMids)+1)
 		groupMemberMids = append(groupMemberMids, lc.Mid)
 		groupMemberMids = append(groupMemberMids, allMemberMids...)
+		lc.cacheGroupMemberMIDs(chat.ChatMid, groupMemberMids)
 		lc.cacheMu.Lock()
-		if lc.groupMemberCache == nil {
-			lc.groupMemberCache = make(map[string][]string)
-		}
 		if lc.generatedGroupNameCache == nil {
 			lc.generatedGroupNameCache = make(map[string]bool)
 		}
-		lc.groupMemberCache[chat.ChatMid] = groupMemberMids
 		lc.cacheMu.Unlock()
 	}
 
@@ -446,7 +1064,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		Avatar: lc.avatarFromPicturePath(chat.PicturePath),
 		Members: &bridgev2.ChatMemberList{
 			IsFull:                     true,
-			Members:                    members,
+			MemberMap:                  chatMemberMapFromList(members),
 			ExcludeChangesFromTimeline: excludeFromTimeline,
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
@@ -530,57 +1148,49 @@ func (lc *LineClient) cacheGroupMembersFromSystemMessage(msg *line.Message) {
 	}
 	locKey := msg.ContentMetadata["LOC_KEY"]
 	switch locKey {
-	case "C_GI", "C_MI", "A_MI", "A_MC":
-	default:
+	case "C_GI", "C_MI", "A_MI":
+		lc.addGroupMembersToCache(chatMid, midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"])...)
+	case "A_MC":
+		lc.addGroupMembersToCache(chatMid, append(midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"]), msg.From)...)
+	case "C_MJ", "A_MJ":
+		lc.addGroupMembersToCache(chatMid, msg.From)
+	case "C_ML", "A_ML", "C_MR", "A_MR":
+		lc.removeGroupMemberFromCache(chatMid, msg.From)
+	case "C_IC":
+		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+		if len(parts) == 2 {
+			lc.removeGroupMemberFromCache(chatMid, parts[1])
+		}
+	}
+}
+
+func (lc *LineClient) cacheGroupMembersFromMessage(chatMid string, msg *line.Message) {
+	if msg == nil || !isChatMID(chatMid) {
 		return
 	}
-
-	seen := map[string]struct{}{
-		lc.Mid: {},
-	}
-	for _, mid := range lc.getCachedGroupMembers(chatMid) {
-		seen[mid] = struct{}{}
-	}
-	for _, mid := range midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"]) {
-		seen[mid] = struct{}{}
-	}
-	if len(seen) <= 1 {
+	if ContentType(msg.ContentType) == ContentSystem {
+		lc.cacheGroupMembersFromSystemMessage(msg)
 		return
 	}
-
-	members := make([]string, 0, len(seen))
-	for mid := range seen {
-		members = append(members, mid)
+	if !isBridgeableContentType(msg) {
+		return
 	}
-	lc.cacheMu.Lock()
-	if lc.groupMemberCache == nil {
-		lc.groupMemberCache = make(map[string][]string)
-	}
-	lc.groupMemberCache[chatMid] = members
-	lc.cacheMu.Unlock()
+	lc.addGroupMembersToCache(chatMid, msg.From)
 }
 
 func (lc *LineClient) cacheGroupMembersFromRecentMessages(ctx context.Context, chatMid string) {
 	if len(lc.getCachedGroupMembers(chatMid)) > 1 {
 		return
 	}
-	client := line.NewClient(lc.AccessToken)
-	msgs, err := client.GetRecentMessagesV2(chatMid, 50)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			msgs, err = client.GetRecentMessagesV2(chatMid, 50)
-		}
-	}
+	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+		return client.GetRecentMessagesV2(chatMid, 50)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Debug().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch recent messages for group member cache")
 		return
 	}
 	for i := len(msgs) - 1; i >= 0; i-- {
-		msg := msgs[i]
-		if msg.ContentType == 18 {
-			lc.cacheGroupMembersFromSystemMessage(msg)
-		}
+		lc.cacheGroupMembersFromMessage(chatMid, msgs[i])
 	}
 }
 
@@ -598,7 +1208,7 @@ func midsFromSystemLocArgs(locArgs string) []string {
 }
 
 func isUserMID(mid string) bool {
-	return len(mid) > 1 && strings.HasPrefix(mid, "U")
+	return len(mid) > 1 && (mid[0] == 'U' || mid[0] == 'u')
 }
 
 func isChatMID(mid string) bool {
@@ -607,6 +1217,215 @@ func isChatMID(mid string) bool {
 	}
 	lower := strings.ToLower(mid)
 	return strings.HasPrefix(lower, "c") || strings.HasPrefix(lower, "r")
+}
+
+func (lc *LineClient) isOwnMID(mid string) bool {
+	if mid == "" {
+		return false
+	}
+	if mid == lc.Mid {
+		return true
+	}
+	if lc.UserLogin != nil && lc.UserLogin.UserLogin != nil && mid == string(lc.UserLogin.ID) {
+		return true
+	}
+	return false
+}
+
+func (lc *LineClient) eventSenderForMID(mid string) bridgev2.EventSender {
+	return bridgev2.EventSender{
+		Sender:   makeUserID(mid),
+		IsFromMe: lc.isOwnMID(mid),
+	}
+}
+
+// resolveReactionSenderMID mirrors the Chrome extension's operation handling:
+// SEND_REACTION (type 139) updates the current user's reaction without a sender,
+// while NOTIFIED_SEND_REACTION (type 140) always passes param3 as senderMid.
+// This handler is shared by DMs and groups regardless of Letter Sealing mode.
+// A missing param3 can only be inferred safely in a DM, where chatMid is the
+// other user's MID. Never turn a group chat MID into a Matrix ghost.
+func (lc *LineClient) resolveReactionSenderMID(opType OperationType, op line.Operation, chatMid string) string {
+	if opType == OpPredefinedReaction {
+		return string(lc.UserLogin.ID)
+	}
+	if isUserMID(op.Param3) {
+		return op.Param3
+	}
+	if op.Param3 == "" && isUserMID(chatMid) {
+		return chatMid
+	}
+	return ""
+}
+
+func hiddenMemberEventExtra(exclude bool) map[string]any {
+	if !exclude {
+		return nil
+	}
+	return map[string]any{beeperExcludeFromTimelineKey: true}
+}
+
+func chatMemberMapFromList(members []bridgev2.ChatMember) bridgev2.ChatMemberMap {
+	memberMap := make(bridgev2.ChatMemberMap, len(members))
+	for _, member := range members {
+		memberMap.Set(member)
+	}
+	return memberMap
+}
+
+func (lc *LineClient) selfChatMember() bridgev2.ChatMember {
+	return bridgev2.ChatMember{
+		EventSender: bridgev2.EventSender{
+			IsFromMe: true,
+			Sender:   networkid.UserID(lc.UserLogin.ID),
+		},
+		Membership: event.MembershipJoin,
+		PowerLevel: ptr.Ptr(0),
+	}
+}
+
+func (lc *LineClient) isOwnChatMember(member bridgev2.ChatMember) bool {
+	if member.IsFromMe {
+		return true
+	}
+	if lc.UserLogin != nil && member.SenderLogin == lc.UserLogin.ID {
+		return true
+	}
+	return lc.isOwnMID(string(member.Sender))
+}
+
+func (lc *LineClient) stripRemoteMembersFromInitialChatInfo(info *bridgev2.ChatInfo) {
+	if info == nil || info.Members == nil {
+		return
+	}
+
+	members := info.Members
+	filteredMemberMap := make(bridgev2.ChatMemberMap)
+	for userID, member := range members.MemberMap {
+		if lc.isOwnChatMember(member) {
+			filteredMemberMap[userID] = member
+		}
+	}
+	if len(filteredMemberMap) == 0 {
+		filteredMemberMap.Set(lc.selfChatMember())
+	}
+
+	filtered := &bridgev2.ChatMemberList{
+		IsFull:                     false,
+		CheckAllLogins:             members.CheckAllLogins,
+		ExcludeChangesFromTimeline: members.ExcludeChangesFromTimeline,
+		TotalMemberCount:           members.TotalMemberCount,
+		OtherUserID:                members.OtherUserID,
+		MemberMap:                  filteredMemberMap,
+		PowerLevels:                members.PowerLevels,
+	}
+	info.Members = filtered
+}
+
+func (lc *LineClient) addGroupMembersToCache(chatMid string, mids ...string) bool {
+	if !isChatMID(chatMid) {
+		return false
+	}
+
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+
+	if lc.groupMemberCache == nil {
+		lc.groupMemberCache = make(map[string][]string)
+	}
+
+	seen := make(map[string]struct{}, len(lc.groupMemberCache[chatMid])+len(mids)+1)
+	members := make([]string, 0, len(lc.groupMemberCache[chatMid])+len(mids)+1)
+	appendMID := func(mid string) bool {
+		if !isUserMID(mid) {
+			return false
+		}
+		if _, ok := seen[mid]; ok {
+			return false
+		}
+		seen[mid] = struct{}{}
+		members = append(members, mid)
+		return true
+	}
+
+	appendMID(lc.Mid)
+	if lc.UserLogin != nil {
+		appendMID(string(lc.UserLogin.ID))
+	}
+	for _, mid := range lc.groupMemberCache[chatMid] {
+		appendMID(mid)
+	}
+
+	added := false
+	for _, mid := range mids {
+		if appendMID(mid) {
+			added = true
+		}
+	}
+	if len(members) > 0 {
+		lc.groupMemberCache[chatMid] = members
+	}
+	return added
+}
+
+func (lc *LineClient) removeGroupMemberFromCache(chatMid, mid string) bool {
+	if !isChatMID(chatMid) || !isUserMID(mid) {
+		return false
+	}
+
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+
+	members := lc.groupMemberCache[chatMid]
+	if len(members) == 0 {
+		return false
+	}
+
+	changed := false
+	next := members[:0]
+	for _, member := range members {
+		if member == mid {
+			changed = true
+			continue
+		}
+		next = append(next, member)
+	}
+	if changed {
+		lc.groupMemberCache[chatMid] = append([]string(nil), next...)
+	}
+	return changed
+}
+
+func (lc *LineClient) ensureGroupMessageSenderKnown(chatMid, senderMid string, ts time.Time) {
+	if !isChatMID(chatMid) || !isUserMID(senderMid) || lc.isOwnMID(senderMid) {
+		return
+	}
+	if !lc.addGroupMembersToCache(chatMid, senderMid) {
+		return
+	}
+	lc.emitMemberChange(chatMid, senderMid, event.MembershipJoin, ts, true)
+}
+
+func (lc *LineClient) hiddenJoinGroupMessageSender(ctx context.Context, portal *bridgev2.Portal, chatMid, senderMid string, ts time.Time) {
+	if !isChatMID(chatMid) || !isUserMID(senderMid) || lc.isOwnMID(senderMid) {
+		return
+	}
+	lc.addGroupMembersToCache(chatMid, senderMid)
+	if portal == nil || portal.MXID == "" {
+		return
+	}
+	portal.ProcessChatInfoChange(ctx, bridgev2.EventSender{}, lc.UserLogin, &bridgev2.ChatInfoChange{
+		MemberChanges: &bridgev2.ChatMemberList{
+			ExcludeChangesFromTimeline: true,
+			Members: []bridgev2.ChatMember{
+				{
+					EventSender:      bridgev2.EventSender{Sender: makeUserID(senderMid)},
+					Membership:       event.MembershipJoin,
+					MemberEventExtra: hiddenMemberEventExtra(true),
+				},
+			},
+		},
+	}, ts)
 }
 
 func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
@@ -659,27 +1478,72 @@ func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
 	}
 }
 
+func startReceiveAuthProbeContext(parent context.Context, startedAt time.Time) (context.Context, context.CancelFunc, time.Time) {
+	if receiveAuthProbeInterval <= 0 {
+		return parent, func() {}, time.Time{}
+	}
+
+	nextProbeAt := startedAt.Add(receiveAuthProbeInterval)
+	if now := receiveAuthProbeNow(); !nextProbeAt.After(now) {
+		nextProbeAt = now.Add(receiveAuthProbeInterval)
+	}
+	receiveCtx, cancel := newReceiveAuthProbeContext(parent, nextProbeAt)
+	return receiveCtx, cancel, nextProbeAt
+}
+
+func isReceiveAuthProbeDue(receiveCtx context.Context, nextProbeAt time.Time) bool {
+	if receiveAuthProbeInterval <= 0 {
+		return false
+	}
+	return errors.Is(context.Cause(receiveCtx), errReceiveAuthProbeDue) || !receiveAuthProbeNow().Before(nextProbeAt)
+}
+
+func waitForSSEReconnect(ctx context.Context) bool {
+	if sseReconnectDelay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(sseReconnectDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (lc *LineClient) pollLoop(ctx context.Context) {
 	defer lc.wg.Done()
 
 	var localRev int64 = 0
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
-	rev, err := client.GetLastOpRevision()
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			rev, err = client.GetLastOpRevision()
-		} else {
-			lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token for getLastOpRevision")
-		}
-	}
+	_, rev, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (int64, error) {
+		return getLastOpRevisionWithClient(ctx, client)
+	})
 	if err != nil {
+		if lc.isSessionInvalidated() {
+			return
+		}
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get last op revision")
 	} else {
 		localRev = rev
 		lc.UserLogin.Bridge.Log.Info().Int64("local_rev", localRev).Msg("Seeded local revision from getLastOpRevision")
+	}
+
+	receiveCtx, cancelReceive, nextProbeAt := startReceiveAuthProbeContext(ctx, receiveAuthProbeNow())
+	defer func() {
+		cancelReceive()
+	}()
+	probeAndReschedule := func() bool {
+		probeStartedAt := receiveAuthProbeNow()
+		if lc.handleReceiveAuthProbe(ctx) || ctx.Err() != nil {
+			return true
+		}
+		cancelReceive()
+		receiveCtx, cancelReceive, nextProbeAt = startReceiveAuthProbeContext(ctx, probeStartedAt)
+		return false
 	}
 
 	handler := func(eventType, data string) {
@@ -702,6 +1566,13 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 					localRev = newRev
 
 				}
+			}
+			newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
+			if err != nil {
+				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to refresh blocked contacts during fullSync")
+			}
+			for _, mid := range newlyUnblocked {
+				lc.queueUnblockedDMRestore(ctx, mid, "full_sync")
 			}
 			lc.wg.Add(3)
 			go lc.syncChats(ctx)
@@ -728,35 +1599,164 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	}
 
 	for {
-		err := client.ListenSSE(ctx, localRev, handler)
+		if ctx.Err() != nil {
+			return
+		}
+		if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
+			if probeAndReschedule() {
+				return
+			}
+			continue
+		}
+
+		client = lc.newClient()
+		err := listenSSEWithClient(client, receiveCtx, localRev, handler)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
+				if probeAndReschedule() {
+					return
+				}
+				continue
+			}
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			if err.Error() != "EOF" {
+			if !errors.Is(err, io.EOF) {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
 
-				isAuthErr := strings.Contains(err.Error(), "SSE error: 401") ||
-					strings.Contains(err.Error(), "SSE error: 403") ||
-					lc.isLoggedOut(err)
-
-				if isAuthErr {
-					if errRecover := lc.recoverToken(ctx); errRecover != nil {
-						lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
-						lc.UserLogin.BridgeState.Send(status.BridgeState{
-							StateEvent: status.StateBadCredentials,
-							Error:      "line-logged-out",
-							Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
-							UserAction: status.UserActionRelogin,
-						})
+				if line.IsSSEIdleTimeout(err) {
+					if probeAndReschedule() {
 						return
 					}
-					client = line.NewClient(lc.AccessToken)
+					if !waitForSSEReconnect(receiveCtx) {
+						continue
+					}
+					continue
+				}
+
+				if line.IsAuthError(err) {
+					if lc.handleReceiveAuthError(ctx, client, err) {
+						return
+					}
 				}
 			}
-			time.Sleep(3 * time.Second)
+			if !waitForSSEReconnect(receiveCtx) {
+				continue
+			}
 		}
 	}
+}
+
+// handleReceiveAuthProbe checks Talk auth independently of SSE activity. The
+// caller reconnects from the existing localRev after every probe so operations
+// that arrived during the check are replayed rather than skipped.
+func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
+	if ctx.Err() != nil || lc.isSessionInvalidated() {
+		return true
+	}
+	if lc.superseded.Load() {
+		return true
+	}
+
+	// This is only a health probe. Keep localRev unchanged so the reconnected
+	// stream replays operations that arrived while the old stream was stalled.
+	probeClient := lc.newClient()
+	_, probeErr := getLastOpRevisionWithClient(ctx, probeClient)
+	if probeErr == nil {
+		return false
+	}
+	if ctx.Err() != nil {
+		return true
+	}
+
+	if line.IsUnauthorizedStatus(probeErr) {
+		return lc.handleReceiveAuthError(ctx, probeClient, probeErr)
+	}
+
+	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, probeClient, probeErr)
+	if errRecover != nil {
+		if errors.Is(errRecover, errLineSessionInvalidated) || errors.Is(errRecover, errLineClientSuperseded) || ctx.Err() != nil {
+			return true
+		}
+		if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover token after receive auth probe")
+		}
+		return false
+	}
+	if recoveredClient != nil {
+		return false
+	}
+	if lc.isSessionInvalidated() {
+		return true
+	}
+
+	if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(probeErr).Msg("Receive auth probe failed; reconnecting SSE")
+	}
+	return false
+}
+
+// handleReceiveAuthError handles auth failures from /operation/receive. The
+// receive endpoint may return only a bare 401/403, so probe getProfile to reveal
+// the detailed forced-logout envelope before deciding whether recovery is safe.
+func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *line.Client, err error) bool {
+	if lc.isLoggedOut(err) {
+		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+		if errRecover != nil {
+			return true
+		}
+		return recoveredClient == nil
+	}
+
+	profileToken := lc.getAccessToken()
+	if profileToken == "" && failedClient != nil {
+		profileToken = failedClient.AccessToken
+	}
+	profileClient := newLineAPIClient(profileToken)
+	_, profileErr := getProfileWithToken(ctx, profileToken)
+	if ctx.Err() != nil {
+		return true
+	}
+	if lc.isLoggedOut(profileErr) {
+		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, profileClient, profileErr)
+		if errRecover != nil {
+			return true
+		}
+		return recoveredClient == nil
+	}
+	if profileErr == nil {
+		return false
+	}
+
+	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+	if recoveredClient != nil {
+		return false
+	}
+	if errRecover == nil {
+		return true
+	}
+
+	if ctx.Err() != nil {
+		return true
+	}
+	if errors.Is(errRecover, errLineSessionInvalidated) || errors.Is(errRecover, errLineClientSuperseded) {
+		return true
+	}
+	if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
+		lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
+	}
+	if lc.UserLogin != nil && lc.UserLogin.BridgeState != nil {
+		lc.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      "line-logged-out",
+			Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
+			UserAction: status.UserActionRelogin,
+		})
+	}
+	return true
 }
 
 func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
@@ -785,6 +1785,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Lock()
 		lc.blockedUsers[mid] = true
 		lc.cacheMu.Unlock()
+		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact blocked")
 		// Block operations should only carry user MIDs; skip if it looks like a group/room
 		// to avoid blast-radius deleting a group portal on an unexpected payload.
@@ -808,19 +1809,13 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Lock()
 		delete(lc.blockedUsers, mid)
 		lc.cacheMu.Unlock()
+		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact unblocked")
-		// Reattach the DM portal: emit a ChatResync with CreatePortal so the
-		// framework recreates the portal that was deleted on block, then ask it
-		// to backfill recent history. The backfill is batch-sent silently (see
-		// FetchMessages), so the restored chat repopulates without firing a
-		// notification for every old message — a blocked contact can't have sent
-		// anything new, so notifying on unblock is never useful.
-		lowerMid := strings.ToLower(mid)
-		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
-			return
-		}
-		lc.queueDMChatResync(ctx, mid, true)
-		lc.queueDMBackfill(mid)
+		// Reattach the DM portal and, when silent batch sending is available,
+		// restore its recent history without notifying for every old message.
+		// A blocked contact can't have sent anything new, so notifying on unblock
+		// is never useful; without batch sending, restore the empty room instead.
+		lc.queueUnblockedDMRestore(ctx, mid, "op_unblock")
 
 	case OpContactUpdate:
 		mid := op.Param1
@@ -874,9 +1869,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpNotifiedLeaveChat:
 		lower1 := strings.ToLower(op.Param1)
 		if strings.HasPrefix(lower1, "c") || strings.HasPrefix(lower1, "r") {
-			lc.handleMemberLeave(op.Param1, op.Param2)
+			lc.handleMemberLeft(op.Param1, op.Param2)
 		} else {
-			lc.handleMemberLeave(op.Param2, op.Param1)
+			lc.handleMemberLeft(op.Param2, op.Param1)
 		}
 
 	case OpNotifiedJoinChat:
@@ -913,7 +1908,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 					Receiver: lc.UserLogin.ID,
 				},
 				Timestamp: time.UnixMilli(ts),
-				Sender:    bridgev2.EventSender{Sender: senderID},
+				Sender:    lc.eventSenderForMID(string(senderID)),
 			},
 			ReadUpTo: time.UnixMilli(ts),
 		})
@@ -944,13 +1939,13 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				return
 			}
 
-			// Type 139 is the "self" event - sender is always the bridge user
-			op.Param3 = string(lc.UserLogin.ID)
+			// Type 139 is the "self" event - sender is always the bridge user.
+			op.Param3 = lc.resolveReactionSenderMID(OpPredefinedReaction, op, param2.ChatMid)
 
 			// Curr == nil signals a reaction removal/clear from LINE.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (self)")
-				lc.handleReactionRemove(op, param2.ChatMid, []networkid.UserID{makeUserID(string(lc.UserLogin.ID))})
+				lc.handleReactionRemove(op, param2.ChatMid, makeUserID(string(lc.UserLogin.ID)))
 				return
 			}
 
@@ -974,30 +1969,27 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				return
 			}
 
+			op.Param3 = lc.resolveReactionSenderMID(OpReaction, op, param2.ChatMid)
+			if op.Param3 == "" {
+				lc.UserLogin.Bridge.Log.Warn().
+					Str("msg_id", op.Param1).
+					Str("chat_mid", param2.ChatMid).
+					Msg("Skipping reaction without a user sender MID")
+				return
+			}
+
 			// Curr == nil signals a reaction removal/clear from LINE. The
 			// payload does not carry the previous reaction type, so we don't
-			// know whether the original was predefined or paid. Existing
-			// predefined adds in this branch override op.Param3 = chatMid,
-			// while paid adds leave it as the observer MID — so we queue a
-			// removal for each candidate sender. The framework safely ignores
-			// any sender that doesn't have a matching reaction row.
+			// know whether the original was predefined or paid. Both variants
+			// use the type 140 actor from param3, so the sender is unambiguous.
 			if param2.Curr == nil {
 				lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("chat_mid", param2.ChatMid).Msg("Received reaction removal (other)")
-				senders := []networkid.UserID{makeUserID(param2.ChatMid)}
-				if op.Param3 != "" && op.Param3 != param2.ChatMid {
-					senders = append(senders, makeUserID(op.Param3))
-				}
-				lc.handleReactionRemove(op, param2.ChatMid, senders)
+				lc.handleReactionRemove(op, param2.ChatMid, makeUserID(op.Param3))
 				return
 			}
 
 			// Handle predefined reactions sent via type 140 operations
 			if param2.Curr.PaidReactionType == nil && param2.Curr.PredefinedReactionType != nil {
-				// Type 140 is the "other" event - param3 is the observer,
-				// not the actor. Override with chatMid, which in 1:1 DMs
-				// is the other participant's MID (the reacting user).
-				op.Param3 = param2.ChatMid
-
 				lc.handlePredefinedReaction(ctx, op, param2.ChatMid, param2.Curr.PredefinedReactionType.Val)
 				return
 			}
@@ -1012,7 +2004,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 
 	case OpSendMessage, OpReceiveMessage:
 		if op.Message != nil {
-			if op.Message.ContentType == 18 {
+			if ContentType(op.Message.ContentType) == ContentSystem {
 				lc.handleSystemMessage(op)
 			} else {
 				lc.queueIncomingMessage(op.Message, op.Type)
@@ -1035,212 +2027,86 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 }
 
 func (lc *LineClient) handlePaidReaction(ctx context.Context, op line.Operation, param2 *line.ReactionPayload) {
-	prt := param2.Curr.PaidReactionType
-	url := fmt.Sprintf("https://stickershop.line-scdn.net/sticonshop/v1/sticon/%s/android/%s.png", prt.ProductID, prt.EmojiID)
-
-	resp, err := lc.HTTPClient.Get(url)
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Error().Err(err).Str("url", url).Msg("Failed to download reaction image")
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		lc.UserLogin.Bridge.Log.Error().Int("status_code", resp.StatusCode).Str("url", url).Msg("Failed to download reaction image: bad status code")
-		return
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to read reaction image body")
-		return
-	}
-
-	mimeType := resp.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "image/png"
-	}
-
-	senderID := makeUserID(op.Param3)
-	ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, senderID)
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to get ghost for reaction sender")
-		return
-	}
-
-	portalKey := networkid.PortalKey{ID: makePortalID(param2.ChatMid), Receiver: lc.UserLogin.ID}
-	portal, err := lc.UserLogin.Bridge.GetPortalByKey(ctx, portalKey)
-	if err != nil || portal == nil {
-		lc.UserLogin.Bridge.Log.Error().Err(err).Str("chat_mid", param2.ChatMid).Msg("Failed to get portal for reaction")
-		return
-	}
-
-	if portal.MXID == "" {
-		lc.UserLogin.Bridge.Log.Error().Msg("Portal MXID is empty, cannot upload media")
-		return
-	}
-
-	mxc, uploadedFile, err := ghost.Intent.UploadMedia(ctx, "", data, "reaction.png", mimeType)
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Error().Err(err).Int("data_len", len(data)).Msg("Failed to upload reaction image to Matrix")
-		return
-	}
-	if mxc == "" && uploadedFile != nil && uploadedFile.URL != "" {
-		mxc = id.ContentURIString(uploadedFile.URL)
-	}
-	if mxc == "" {
-		lc.UserLogin.Bridge.Log.Error().Interface("uploaded_file", uploadedFile).Msg("UploadMedia returned empty MXC URI")
-		return
-	}
-
-	// A fresh add invalidates any prior remove-dedup entries for this
-	// message — otherwise a later removal would be silently skipped.
-	lc.clearReactionDedupEntries(op.Param1, true)
-
 	ts, _ := op.CreatedTime.Int64()
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventReaction,
-			PortalKey: portalKey,
-			Timestamp: time.UnixMilli(ts),
-			Sender:    bridgev2.EventSender{Sender: senderID},
-		},
-		TargetMessage: networkid.MessageID(op.Param1),
-		Emoji:         string(mxc),
-	})
+	reaction, err := lc.convertReaction(
+		ctx,
+		line.ReactionType{PaidReactionType: param2.Curr.PaidReactionType},
+		lc.eventSenderForMID(op.Param3),
+		time.UnixMilli(ts),
+	)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to prepare paid reaction icon")
+		return
+	}
+	lc.UserLogin.Bridge.QueueRemoteEvent(
+		lc.UserLogin,
+		lc.liveReactionSyncEvent(op, param2.ChatMid, reaction.Sender.Sender, reaction),
+	)
 }
 
 func (lc *LineClient) handlePredefinedReaction(ctx context.Context, op line.Operation, chatMid string, prt int) {
-	if prt < 2 || prt > 7 {
-		lc.UserLogin.Bridge.Log.Error().Int("predefined_reaction_type", prt).Msg("Unknown predefined reaction type")
-		return
-	}
-
-	senderID := makeUserID(op.Param3)
-	if op.Param3 == "" {
-		senderID = makeUserID(chatMid)
-	}
-
-	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
-
-	lc.cacheMu.Lock()
-	mxc, ok := lc.reactionIconMXC[prt]
-	lc.cacheMu.Unlock()
-
-	if !ok || mxc == "" {
-		pngData, err := getReactionIconData(prt)
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Error().Err(err).Int("prt", prt).Msg("Failed to get reaction icon data")
-			return
-		}
-
-		uploadedMXC, _, err := lc.UserLogin.Bridge.Bot.UploadMedia(ctx, "", pngData, "reaction.png", "image/png")
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Error().Err(err).Int("prt", prt).Msg("Failed to upload reaction icon to Matrix")
-			return
-		}
-		mxc = string(uploadedMXC)
-
-		lc.cacheMu.Lock()
-		if lc.reactionIconMXC == nil {
-			lc.reactionIconMXC = make(map[int]string)
-		}
-		lc.reactionIconMXC[prt] = mxc
-		lc.cacheMu.Unlock()
-	}
-
-	dedupKey := op.Param1 + "\x00" + mxc
-	if _, loaded := lc.recentReactions.LoadOrStore(dedupKey, struct{}{}); loaded {
-		lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Msg("Skipping duplicate predefined reaction")
-		return
-	}
-
-	// A fresh add invalidates any prior remove-dedup entries for this
-	// message — otherwise a later removal of this (or a replacement)
-	// reaction would be silently skipped.
-	lc.clearReactionDedupEntries(op.Param1, true)
-
 	ts, _ := op.CreatedTime.Int64()
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
+	reaction, err := lc.convertReaction(
+		ctx,
+		line.ReactionType{PredefinedReactionType: prt},
+		lc.eventSenderForMID(op.Param3),
+		time.UnixMilli(ts),
+	)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Error().Err(err).Int("predefined_reaction_type", prt).Msg("Failed to prepare predefined reaction icon")
+		return
+	}
+	lc.UserLogin.Bridge.QueueRemoteEvent(
+		lc.UserLogin,
+		lc.liveReactionSyncEvent(op, chatMid, reaction.Sender.Sender, reaction),
+	)
+}
+
+func (lc *LineClient) liveReactionSyncEvent(
+	op line.Operation,
+	chatMid string,
+	sender networkid.UserID,
+	reaction *bridgev2.BackfillReaction,
+) *simplevent.ReactionSync {
+	ts, _ := op.CreatedTime.Int64()
+	reactions := []*bridgev2.BackfillReaction(nil)
+	if reaction != nil {
+		reactions = []*bridgev2.BackfillReaction{reaction}
+	}
+	return &simplevent.ReactionSync{
 		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventReaction,
-			PortalKey: portalKey,
+			Type:      bridgev2.RemoteEventReactionSync,
+			PortalKey: networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID},
 			Timestamp: time.UnixMilli(ts),
-			Sender:    bridgev2.EventSender{Sender: senderID},
 		},
 		TargetMessage: networkid.MessageID(op.Param1),
-		Emoji:         mxc,
-	})
-}
-
-// handleReactionRemove queues a RemoteEventReactionRemove for each candidate
-// sender. Reactions are stored with EmojiID="" (see handlePaidReaction /
-// handlePredefinedReaction), so the framework's reaction lookup finds the
-// single row keyed by (target_message, sender) and redacts it. A miss is
-// silently ignored by bridgev2, which lets callers safely queue multiple
-// sender candidates when the previous reaction's actor is ambiguous.
-//
-// It also evicts stale add-dedup entries for the target message so that
-// re-adding the same emoji after a clear isn't silently dropped by the
-// recentReactions sync.Map.
-func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, senders []networkid.UserID) {
-	ts, _ := op.CreatedTime.Int64()
-	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
-
-	for _, sender := range senders {
-		dedupKey := op.Param1 + "\x00remove\x00" + string(sender)
-		if _, loaded := lc.recentReactions.LoadOrStore(dedupKey, struct{}{}); loaded {
-			lc.UserLogin.Bridge.Log.Debug().Str("msg_id", op.Param1).Str("sender", string(sender)).Msg("Skipping duplicate reaction removal")
-			continue
-		}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Reaction{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventReactionRemove,
-				PortalKey: portalKey,
-				Timestamp: time.UnixMilli(ts),
-				Sender:    bridgev2.EventSender{Sender: sender},
+		Reactions: &bridgev2.ReactionSyncData{
+			Users: map[networkid.UserID]*bridgev2.ReactionSyncUser{
+				sender: {
+					Reactions:       reactions,
+					HasAllReactions: true,
+				},
 			},
-			TargetMessage: networkid.MessageID(op.Param1),
-		})
+			HasAllUsers: false,
+		},
 	}
-
-	lc.clearReactionDedupEntries(op.Param1, false)
 }
 
-// clearReactionDedupEntries evicts recentReactions entries for the given
-// message. The recentReactions sync.Map dedups concurrent 139/140 events
-// from LINE; without periodic cleanup, the keys accumulate and silently
-// block legitimate later events (e.g. add → remove → add of the same
-// emoji, or remove → add → remove sequences). We use the inverse-direction
-// event as the cleanup trigger: an add clears stale remove-dedup entries
-// (removeOnly=true), a remove clears stale add-dedup entries
-// (removeOnly=false).
-func (lc *LineClient) clearReactionDedupEntries(msgID string, removeOnly bool) {
-	prefix := msgID + "\x00"
-	lc.recentReactions.Range(func(k, _ any) bool {
-		ks, ok := k.(string)
-		if !ok {
-			return true
-		}
-		if !strings.HasPrefix(ks, prefix) {
-			return true
-		}
-		if strings.Contains(ks, "\x00remove\x00") == removeOnly {
-			lc.recentReactions.Delete(ks)
-		}
-		return true
-	})
+// handleReactionRemove queues an authoritative empty reaction sync for the
+// sender, removing both legacy empty-ID rows and stable paid/predefined reaction
+// IDs without needing the previous reaction type.
+func (lc *LineClient) handleReactionRemove(op line.Operation, chatMid string, sender networkid.UserID) {
+	lc.UserLogin.Bridge.QueueRemoteEvent(
+		lc.UserLogin,
+		lc.liveReactionSyncEvent(op, chatMid, sender, nil),
+	)
 }
 
 func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 	chatMid := op.Param1
-	client := line.NewClient(lc.AccessToken)
-	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
-		}
-	}
+	_, chatsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+		return client.GetChats([]string{chatMid}, true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch chat info")
 		// Only emit leave if we confirm the user is definitively not a member
@@ -1294,14 +2160,9 @@ func (lc *LineClient) syncSingleChat(ctx context.Context, op line.Operation) {
 // checkChatMembership calls GetAllChatMids to verify whether the bridge user
 // is a member or invitee of the given chat.
 func (lc *LineClient) checkChatMembership(ctx context.Context, chatMid string) (isMember, isInvitee bool) {
-	client := line.NewClient(lc.AccessToken)
-	midsResp, err := client.GetAllChatMids(true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			midsResp, err = client.GetAllChatMids(true, true)
-		}
-	}
+	_, midsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetAllChatMidsResponse, error) {
+		return client.GetAllChatMids(true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("checkChatMembership: GetAllChatMids failed")
 		return false, false
@@ -1319,45 +2180,96 @@ func (lc *LineClient) checkChatMembership(ctx context.Context, chatMid string) (
 	return false, false
 }
 
-func (lc *LineClient) emitMemberChange(chatMid, userMid string, membership event.Membership, ts time.Time) {
+func (lc *LineClient) emitMemberChange(chatMid, userMid string, membership event.Membership, ts time.Time, excludeFromTimeline ...bool) {
+	lc.emitMemberChangeWithSender(chatMid, userMid, membership, ts, bridgev2.EventSender{}, excludeFromTimeline...)
+}
+
+func (lc *LineClient) emitMemberChangeWithSender(
+	chatMid, userMid string,
+	membership event.Membership,
+	ts time.Time,
+	changeSender bridgev2.EventSender,
+	excludeFromTimeline ...bool,
+) {
+	exclude := len(excludeFromTimeline) > 0 && excludeFromTimeline[0]
 	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
-	sender := bridgev2.EventSender{Sender: networkid.UserID(userMid)}
-	if userMid == string(lc.UserLogin.ID) || userMid == lc.Mid {
-		sender.IsFromMe = true
-	}
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatInfoChange{
+	member := lc.eventSenderForMID(userMid)
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, makeMemberChangeEvent(
+		portalKey,
+		member,
+		changeSender,
+		membership,
+		ts,
+		exclude,
+	))
+}
+
+func makeMemberChangeEvent(
+	portalKey networkid.PortalKey,
+	member, changeSender bridgev2.EventSender,
+	membership event.Membership,
+	ts time.Time,
+	exclude bool,
+) *simplevent.ChatInfoChange {
+	return &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatInfoChange,
 			PortalKey: portalKey,
+			Sender:    changeSender,
 			Timestamp: ts,
 		},
 		ChatInfoChange: &bridgev2.ChatInfoChange{
 			MemberChanges: &bridgev2.ChatMemberList{
-				Members: []bridgev2.ChatMember{
-					{
-						EventSender: sender,
-						Membership:  membership,
+				ExcludeChangesFromTimeline: exclude,
+				MemberMap: bridgev2.ChatMemberMap{
+					member.Sender: {
+						EventSender:      member,
+						Membership:       membership,
+						MemberEventExtra: hiddenMemberEventExtra(exclude),
 					},
 				},
 			},
 		},
-	})
+	}
 }
 
 func (lc *LineClient) handleSelfLeave(chatMid string) {
-	lc.emitMemberChange(chatMid, string(lc.UserLogin.ID), event.MembershipLeave, time.Now())
+	selfID := string(lc.UserLogin.ID)
+	lc.handleSelfLeaveWithSender(chatMid, lc.eventSenderForMID(selfID))
+}
+
+func (lc *LineClient) handleSelfLeaveWithSender(chatMid string, changeSender bridgev2.EventSender) {
+	lc.cacheMu.Lock()
+	delete(lc.groupMemberCache, chatMid)
+	lc.cacheMu.Unlock()
+	lc.emitMemberChangeWithSender(
+		chatMid,
+		string(lc.UserLogin.ID),
+		event.MembershipLeave,
+		time.Now(),
+		changeSender,
+	)
 }
 
 func (lc *LineClient) handleMemberLeave(chatMid, leaverMid string) {
+	lc.handleMemberLeaveWithSender(chatMid, leaverMid, bridgev2.EventSender{})
+}
+
+func (lc *LineClient) handleMemberLeft(chatMid, leaverMid string) {
+	lc.handleMemberLeaveWithSender(chatMid, leaverMid, lc.eventSenderForMID(leaverMid))
+}
+
+func (lc *LineClient) handleMemberLeaveWithSender(chatMid, leaverMid string, changeSender bridgev2.EventSender) {
 	lower := strings.ToLower(chatMid)
 	if !strings.HasPrefix(lower, "c") && !strings.HasPrefix(lower, "r") {
 		return
 	}
 	if leaverMid == lc.Mid || leaverMid == string(lc.UserLogin.ID) {
-		lc.handleSelfLeave(chatMid)
+		lc.handleSelfLeaveWithSender(chatMid, changeSender)
 		return
 	}
-	lc.emitMemberChange(chatMid, leaverMid, event.MembershipLeave, time.Now())
+	lc.removeGroupMemberFromCache(chatMid, leaverMid)
+	lc.emitMemberChangeWithSender(chatMid, leaverMid, event.MembershipLeave, time.Now(), changeSender)
 }
 
 func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
@@ -1365,18 +2277,14 @@ func (lc *LineClient) handleMemberJoin(chatMid, joinerMid string) {
 	if !strings.HasPrefix(lower, "c") && !strings.HasPrefix(lower, "r") {
 		return
 	}
+	lc.addGroupMembersToCache(chatMid, joinerMid)
 	lc.emitMemberChange(chatMid, joinerMid, event.MembershipJoin, time.Now())
 }
 
 func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType OperationType) {
-	client := line.NewClient(lc.AccessToken)
-	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
-		}
-	}
+	_, chatsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+		return client.GetChats([]string{chatMid}, true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch chat info for invite")
 		return
@@ -1417,14 +2325,9 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType O
 }
 
 func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
-	client := line.NewClient(lc.AccessToken)
-	chatsResp, err := client.GetChats([]string{chatMid}, true, true)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			chatsResp, err = client.GetChats([]string{chatMid}, true, true)
-		}
-	}
+	_, chatsResp, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+		return client.GetChats([]string{chatMid}, true, true)
+	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).Msg("Failed to fetch invited chat info")
 		return
@@ -1463,106 +2366,201 @@ func (lc *LineClient) handleInviteForSelfFromChat(ctx context.Context, chat *lin
 	})
 }
 
-func (lc *LineClient) handleSystemMessage(op line.Operation) {
-	msg := op.Message
-	if msg.ContentMetadata == nil {
-		return
+func isHandledSystemMessage(msg *line.Message) bool {
+	if msg == nil || ContentType(msg.ContentType) != ContentSystem || msg.ContentMetadata == nil || !isChatMID(msg.To) {
+		return false
 	}
-	locKey := msg.ContentMetadata["LOC_KEY"]
-	ts, _ := msg.CreatedTime.Int64()
-	if ts == 0 {
-		ts = time.Now().UnixMilli()
-	}
-	tsTime := time.UnixMilli(ts)
-	switch locKey {
+	switch msg.ContentMetadata["LOC_KEY"] {
 	case "C_PN":
-		lc.handleGroupRename(op)
-	case "C_MJ", "A_MJ":
-		lc.emitMemberChange(msg.To, msg.From, event.MembershipJoin, tsTime)
-	case "C_ML", "A_ML", "C_MR", "A_MR":
-		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("leaver_mid", msg.From).Msg("System message: member leave")
-		lc.emitMemberChange(msg.To, msg.From, event.MembershipLeave, tsTime)
-	case "C_GI", "C_MI", "A_MI":
-		// msg.From is the inviter, not the invitee.
-		// Extract the invitee from LOC_ARGS, which has format: inviterMid\x1einviteeMid
-		locArgs := msg.ContentMetadata["LOC_ARGS"]
-		parts := strings.SplitN(locArgs, "\x1e", 2)
-		if len(parts) == 2 {
-			inviteeMid := parts[1]
-			if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
-				// The bridge user is the invitee: create the portal as a message request.
-				// Defense-in-depth in case no OpInviteIntoChat/OpNotifiedInviteIntoChat SSE op
-				// arrives — an emitMemberChange here would be dropped because the portal doesn't
-				// exist yet. The SSE handler usually wins the race, so only act as a fallback when
-				// the portal doesn't exist yet, to avoid a duplicate GetChats + ChatResync.
-				chatMid := msg.To
-				lc.wg.Add(1)
-				go func() {
-					defer lc.wg.Done()
-					portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
-					if portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(context.Background(), portalKey); err == nil && portal != nil && portal.MXID != "" {
-						return
-					}
-					lc.handleInviteForSelf(context.Background(), chatMid)
-				}()
-			} else {
-				lc.emitMemberChange(msg.To, inviteeMid, event.MembershipInvite, tsTime)
-			}
-		}
-	case "C_IC":
-		// Invitation cancelled — emit leave for the invitee
-		// LOC_ARGS format: cancellerMid\x1einviteeMid
-		locArgs := msg.ContentMetadata["LOC_ARGS"]
-		parts := strings.SplitN(locArgs, "\x1e", 2)
-		if len(parts) == 2 {
-			inviteeMid := parts[1]
-			lc.emitMemberChange(msg.To, inviteeMid, event.MembershipLeave, tsTime)
-		}
-	case "A_MC":
-		// A_MC = Auto-join via call / member added.
-		// msg.From is the person added.
-		lc.emitMemberChange(msg.To, msg.From, event.MembershipJoin, tsTime)
+		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+		return len(parts) == 2 && parts[1] != ""
+	case "C_MJ", "A_MJ", "C_ML", "A_ML", "C_MR", "A_MR", "A_MC":
+		return msg.From != ""
+	case "C_GI", "C_MI", "A_MI", "C_IC":
+		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+		return len(parts) == 2 && parts[1] != ""
 	default:
-		lc.UserLogin.Bridge.Log.Debug().
-			Str("loc_key", locKey).
-			Str("chat_mid", msg.To).
-			Msg("Unhandled system message LOC_KEY")
+		return false
 	}
 }
 
-func (lc *LineClient) handleGroupRename(op line.Operation) {
+// makeSystemMessageEvent converts a LINE contentType=18 record into the same
+// chat info event used by the live SSE path. A nil event with handled=true is
+// the special self-invite case, which schedules its existing portal fallback.
+func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.ChatInfoChange, bool) {
 	msg := op.Message
-	locArgs := msg.ContentMetadata["LOC_ARGS"]
-	// LOC_ARGS format: "<renamer_mid>\x1e<new_name>"
-	parts := strings.SplitN(locArgs, "\x1e", 2)
-	if len(parts) < 2 || parts[1] == "" {
-		return
+	if !isHandledSystemMessage(msg) {
+		return nil, false
 	}
-	newName := parts[1]
 
+	locKey := msg.ContentMetadata["LOC_KEY"]
+	ts := lc.parseMessageTimestamp(msg)
 	portalKey := networkid.PortalKey{ID: makePortalID(msg.To), Receiver: lc.UserLogin.ID}
+	switch locKey {
+	case "C_PN":
+		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+		newName := parts[1]
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("new_name", newName).
+			Str("chat_mid", msg.To).
+			Str("from", msg.From).
+			Msg("Handling group rename")
+		return &simplevent.ChatInfoChange{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatInfoChange,
+				PortalKey: portalKey,
+				Timestamp: ts,
+			},
+			ChatInfoChange: &bridgev2.ChatInfoChange{
+				ChatInfo: &bridgev2.ChatInfo{Name: &newName},
+			},
+		}, true
+	case "C_MJ", "A_MJ":
+		lc.addGroupMembersToCache(msg.To, msg.From)
+		return makeMemberChangeEvent(
+			portalKey,
+			lc.eventSenderForMID(msg.From),
+			bridgev2.EventSender{},
+			event.MembershipJoin,
+			ts,
+			false,
+		), true
+	case "C_ML", "A_ML":
+		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("leaver_mid", msg.From).Msg("System message: member leave")
+		lc.removeGroupMemberFromCache(msg.To, msg.From)
+		leaver := lc.eventSenderForMID(msg.From)
+		return makeMemberChangeEvent(portalKey, leaver, leaver, event.MembershipLeave, ts, false), true
+	case "C_MR", "A_MR":
+		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("removed_mid", msg.From).Msg("System message: member removed")
+		lc.removeGroupMemberFromCache(msg.To, msg.From)
+		return makeMemberChangeEvent(
+			portalKey,
+			lc.eventSenderForMID(msg.From),
+			bridgev2.EventSender{},
+			event.MembershipLeave,
+			ts,
+			false,
+		), true
+	case "C_GI", "C_MI", "A_MI":
+		// msg.From is the inviter, not the invitee. LOC_ARGS has the
+		// format inviterMid\x1einviteeMid.
+		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+		inviteeMID := parts[1]
+		if lc.isOwnMID(inviteeMID) {
+			// Defense-in-depth in case no invite operation arrives. Only do
+			// the network fallback if a portal does not already exist.
+			chatMID := msg.To
+			lc.wg.Add(1)
+			go func() {
+				defer lc.wg.Done()
+				key := networkid.PortalKey{ID: makePortalID(chatMID), Receiver: lc.UserLogin.ID}
+				if portal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(context.Background(), key); err == nil && portal != nil && portal.MXID != "" {
+					return
+				}
+				lc.handleInviteForSelf(context.Background(), chatMID)
+			}()
+			return nil, true
+		}
+		return makeMemberChangeEvent(
+			portalKey,
+			lc.eventSenderForMID(inviteeMID),
+			bridgev2.EventSender{},
+			event.MembershipInvite,
+			ts,
+			false,
+		), true
+	case "C_IC":
+		// Invitation cancelled. LOC_ARGS has the format
+		// cancellerMid\x1einviteeMid.
+		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
+		inviteeMID := parts[1]
+		lc.removeGroupMemberFromCache(msg.To, inviteeMID)
+		return makeMemberChangeEvent(
+			portalKey,
+			lc.eventSenderForMID(inviteeMID),
+			bridgev2.EventSender{},
+			event.MembershipLeave,
+			ts,
+			false,
+		), true
+	case "A_MC":
+		// Auto-join via call / member added. msg.From is the person added.
+		lc.addGroupMembersToCache(msg.To, msg.From)
+		return makeMemberChangeEvent(
+			portalKey,
+			lc.eventSenderForMID(msg.From),
+			bridgev2.EventSender{},
+			event.MembershipJoin,
+			ts,
+			false,
+		), true
+	default:
+		return nil, false
+	}
+}
 
-	ts, _ := msg.CreatedTime.Int64()
-	if ts == 0 {
-		ts = time.Now().UnixMilli()
+func (lc *LineClient) handleSystemMessage(op line.Operation) bool {
+	systemEvent, handled := lc.makeSystemMessageEvent(op)
+	if systemEvent != nil {
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, systemEvent)
+	} else if !handled && op.Message != nil {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("loc_key", op.Message.ContentMetadata["LOC_KEY"]).
+			Str("chat_mid", op.Message.To).
+			Msg("Unhandled system message LOC_KEY")
+	}
+	return handled
+}
+
+// queueHistoricalSystemMessage persists an invisible marker under the LINE
+// message ID. The marker gives startup backfill normal database deduplication,
+// while its converter applies the historical state event synchronously before
+// the marker is inserted.
+func (lc *LineClient) queueHistoricalSystemMessage(msg *line.Message, opType int) bool {
+	if !isHandledSystemMessage(msg) {
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("msg_id", msg.ID).
+			Str("loc_key", msg.ContentMetadata["LOC_KEY"]).
+			Msg("Skipping unsupported historical system message")
+		return false
 	}
 
-	lc.UserLogin.Bridge.Log.Debug().
-		Str("new_name", newName).
-		Str("chat_mid", msg.To).
-		Str("from", msg.From).
-		Msg("Handling group rename")
-
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatInfoChange{
+	op := line.Operation{Type: opType, Message: msg, CreatedTime: msg.CreatedTime}
+	portalKey := networkid.PortalKey{ID: makePortalID(msg.To), Receiver: lc.UserLogin.ID}
+	result := lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Message[line.Operation]{
 		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventChatInfoChange,
+			Type:      bridgev2.RemoteEventMessage,
 			PortalKey: portalKey,
-			Timestamp: time.UnixMilli(ts),
-		},
-		ChatInfoChange: &bridgev2.ChatInfoChange{
-			ChatInfo: &bridgev2.ChatInfo{
-				Name: &newName,
+			Timestamp: lc.parseMessageTimestamp(msg),
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.Str("msg_id", msg.ID).Str("loc_key", msg.ContentMetadata["LOC_KEY"])
 			},
 		},
+		Data: op,
+		ID:   networkid.MessageID(msg.ID),
+		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, _ bridgev2.MatrixAPI, data line.Operation) (*bridgev2.ConvertedMessage, error) {
+			systemEvent, handled := lc.makeSystemMessageEvent(data)
+			if !handled {
+				return nil, bridgev2.ErrIgnoringRemoteEvent
+			}
+			if systemEvent != nil {
+				change, err := systemEvent.GetChatInfoChange(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("get historical system message change: %w", err)
+				}
+				portal.ProcessChatInfoChange(ctx, systemEvent.GetSender(), lc.UserLogin, change, systemEvent.GetTimestamp())
+			}
+			return &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type: event.EventMessage,
+					Content: &event.MessageEventContent{
+						MsgType:  event.MsgNotice,
+						Mentions: &event.Mentions{},
+					},
+					DontBridge: true,
+				}},
+			}, nil
+		},
 	})
+	return result.Success && !result.Ignored
 }

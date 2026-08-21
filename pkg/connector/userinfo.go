@@ -15,6 +15,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
@@ -37,8 +38,10 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 		return nil
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	return client.SendChatChecked(string(read.Portal.ID), targetID)
+	_, err := lc.callLine(ctx, func(client *line.Client) error {
+		return client.SendChatChecked(string(read.Portal.ID), targetID)
+	})
+	return err
 }
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
@@ -46,6 +49,8 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 		MaxTextLength:         5000,
 		Reply:                 event.CapLevelFullySupported,
 		Reaction:              event.CapLevelPartialSupport,
+		ReactionCount:         1,
+		AllowedReactions:      getLineAllowedReactions(),
 		ReadReceipts:          true,
 		Delete:                event.CapLevelFullySupported,
 		DeleteMaxAge:          &jsontime.Seconds{Duration: 24 * time.Hour},
@@ -60,6 +65,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 		File: event.FileFeatureMap{
 			event.MsgImage: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"image/jpeg":    event.CapLevelFullySupported,
 					"image/png":     event.CapLevelFullySupported,
@@ -76,6 +82,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.MsgFile: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"image/gif": event.CapLevelFullySupported,
 					"*/*":       event.CapLevelFullySupported,
@@ -83,6 +90,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.MsgVideo: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"video/mp4":        event.CapLevelFullySupported,
 					"video/webm":       event.CapLevelFullySupported,
@@ -96,6 +104,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.MsgAudio: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"audio/mpeg":  event.CapLevelFullySupported,
 					"audio/ogg":   event.CapLevelFullySupported,
@@ -113,6 +122,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 			event.CapMsgVoice: {
 				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
 				MimeTypes: map[string]event.CapabilitySupportLevel{
 					"audio/ogg":   event.CapLevelFullySupported,
 					"audio/mp4":   event.CapLevelFullySupported,
@@ -140,14 +150,9 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	mid := string(portal.ID)
 	lowerMid := strings.ToLower(mid)
 	if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
-		client := line.NewClient(lc.AccessToken)
-		res, err := client.GetChats([]string{mid}, true, true)
-		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				res, err = client.GetChats([]string{mid}, true, true)
-			}
-		}
+		_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+			return client.GetChats([]string{mid}, true, true)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -207,14 +212,9 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 
 	// Use GetProfile for our own user data
 	if mid == lc.Mid || mid == string(lc.UserLogin.ID) {
-		client := line.NewClient(lc.AccessToken)
-		profile, err := client.GetProfile()
-		if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				profile, err = client.GetProfile()
-			}
-		}
+		_, profile, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Profile, error) {
+			return client.GetProfile()
+		})
 		if err == nil && profile != nil {
 			contact := line.Contact{Mid: mid, DisplayName: profile.DisplayName, PicturePath: profile.PicturePath}
 			lc.setCachedContact(mid, contact)
@@ -223,14 +223,10 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 		return line.Contact{Mid: mid, DisplayName: mid}
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	res, err := client.GetContactsV2([]string{mid})
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			res, err = client.GetContactsV2([]string{mid})
-		}
-	}
+	client := lc.newClient()
+	client, res, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.ContactsResponse, error) {
+		return client.GetContactsV2([]string{mid})
+	})
 	if err == nil && res != nil && res.Contacts != nil {
 		if wrapper, ok := res.Contacts[mid]; ok {
 			lc.setCachedContact(mid, wrapper.Contact)
@@ -240,13 +236,9 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 
 	// Fall back to BuddyService for official/business accounts
 	lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Msg("Contact not found via GetContactsV2, trying BuddyService")
-	buddy, err := client.GetBuddyProfile(mid)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			buddy, err = client.GetBuddyProfile(mid)
-		}
-	}
+	_, buddy, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.BuddyProfile, error) {
+		return client.GetBuddyProfile(mid)
+	})
 	if err == nil && buddy != nil {
 		lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Str("display_name", buddy.DisplayName).Str("picture_path", buddy.PicturePath).Msg("Got buddy profile")
 		contact := line.Contact{Mid: mid, DisplayName: buddy.DisplayName, PicturePath: buddy.PicturePath}
@@ -314,8 +306,9 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	// Try by LINE user ID first
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
 	if lowerQuery != "" {
-		client := line.NewClient(lc.AccessToken)
-		contact, err := client.FindContactByUserid(lowerQuery)
+		_, contact, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByUserid(lowerQuery)
+		})
 		if err == nil && contact != nil && contact.Mid != "" {
 			if r := lc.midToResolveIdentifier(ctx, contact.Mid); r != nil {
 				results = append(results, r)
@@ -327,19 +320,12 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	}
 
 	// Search contacts by display name
-	client := line.NewClient(lc.AccessToken)
-	allMids, err := client.GetAllContactIds()
+	client, allMids, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
+		return client.GetAllContactIds()
+	})
 	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				allMids, err = client.GetAllContactIds()
-			}
-		}
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get all contact IDs for search")
-			return results, nil
-		}
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get all contact IDs for search")
+		return results, nil
 	}
 
 	// Fetch contacts in batches to check display names
@@ -373,18 +359,11 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 var _ bridgev2.UserSearchingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveIdentifierResponse, error) {
-	client := line.NewClient(lc.AccessToken)
-	allMids, err := client.GetAllContactIds()
+	client, allMids, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
+		return client.GetAllContactIds()
+	})
 	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				allMids, err = client.GetAllContactIds()
-			}
-		}
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	var results []*bridgev2.ResolveIdentifierResponse

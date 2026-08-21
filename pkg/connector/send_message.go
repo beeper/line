@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -18,7 +19,9 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
 )
 
 type mentionEntry struct {
@@ -30,8 +33,51 @@ type mentionEntry struct {
 
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
+const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
+
+func lineGroupE2EEReconnectRequiredError(err error) error {
+	if !errors.Is(err, e2ee.ErrMissingOwnPrivateKey) {
+		return nil
+	}
+	return bridgev2.WrapErrorInStatus(fmt.Errorf("%s: %w", lineGroupE2EEReconnectNotice, err)).
+		WithStatus(event.MessageStatusFail).
+		WithIsCertain(true).
+		WithMessage(lineGroupE2EEReconnectNotice).
+		WithSendNotice(true).
+		WithErrorReason(event.MessageStatusGenericError)
+}
+
+func lineGroupE2EEFetchFailureError(err error) error {
+	if err == nil || line.IsNoUsableE2EEGroupKey(err) {
+		return nil
+	}
+	if errStatus := lineGroupE2EEReconnectRequiredError(err); errStatus != nil {
+		return errStatus
+	}
+	return err
+}
+
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	client := line.NewClient(lc.AccessToken)
+	client := lc.newClient()
+	callLineErr := func(call func(*line.Client) error) error {
+		var err error
+		client, err = lc.callLineUsing(ctx, client, call)
+		return err
+	}
+	callLineString := func(call func(*line.Client) (string, error)) (string, error) {
+		var err error
+		var res string
+		client, res, err = callLineResultUsing(lc, ctx, client, call)
+		return res, err
+	}
+	sendLineMessage := func(reqSeq int, lineMsg *line.Message) (*line.Message, error) {
+		var err error
+		var sentMsg *line.Message
+		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
+			return client.SendMessage(int64(reqSeq), lineMsg)
+		})
+		return sentMsg, err
+	}
 	portalMid := string(msg.Portal.ID)
 	fromMid := lc.midOrFallback()
 
@@ -205,7 +251,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				return nil, fmt.Errorf("failed to encrypt image data: %w", err)
 			}
 
-			oid, err := client.UploadOBS(uploadData)
+			oid, err := callLineString(func(client *line.Client) (string, error) {
+				return client.UploadOBS(uploadData)
+			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to upload image to OBS: %w", err)
 			}
@@ -217,7 +265,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to encrypt thumbnail, continuing without it")
 			} else {
 				previewOID := fmt.Sprintf("%s__ud-preview", oid)
-				if err := client.UploadOBSWithOID(thumbToUpload, previewOID); err != nil {
+				if err := callLineErr(func(client *line.Client) error {
+					return client.UploadOBSWithOID(thumbToUpload, previewOID)
+				}); err != nil {
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload preview, continuing without it")
 				} else {
 					mediaThumbInfo := map[string]interface{}{
@@ -303,7 +353,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				return nil, fmt.Errorf("failed to encrypt file data: %w", err)
 			}
 
-			oid, err := client.UploadOBSWithSID(uploadData, "emf")
+			oid, err := callLineString(func(client *line.Client) (string, error) {
+				return client.UploadOBSWithSID(uploadData, "emf")
+			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to upload file to OBS: %w", err)
 			}
@@ -384,7 +436,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				return nil, fmt.Errorf("failed to encrypt video data: %w", err)
 			}
 
-			oid, err := client.UploadOBSWithSID(uploadData, "emv")
+			oid, err := callLineString(func(client *line.Client) (string, error) {
+				return client.UploadOBSWithSID(uploadData, "emv")
+			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to upload video to OBS: %w", err)
 			}
@@ -392,7 +446,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			chunkHashes := generateChunkHashes(uploadData[:len(uploadData)-32])
 			if len(chunkHashes) > 0 {
 				hashOID := fmt.Sprintf("%s__ud-hash", oid)
-				if err := client.UploadOBSWithOIDAndSID(chunkHashes, hashOID, "emv"); err != nil {
+				if err := callLineErr(func(client *line.Client) error {
+					return client.UploadOBSWithOIDAndSID(chunkHashes, hashOID, "emv")
+				}); err != nil {
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload video hash, continuing without it")
 				} else {
 					lc.UserLogin.Bridge.Log.Info().
@@ -418,7 +474,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to encrypt video thumbnail, continuing without it")
 				} else {
 					previewOID := fmt.Sprintf("%s__ud-preview", oid)
-					if err := client.UploadOBSWithOIDAndSID(thumbToUpload, previewOID, "emv"); err != nil {
+					if err := callLineErr(func(client *line.Client) error {
+						return client.UploadOBSWithOIDAndSID(thumbToUpload, previewOID, "emv")
+					}); err != nil {
 						lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload video preview, continuing without it")
 					} else {
 						mediaThumbInfo := map[string]interface{}{
@@ -480,7 +538,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				return nil, fmt.Errorf("failed to encrypt audio data: %w", err)
 			}
 
-			oid, err := client.UploadOBSWithSID(uploadData, "ema")
+			oid, err := callLineString(func(client *line.Client) (string, error) {
+				return client.UploadOBSWithSID(uploadData, "ema")
+			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to upload audio to OBS: %w", err)
 			}
@@ -523,6 +583,12 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if isGroup {
 			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
+				if errors.Is(errFetch, ltsm.ErrAbort) {
+					return nil, errFetch
+				}
+				if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
+					return nil, errFetch
+				}
 			}
 			if contentType != int(ContentText) {
 				chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
@@ -530,12 +596,22 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 			}
 			if err != nil {
+				if errors.Is(err, ltsm.ErrAbort) {
+					return nil, err
+				}
 				if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch == nil {
 					if contentType != int(ContentText) {
 						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 					} else {
 						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 					}
+				} else if errors.Is(errFetch, ltsm.ErrAbort) {
+					return nil, errFetch
+				} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
+					return nil, errFetch
+				}
+				if errors.Is(err, ltsm.ErrAbort) {
+					return nil, err
 				}
 				if err != nil {
 					// E2EE setup failed — fall back to plain text
@@ -622,7 +698,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	reqSeq := int(now % 1_000_000_000)
 	lc.trackReqSeq(reqSeq)
 
-	sentMsg, err := client.SendMessage(int64(reqSeq), lineMsg)
+	sentMsg, err := sendLineMessage(reqSeq, lineMsg)
 
 	// LINE rejects some file types from the Chrome Extension client.
 	// Retry by wrapping the file in a ZIP archive (matching Chrome Extension behavior).
@@ -647,7 +723,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			if encErr != nil {
 				return nil, fmt.Errorf("failed to encrypt zipped file: %w", encErr)
 			}
-			oid, uploadErr := client.UploadOBSWithSID(uploadData, "emf")
+			oid, uploadErr := callLineString(func(client *line.Client) (string, error) {
+				return client.UploadOBSWithSID(uploadData, "emf")
+			})
 			if uploadErr != nil {
 				return nil, fmt.Errorf("failed to upload zipped file to OBS: %w", uploadErr)
 			}
@@ -682,7 +760,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
 		lc.trackReqSeq(retryReqSeq)
 
-		sentMsg, err = client.SendMessage(int64(retryReqSeq), lineMsg)
+		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 	}
 
 	// If LINE rejects with "group key is not registered" (code 99),
@@ -709,12 +787,26 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			if err == nil {
 				retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
 				lc.trackReqSeq(retryReqSeq)
-				sentMsg, err = client.SendMessage(int64(retryReqSeq), lineMsg)
+				sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 			}
 		} else {
 			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", portalMid).
 				Err(regErr).Msg("autoRegisterGroupKey failed, giving up on retry")
 		}
+	}
+
+	if shouldRetrySendWithoutReplyRelation(lineMsg, err) {
+		relatedMessageID := lineMsg.RelatedMessageID
+		clearReplyRelation(lineMsg)
+		lc.UserLogin.Bridge.Log.Warn().
+			Err(err).
+			Str("chat_mid", portalMid).
+			Str("related_message_id", relatedMessageID).
+			Msg("SendMessage failed because LINE could not find reply target, retrying without reply relation")
+
+		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
+		lc.trackReqSeq(retryReqSeq)
+		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 	}
 
 	if err != nil {
@@ -733,7 +825,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			obsType = "file"
 		}
 
-		if err := client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType); err != nil {
+		if err := callLineErr(func(client *line.Client) error {
+			return client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType)
+		}); err != nil {
 			return nil, fmt.Errorf("failed to upload plain media to OBS: %w", err)
 		}
 		lc.UserLogin.Bridge.Log.Info().
@@ -744,7 +838,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 		if plainThumbData != nil {
 			previewID := fmt.Sprintf("%s__ud-preview", sentMsg.ID)
-			if err := client.UploadOBSPlain(plainThumbData, previewID, obsType); err != nil {
+			if err := callLineErr(func(client *line.Client) error {
+				return client.UploadOBSPlain(plainThumbData, previewID, obsType)
+			}); err != nil {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to upload plain media thumbnail, continuing without it")
 			}
 		}
@@ -792,13 +888,28 @@ func contentTypeForMsgType(msgType event.MessageType) int {
 	}
 }
 
-func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error {
-	client := line.NewClient(lc.AccessToken)
+func shouldRetrySendWithoutReplyRelation(msg *line.Message, err error) bool {
+	return msg != nil && msg.RelatedMessageID != "" && line.IsTalkExceptionNotFound(err)
+}
 
+func clearReplyRelation(msg *line.Message) {
+	msg.RelatedMessageID = ""
+	msg.MessageRelationType = 0
+	msg.RelatedMessageServiceCode = 0
+	if msg.ContentMetadata != nil {
+		delete(msg.ContentMetadata, "message_relation_server_message_id")
+		delete(msg.ContentMetadata, "message_relation_type")
+		delete(msg.ContentMetadata, "message_relation_service_code")
+	}
+}
+
+func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error {
 	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
 	lc.trackReqSeq(reqSeq)
 
-	err := client.UnsendMessage(int64(reqSeq), string(msg.TargetMessage.ID))
+	_, err := lc.callLine(ctx, func(client *line.Client) error {
+		return client.UnsendMessage(int64(reqSeq), string(msg.TargetMessage.ID))
+	})
 	if err != nil && strings.Contains(err.Error(), "message too old") {
 		return bridgev2.WrapErrorInStatus(fmt.Errorf("message too old to unsend on LINE (24h limit)")).
 			WithStatus(event.MessageStatusFail).
@@ -810,8 +921,6 @@ func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridge
 }
 
 func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev2.Portal) error {
-	client := line.NewClient(lc.AccessToken)
-
 	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
 
 	// A still-pending invite (the user declined the Request without accepting it) must be
@@ -819,12 +928,18 @@ func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev
 	// clears MessageRequest once the invite is accepted, so an accepted chat falls through to
 	// the normal SendChatRemoved leave path below.
 	if portal.MessageRequest {
-		return client.RejectChatInvitation(int64(reqSeq), string(portal.ID))
+		_, err := lc.callLine(ctx, func(client *line.Client) error {
+			return client.RejectChatInvitation(int64(reqSeq), string(portal.ID))
+		})
+		return err
 	}
 
 	lc.trackReqSeq(reqSeq)
 
-	return client.SendChatRemoved(int64(reqSeq), string(portal.ID), "0", 0)
+	_, err := lc.callLine(ctx, func(client *line.Client) error {
+		return client.SendChatRemoved(int64(reqSeq), string(portal.ID), "0", 0)
+	})
+	return err
 }
 
 // Compile-time assertion that LineClient handles Beeper message-request acceptance.
@@ -833,9 +948,11 @@ var _ bridgev2.MessageRequestAcceptingNetworkAPI = (*LineClient)(nil)
 // HandleMatrixAcceptMessageRequest is called when the user accepts a Request in Beeper (a
 // pending LINE group invitation). It accepts the invitation on the LINE side, joining the chat.
 func (lc *LineClient) HandleMatrixAcceptMessageRequest(ctx context.Context, msg *bridgev2.MatrixAcceptMessageRequest) error {
-	client := line.NewClient(lc.AccessToken)
 	reqSeq := int64(time.Now().UnixMilli() % 1_000_000_000)
-	return client.AcceptChatInvitation(reqSeq, string(msg.Portal.ID))
+	_, err := lc.callLine(ctx, func(client *line.Client) error {
+		return client.AcceptChatInvitation(reqSeq, string(msg.Portal.ID))
+	})
+	return err
 }
 
 func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedBody string, mentions *event.Mentions) map[string]string {
@@ -858,11 +975,15 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 			}
 		}
 		if pos >= 0 {
-			mentionees = append(mentionees, mentionEntry{
-				S: strconv.Itoa(pos),
-				E: strconv.Itoa(pos + matchLen),
-				A: "1",
-			})
+			start, startOK := byteIndexToUTF16Offset(body, pos)
+			end, endOK := byteIndexToUTF16Offset(body, pos+matchLen)
+			if startOK && endOK {
+				mentionees = append(mentionees, mentionEntry{
+					S: strconv.Itoa(start),
+					E: strconv.Itoa(end),
+					A: "1",
+				})
+			}
 		}
 	}
 
@@ -897,11 +1018,15 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 		searchStr := "@" + displayName
 		pos := strings.Index(body, searchStr)
 		if pos >= 0 {
-			mentionees = append(mentionees, mentionEntry{
-				S: strconv.Itoa(pos),
-				E: strconv.Itoa(pos + len(searchStr)),
-				M: string(mid),
-			})
+			start, startOK := byteIndexToUTF16Offset(body, pos)
+			end, endOK := byteIndexToUTF16Offset(body, pos+len(searchStr))
+			if startOK && endOK {
+				mentionees = append(mentionees, mentionEntry{
+					S: strconv.Itoa(start),
+					E: strconv.Itoa(end),
+					M: string(mid),
+				})
+			}
 		}
 	}
 

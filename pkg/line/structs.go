@@ -5,9 +5,16 @@ import "encoding/json"
 type FlexibleMidMap map[string]bool
 
 func (f *FlexibleMidMap) UnmarshalJSON(data []byte) error {
-	var m map[string]bool
+	var m map[string]json.RawMessage
 	if err := json.Unmarshal(data, &m); err == nil {
-		*f = m
+		if m == nil {
+			*f = nil
+			return nil
+		}
+		*f = make(map[string]bool, len(m))
+		for mid := range m {
+			(*f)[mid] = true
+		}
 		return nil
 	}
 
@@ -54,6 +61,17 @@ type Profile struct {
 	CreatedTimeMillis            string            `json:"createdTimeMillis"`
 }
 
+// SettingsAttributeNotificationDisabledWithSub selects the account setting
+// that controls whether another LINE client suppresses mobile notifications.
+const SettingsAttributeNotificationDisabledWithSub = 16
+
+// Settings contains the account-level values accepted by
+// TalkService/updateSettingsAttributes2. Pointer fields distinguish explicit
+// zero values from settings that should be omitted from the update.
+type Settings struct {
+	NotificationDisabledWithSub *bool `json:"notificationDisabledWithSub,omitempty"`
+}
+
 type Operation struct {
 	Revision    json.Number `json:"revision"`
 	Type        int         `json:"type"` // 25=Send, 26=Receive
@@ -91,6 +109,8 @@ type Message struct {
 	RelatedMessageID          string `json:"relatedMessageId,omitempty"`
 	MessageRelationType       int    `json:"messageRelationType,omitempty"`
 	RelatedMessageServiceCode int    `json:"relatedMessageServiceCode,omitempty"`
+
+	Reactions []MessageReaction `json:"reactions,omitempty"`
 }
 
 // E2EEPublicKey represents the peer key returned by negotiateE2EEPublicKey
@@ -273,11 +293,12 @@ type AcquireEncryptedAccessTokenResponse struct {
 }
 
 type MessageBoxesOptions struct {
-	ActiveOnly                     bool `json:"activeOnly"`
-	UnreadOnly                     bool `json:"unreadOnly"`
-	MessageBoxCountLimit           int  `json:"messageBoxCountLimit"`
-	WithUnreadCount                bool `json:"withUnreadCount"`
-	LastMessagesPerMessageBoxCount int  `json:"lastMessagesPerMessageBoxCount"`
+	MinChatID                      string `json:"minChatId,omitempty"`
+	ActiveOnly                     bool   `json:"activeOnly"`
+	UnreadOnly                     bool   `json:"unreadOnly"`
+	MessageBoxCountLimit           int    `json:"messageBoxCountLimit"`
+	WithUnreadCount                bool   `json:"withUnreadCount"`
+	LastMessagesPerMessageBoxCount int    `json:"lastMessagesPerMessageBoxCount"`
 }
 
 type MessageBoxesResponse struct {

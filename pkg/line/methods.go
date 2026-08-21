@@ -1,6 +1,7 @@
 package line
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,8 @@ var (
 )
 
 const obsTokenBuffer = 30 * time.Second
+
+const defaultChannelTokenLifetime = 5 * time.Minute
 
 // InvalidateOBSTokenCache clears the cached OBS access token. The OBS token is
 // derived from the main LINE access token; when the latter is rotated (refresh
@@ -100,7 +103,11 @@ func (c *Client) LoginV2WithVerifier(verifier string) (*LoginResult, error) {
 
 // GetProfile fetches the user's profile information
 func (c *Client) GetProfile() (*Profile, error) {
-	resp, err := c.callRPC("TalkService", "getProfile", 2)
+	return c.GetProfileContext(context.Background())
+}
+
+func (c *Client) GetProfileContext(ctx context.Context) (*Profile, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "getProfile", 2)
 	if err != nil {
 		return nil, err
 	}
@@ -389,6 +396,29 @@ func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
 	return wrapper.Data, nil
 }
 
+// UpdateSettingsAttributes2Context updates the selected account settings. The
+// request shape matches LINE Chrome: [reqSeq, attribute IDs, settings].
+func (c *Client) UpdateSettingsAttributes2Context(ctx context.Context, reqSeq int64, attributes []int, settings Settings) error {
+	resp, err := c.callRPCContext(ctx, "TalkService", "updateSettingsAttributes2", reqSeq, attributes, settings)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse updateSettingsAttributes2 response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		// Preserve the response data because TalkException details contain the
+		// error code used by connector-level auth recovery.
+		return fmt.Errorf("updateSettingsAttributes2 failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
+	}
+	return nil
+}
+
 func (c *Client) React(reqSeq int64, messageID string, reactionType ReactionType) error {
 	req := ReactRequest{
 		ReqSeq:       int(reqSeq),
@@ -611,7 +641,11 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 }
 
 func (c *Client) GetLastOpRevision() (int64, error) {
-	resp, err := c.callRPC("TalkService", "getLastOpRevision")
+	return c.GetLastOpRevisionContext(context.Background())
+}
+
+func (c *Client) GetLastOpRevisionContext(ctx context.Context) (int64, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "getLastOpRevision")
 	if err != nil {
 		return 0, err
 	}
@@ -680,6 +714,94 @@ func (c *Client) AcquireEncryptedAccessToken() (string, error) {
 	}
 
 	return token, nil
+}
+
+// AcquireChannelAccessToken returns a cached token for an official LINE
+// channel, issuing one through ChannelService when necessary.
+func (c *Client) AcquireChannelAccessToken(channelID string) (string, error) {
+	if channelID == "" {
+		return "", fmt.Errorf("channel ID is required")
+	}
+
+	c.channelTokenMu.Lock()
+	defer c.channelTokenMu.Unlock()
+
+	now := time.Now()
+	if cached, ok := c.channelTokenCache[channelID]; ok &&
+		cached.token != "" &&
+		now.Before(cached.expiresAt) {
+		return cached.token, nil
+	}
+
+	resp, err := c.callRPC("ChannelService", "issueChannelToken", channelID)
+	if err != nil {
+		return "", err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			ChannelAccessToken string          `json:"channelAccessToken"`
+			Expiration         json.RawMessage `json:"expiration"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(resp, &wrapper); err != nil {
+		return "", fmt.Errorf("failed to decode issueChannelToken response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return "", fmt.Errorf("issueChannelToken API error: %s", wrapper.Message)
+	}
+	if wrapper.Data.ChannelAccessToken == "" {
+		return "", fmt.Errorf("issueChannelToken returned an empty token")
+	}
+
+	expiresAt := parseChannelTokenExpiration(wrapper.Data.Expiration, now)
+	if c.channelTokenCache == nil {
+		c.channelTokenCache = make(map[string]cachedChannelAccessToken)
+	}
+	c.channelTokenCache[channelID] = cachedChannelAccessToken{
+		token:     wrapper.Data.ChannelAccessToken,
+		expiresAt: expiresAt,
+	}
+	return wrapper.Data.ChannelAccessToken, nil
+}
+
+func parseChannelTokenExpiration(raw json.RawMessage, now time.Time) time.Time {
+	fallback := now.Add(defaultChannelTokenLifetime)
+	if len(raw) == 0 || string(raw) == "null" {
+		return fallback
+	}
+
+	var numericValue int64
+	if err := json.Unmarshal(raw, &numericValue); err != nil {
+		var stringValue string
+		if err = json.Unmarshal(raw, &stringValue); err != nil {
+			return fallback
+		}
+		if parsedTime, parseErr := time.Parse(time.RFC3339, stringValue); parseErr == nil {
+			return parsedTime.Add(-obsTokenBuffer)
+		}
+		numericValue, err = strconv.ParseInt(stringValue, 10, 64)
+		if err != nil {
+			return fallback
+		}
+	}
+
+	var expiresAt time.Time
+	switch {
+	case numericValue > 100_000_000_000:
+		expiresAt = time.UnixMilli(numericValue)
+	case numericValue > 1_000_000_000:
+		expiresAt = time.Unix(numericValue, 0)
+	case numericValue > 0:
+		expiresAt = now.Add(time.Duration(numericValue) * time.Second)
+	default:
+		return fallback
+	}
+	if expiresAt.Before(now.Add(obsTokenBuffer)) {
+		return fallback
+	}
+	return expiresAt.Add(-obsTokenBuffer)
 }
 
 func (c *Client) GetMessageBoxes(options MessageBoxesOptions) (*MessageBoxesResponse, error) {

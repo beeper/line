@@ -61,9 +61,34 @@ type PaidReactionType struct {
 	Version      int    `json:"version,omitempty"`
 }
 
+func (p *PaidReactionType) UnmarshalJSON(data []byte) error {
+	var parsed struct {
+		ProductID    string  `json:"productId"`
+		EmojiID      string  `json:"emojiId"`
+		ResourceType int     `json:"resourceType,omitempty"`
+		Version      FlexInt `json:"version,omitempty"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	p.ProductID = parsed.ProductID
+	p.EmojiID = parsed.EmojiID
+	p.ResourceType = parsed.ResourceType
+	p.Version = parsed.Version.Val
+	return nil
+}
+
 type ReactionType struct {
 	PredefinedReactionType int               `json:"predefinedReactionType,omitempty"`
 	PaidReactionType       *PaidReactionType `json:"paidReactionType,omitempty"`
+}
+
+// MessageReaction is a reaction embedded in a message returned by
+// getRecentMessagesV2.
+type MessageReaction struct {
+	FromUserMID  string       `json:"fromUserMid"`
+	AtMillis     json.Number  `json:"atMillis"`
+	ReactionType ReactionType `json:"reactionType"`
 }
 
 type ReactRequest struct {

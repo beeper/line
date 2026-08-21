@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"go.mau.fi/util/variationselector"
+
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
@@ -31,8 +36,13 @@ type linePaidReactionRef struct {
 	Version      int
 }
 
-func (ref linePaidReactionRef) networkEmojiID() networkid.EmojiID {
-	return networkid.EmojiID("paid:" + ref.ProductID + ":" + ref.EmojiID)
+type lineReactionRef struct {
+	typ line.ReactionType
+}
+
+type ReactionMetadata struct {
+	MatrixKey    string            `json:"matrix_key,omitempty"`
+	ReactionType line.ReactionType `json:"reaction_type"`
 }
 
 func (ref linePaidReactionRef) reactionType() line.ReactionType {
@@ -43,6 +53,61 @@ func (ref linePaidReactionRef) reactionType() line.ReactionType {
 			ResourceType: ref.ResourceType,
 			Version:      ref.Version,
 		},
+	}
+}
+
+func cloneLineReactionType(typ line.ReactionType) line.ReactionType {
+	cloned := line.ReactionType{
+		PredefinedReactionType: typ.PredefinedReactionType,
+	}
+	if typ.PaidReactionType != nil {
+		paid := *typ.PaidReactionType
+		cloned.PaidReactionType = &paid
+	}
+	return cloned
+}
+
+func newLineReactionRef(typ line.ReactionType) (lineReactionRef, error) {
+	hasPredefined := typ.PredefinedReactionType != 0
+	hasPaid := typ.PaidReactionType != nil
+	if hasPredefined == hasPaid {
+		return lineReactionRef{}, errors.New("reaction type must contain exactly one predefined or paid reaction")
+	}
+	if hasPredefined {
+		if _, ok := line.PredefinedReactionEmoji[typ.PredefinedReactionType]; !ok {
+			return lineReactionRef{}, fmt.Errorf("unknown predefined reaction type %d", typ.PredefinedReactionType)
+		}
+	} else if typ.PaidReactionType.ProductID == "" || typ.PaidReactionType.EmojiID == "" {
+		return lineReactionRef{}, errors.New("paid reaction is missing product or emoji ID")
+	}
+	return lineReactionRef{typ: cloneLineReactionType(typ)}, nil
+}
+
+func (ref lineReactionRef) reactionType() line.ReactionType {
+	return cloneLineReactionType(ref.typ)
+}
+
+func (ref lineReactionRef) networkEmojiID() networkid.EmojiID {
+	if ref.typ.PaidReactionType != nil {
+		return networkid.EmojiID("paid:" + ref.typ.PaidReactionType.ProductID + ":" + ref.typ.PaidReactionType.EmojiID)
+	}
+	return networkid.EmojiID("predefined:" + strconv.Itoa(ref.typ.PredefinedReactionType))
+}
+
+func (ref lineReactionRef) equal(other lineReactionRef) bool {
+	if ref.typ.PredefinedReactionType != other.typ.PredefinedReactionType {
+		return false
+	}
+	if ref.typ.PaidReactionType == nil || other.typ.PaidReactionType == nil {
+		return ref.typ.PaidReactionType == nil && other.typ.PaidReactionType == nil
+	}
+	return *ref.typ.PaidReactionType == *other.typ.PaidReactionType
+}
+
+func (ref lineReactionRef) metadata(matrixKey string) *ReactionMetadata {
+	return &ReactionMetadata{
+		MatrixKey:    matrixKey,
+		ReactionType: ref.reactionType(),
 	}
 }
 
@@ -174,8 +239,242 @@ var lineEmojiReactionURLs = map[string]string{
 	"9":          lineSticonURL(lineOriginalEmojiProductID, "211"),
 }
 
+// lineAllowedReactions is the Matrix-facing form of the outbound LINE reaction
+// map. Room capability hashes depend on slice order, so keep this list sorted.
+var lineAllowedReactions = func() []string {
+	reactions := make([]string, 0, len(lineEmojiReactionURLs))
+	for reaction := range lineEmojiReactionURLs {
+		// The send lookup normalizes keycaps to bare digits. Restore their emoji
+		// form before advertising them to clients.
+		if len(reaction) == 1 && reaction[0] >= '0' && reaction[0] <= '9' {
+			reaction += "\u20E3"
+		}
+		reactions = append(reactions, variationselector.Add(reaction))
+	}
+	slices.Sort(reactions)
+	return reactions
+}()
+
+func getLineAllowedReactions() []string {
+	return slices.Clone(lineAllowedReactions)
+}
+
 func lineSticonURL(productID, emojiID string) string {
 	return fmt.Sprintf("https://stickershop.line-scdn.net/sticonshop/v1/sticon/%s/android/%s.png", productID, emojiID)
+}
+
+func reactionUploadMXC(uploadedMXC string, uploadedFile *event.EncryptedFileInfo) (string, error) {
+	if uploadedFile != nil {
+		return "", errors.New("reaction icon upload returned encrypted media")
+	}
+	if uploadedMXC == "" {
+		return "", errors.New("reaction icon upload returned an empty MXC URI")
+	}
+	return uploadedMXC, nil
+}
+
+func (lc *LineClient) getPredefinedReactionMXC(ctx context.Context, prt int) (string, error) {
+	if _, ok := line.PredefinedReactionEmoji[prt]; !ok {
+		return "", fmt.Errorf("unknown predefined reaction type %d", prt)
+	}
+
+	lc.cacheMu.Lock()
+	mxc := lc.reactionIconMXC[prt]
+	lc.cacheMu.Unlock()
+	if mxc != "" {
+		return mxc, nil
+	}
+
+	pngData, err := getReactionIconData(prt)
+	if err != nil {
+		return "", fmt.Errorf("get reaction icon data: %w", err)
+	}
+	uploadedMXC, uploadedFile, err := lc.UserLogin.Bridge.Bot.UploadMedia(ctx, "", pngData, "reaction.png", "image/png")
+	if err != nil {
+		return "", fmt.Errorf("upload reaction icon: %w", err)
+	}
+	mxc, err = reactionUploadMXC(string(uploadedMXC), uploadedFile)
+	if err != nil {
+		return "", err
+	}
+
+	lc.cacheMu.Lock()
+	if lc.reactionIconMXC == nil {
+		lc.reactionIconMXC = make(map[int]string)
+	}
+	if cached := lc.reactionIconMXC[prt]; cached != "" {
+		mxc = cached
+	} else {
+		lc.reactionIconMXC[prt] = mxc
+	}
+	lc.cacheMu.Unlock()
+	return mxc, nil
+}
+
+func (lc *LineClient) getPaidReactionMXC(ctx context.Context, prt *line.PaidReactionType) (string, error) {
+	if prt == nil || prt.ProductID == "" || prt.EmojiID == "" {
+		return "", errors.New("paid reaction is missing product or emoji ID")
+	}
+	iconURL := lineSticonURL(prt.ProductID, prt.EmojiID)
+
+	lc.cacheMu.Lock()
+	mxc := lc.paidReactionIconMXC[iconURL]
+	lc.cacheMu.Unlock()
+	if mxc != "" {
+		return mxc, nil
+	}
+
+	resp, err := lc.HTTPClient.Get(iconURL)
+	if err != nil {
+		return "", fmt.Errorf("download paid reaction icon: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("download paid reaction icon: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read paid reaction icon: %w", err)
+	}
+	mimeType := resp.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+	uploadedMXC, uploadedFile, err := lc.UserLogin.Bridge.Bot.UploadMedia(ctx, "", data, "reaction.png", mimeType)
+	if err != nil {
+		return "", fmt.Errorf("upload paid reaction icon: %w", err)
+	}
+	mxc, err = reactionUploadMXC(string(uploadedMXC), uploadedFile)
+	if err != nil {
+		return "", fmt.Errorf("paid %w", err)
+	}
+
+	lc.cacheMu.Lock()
+	if lc.paidReactionIconMXC == nil {
+		lc.paidReactionIconMXC = make(map[string]string)
+	}
+	if cached := lc.paidReactionIconMXC[iconURL]; cached != "" {
+		mxc = cached
+	} else {
+		lc.paidReactionIconMXC[iconURL] = mxc
+	}
+	lc.cacheMu.Unlock()
+	return mxc, nil
+}
+
+func (lc *LineClient) convertReaction(
+	ctx context.Context,
+	typ line.ReactionType,
+	sender bridgev2.EventSender,
+	timestamp time.Time,
+) (*bridgev2.BackfillReaction, error) {
+	ref, err := newLineReactionRef(typ)
+	if err != nil {
+		return nil, err
+	}
+
+	var mxc string
+	if ref.typ.PaidReactionType != nil {
+		mxc, err = lc.getPaidReactionMXC(ctx, ref.typ.PaidReactionType)
+	} else {
+		mxc, err = lc.getPredefinedReactionMXC(ctx, ref.typ.PredefinedReactionType)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &bridgev2.BackfillReaction{
+		Timestamp:  timestamp,
+		Sender:     sender,
+		EmojiID:    ref.networkEmojiID(),
+		Emoji:      mxc,
+		DBMetadata: ref.metadata(mxc),
+	}, nil
+}
+
+func (lc *LineClient) convertMessageReactions(ctx context.Context, msg *line.Message) ([]*bridgev2.BackfillReaction, bool) {
+	if msg == nil || msg.Reactions == nil {
+		return nil, false
+	}
+
+	converted := make([]*bridgev2.BackfillReaction, 0, len(msg.Reactions))
+	complete := true
+	for _, reaction := range msg.Reactions {
+		if !isUserMID(reaction.FromUserMID) {
+			complete = false
+			lc.UserLogin.Bridge.Log.Warn().
+				Str("msg_id", msg.ID).
+				Str("reaction_sender", reaction.FromUserMID).
+				Msg("Skipping historical reaction without a valid sender MID")
+			continue
+		}
+
+		var timestamp time.Time
+		if timestampMillis, err := reaction.AtMillis.Int64(); err == nil && timestampMillis > 0 {
+			timestamp = time.UnixMilli(timestampMillis)
+		}
+		convertedReaction, err := lc.convertReaction(
+			ctx,
+			reaction.ReactionType,
+			lc.eventSenderForMID(reaction.FromUserMID),
+			timestamp,
+		)
+		if err != nil {
+			complete = false
+			lc.UserLogin.Bridge.Log.Warn().
+				Err(err).
+				Str("msg_id", msg.ID).
+				Str("reaction_sender", reaction.FromUserMID).
+				Msg("Skipping unsupported historical reaction")
+			continue
+		}
+		converted = append(converted, convertedReaction)
+	}
+	return converted, complete
+}
+
+func (lc *LineClient) queueMessageReactionSync(ctx context.Context, chatMID string, msg *line.Message) bool {
+	if msg == nil || ContentType(msg.ContentType) == ContentSystem || msg.Reactions == nil {
+		return false
+	}
+
+	converted, complete := lc.convertMessageReactions(ctx, msg)
+	if !complete {
+		// The embedded list is authoritative, but an upload/parse failure
+		// means our converted view is incomplete. Do not accidentally redact
+		// reactions that LINE still reports.
+		return false
+	}
+	users := make(map[networkid.UserID]*bridgev2.ReactionSyncUser, len(converted))
+	var timestamp time.Time
+	for _, reaction := range converted {
+		if reaction.Timestamp.After(timestamp) {
+			timestamp = reaction.Timestamp
+		}
+		// LINE allows one reaction per user per message. Keeping the last
+		// record also makes malformed duplicate entries deterministic.
+		users[reaction.Sender.Sender] = &bridgev2.ReactionSyncUser{
+			Reactions:       []*bridgev2.BackfillReaction{reaction},
+			HasAllReactions: true,
+		}
+	}
+	if timestamp.IsZero() {
+		timestamp = lc.parseMessageTimestamp(msg)
+	}
+
+	result := lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ReactionSync{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventReactionSync,
+			PortalKey: networkid.PortalKey{ID: makePortalID(chatMID), Receiver: lc.UserLogin.ID},
+			Timestamp: timestamp,
+		},
+		TargetMessage: networkid.MessageID(msg.ID),
+		Reactions: &bridgev2.ReactionSyncData{
+			Users:       users,
+			HasAllUsers: true,
+		},
+	})
+	return result.Success && !result.Ignored
 }
 
 func parseLineSticonURL(rawURL string) (linePaidReactionRef, error) {
@@ -240,6 +539,61 @@ func linePaidReactionForMatrixEmoji(key string) (linePaidReactionRef, bool) {
 	return ref, true
 }
 
+func storedLineReactionForMatrixKey(key string, reactions []*database.Reaction) (lineReactionRef, bool) {
+	var (
+		found    lineReactionRef
+		hasFound bool
+	)
+	for _, reaction := range reactions {
+		meta, ok := reaction.Metadata.(*ReactionMetadata)
+		if !ok || meta == nil || meta.MatrixKey != key {
+			continue
+		}
+		ref, err := newLineReactionRef(meta.ReactionType)
+		if err != nil || (reaction.EmojiID != "" && reaction.EmojiID != ref.networkEmojiID()) {
+			continue
+		}
+		if hasFound && !found.equal(ref) {
+			return lineReactionRef{}, false
+		}
+		found = ref
+		hasFound = true
+	}
+	return found, hasFound
+}
+
+func (lc *LineClient) resolveMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (lineReactionRef, error) {
+	key := msg.Content.RelatesTo.GetAnnotationKey()
+	if paidRef, ok := linePaidReactionForMatrixEmoji(key); ok {
+		ref, err := newLineReactionRef(paidRef.reactionType())
+		if err != nil {
+			return lineReactionRef{}, err
+		}
+		return ref, nil
+	}
+	if !strings.HasPrefix(key, "mxc://") {
+		return lineReactionRef{}, unsupportedMatrixReactionError(key)
+	}
+	if msg.TargetMessage == nil || msg.Portal == nil || msg.Portal.Bridge == nil || msg.Portal.Bridge.DB == nil {
+		return lineReactionRef{}, errors.New("reaction target database context is missing")
+	}
+
+	reactions, err := msg.Portal.Bridge.DB.Reaction.GetAllToMessagePart(
+		ctx,
+		msg.Portal.Receiver,
+		msg.TargetMessage.ID,
+		msg.TargetMessage.PartID,
+	)
+	if err != nil {
+		return lineReactionRef{}, fmt.Errorf("get target message reactions: %w", err)
+	}
+	ref, ok := storedLineReactionForMatrixKey(key, reactions)
+	if !ok {
+		return lineReactionRef{}, unsupportedMatrixReactionError(key)
+	}
+	return ref, nil
+}
+
 func unsupportedMatrixReactionError(key string) error {
 	return bridgev2.WrapErrorInStatus(fmt.Errorf("LINE does not support Matrix reaction %q", key)).
 		WithStatus(event.MessageStatusFail).
@@ -276,6 +630,14 @@ func parseReactionTargetMessageID(messageID networkid.MessageID) (string, error)
 }
 
 func (lc *LineClient) nextReqSeq() int {
+	return lc.nextReqSeqWithTracking(true)
+}
+
+func (lc *LineClient) nextUntrackedReqSeq() int {
+	return lc.nextReqSeqWithTracking(false)
+}
+
+func (lc *LineClient) nextReqSeqWithTracking(track bool) int {
 	now := time.Now()
 
 	lc.reqSeqMu.Lock()
@@ -295,7 +657,9 @@ func (lc *LineClient) nextReqSeq() int {
 			lc.lastReqSeq = 1
 		}
 		if _, exists := lc.sentReqSeqs[lc.lastReqSeq]; !exists {
-			lc.sentReqSeqs[lc.lastReqSeq] = now
+			if track {
+				lc.sentReqSeqs[lc.lastReqSeq] = now
+			}
 			return lc.lastReqSeq
 		}
 	}
@@ -345,9 +709,9 @@ func (lc *LineClient) consumeSentReqSeq(reqSeq int) bool {
 
 func (lc *LineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
 	key := msg.Content.RelatesTo.GetAnnotationKey()
-	ref, ok := linePaidReactionForMatrixEmoji(key)
-	if !ok {
-		return bridgev2.MatrixReactionPreResponse{}, unsupportedMatrixReactionError(key)
+	ref, err := lc.resolveMatrixReaction(ctx, msg)
+	if err != nil {
+		return bridgev2.MatrixReactionPreResponse{}, err
 	}
 	return bridgev2.MatrixReactionPreResponse{
 		SenderID:     makeUserID(string(lc.UserLogin.ID)),
@@ -359,18 +723,20 @@ func (lc *LineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2
 
 func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
 	key := msg.Content.RelatesTo.GetAnnotationKey()
-	ref, ok := linePaidReactionForMatrixEmoji(key)
-	if !ok {
-		return nil, unsupportedMatrixReactionError(key)
+	ref, err := lc.resolveMatrixReaction(ctx, msg)
+	if err != nil {
+		return nil, err
 	}
 	targetID, err := parseReactionTargetMessageID(msg.TargetMessage.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	client := line.NewClient(lc.AccessToken)
 	reqSeq := lc.nextReqSeq()
-	if err = client.React(int64(reqSeq), targetID, ref.reactionType()); err != nil {
+	_, err = lc.callLine(ctx, func(client *line.Client) error {
+		return client.React(int64(reqSeq), targetID, ref.reactionType())
+	})
+	if err != nil {
 		if line.IsInvalidPaidReactionType(err) {
 			return nil, unsupportedMatrixReactionError(key)
 		}
@@ -381,8 +747,9 @@ func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Ma
 	}
 
 	return &database.Reaction{
-		EmojiID: ref.networkEmojiID(),
-		Emoji:   key,
+		EmojiID:  ref.networkEmojiID(),
+		Emoji:    key,
+		Metadata: ref.metadata(key),
 	}, nil
 }
 
@@ -394,9 +761,10 @@ func (lc *LineClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridg
 	if err != nil {
 		return err
 	}
-	client := line.NewClient(lc.AccessToken)
 	reqSeq := lc.nextReqSeq()
-	err = client.CancelReaction(int64(reqSeq), targetID)
+	_, err = lc.callLine(ctx, func(client *line.Client) error {
+		return client.CancelReaction(int64(reqSeq), targetID)
+	})
 	if line.IsNotAMemberError(err) {
 		return reactionNotAMemberError()
 	}

@@ -13,7 +13,13 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
-var _ bridgev2.GroupCreatingNetworkAPI = (*LineClient)(nil)
+var (
+	_ bridgev2.GroupCreatingNetworkAPI = (*LineClient)(nil)
+
+	getLastE2EEPublicKeysWithClient = func(client *line.Client, req line.GetLastE2EEPublicKeysRequest) (map[string]line.E2EEPeerPublicKey, error) {
+		return client.GetLastE2EEPublicKeys(req)
+	}
+)
 
 func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCreateParams) (*bridgev2.CreateChatResponse, error) {
 	participantMids := make([]string, len(params.Participants))
@@ -26,18 +32,11 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 		name = params.Name.Name
 	}
 
-	client := line.NewClient(lc.AccessToken)
-	var chat *line.Chat
-	var err error
 	chatType := 1 // ROOM: members join automatically.
 	lineName := name
-	chat, err = client.CreateChat(participantMids, lineName, chatType)
-	if err != nil && (lc.isRefreshRequired(err) || lc.isLoggedOut(err)) {
-		if errRecover := lc.recoverToken(ctx); errRecover == nil {
-			client = line.NewClient(lc.AccessToken)
-			chat, err = client.CreateChat(participantMids, lineName, chatType)
-		}
-	}
+	_, chat, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Chat, error) {
+		return client.CreateChat(participantMids, lineName, chatType)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LINE chat: %w", err)
 	}
@@ -64,9 +63,8 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	lc.generatedGroupNameCache[chat.ChatMid] = name == ""
 	lc.cacheMu.Unlock()
 
-	// Register E2EE group key so members can decrypt group messages.
-	// This is best-effort: if E2EE isn't available for a member we skip them,
-	// and if the entire registration fails we log a warning without aborting.
+	// Registration is best-effort: an incomplete E2EE member list leaves the
+	// chat on its plaintext fallback without aborting group creation.
 	if lc.E2EE != nil && len(participantMids) > 0 {
 		if err := lc.registerGroupKey(ctx, chat.ChatMid, participantMids); err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).
@@ -133,72 +131,95 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	}, nil
 }
 
-// registerGroupKey generates a random 32-byte group key, wraps it for each member
-// using ECDH + AES-256-CBC, and registers it with the LINE server so all members
-// can decrypt group messages. The bridge user's own MID is excluded since the
-// creator already has the group key.
-func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, members []string) error {
-	// Exclude the bridge user's own MID — the creator already has the group key.
+func (lc *LineClient) groupKeyMemberMIDs(chatMid string, members []string) []string {
 	otherMembers := make([]string, 0, len(members))
+	seen := make(map[string]struct{}, len(members))
 	for _, mid := range members {
-		if mid != lc.Mid {
-			otherMembers = append(otherMembers, mid)
+		if !isUserMID(mid) || lc.isOwnMID(mid) || mid == chatMid {
+			continue
 		}
-	}
-	if len(otherMembers) == 0 {
-		return fmt.Errorf("no other members to register group key for")
-	}
-	members = otherMembers
-
-	client := line.NewClient(lc.AccessToken)
-
-	// Fetch current E2EE public keys for all other members as a batch. If the batch
-	// call fails (e.g. server 500 for a specific member), fall back to fetching
-	// each member's key individually via NegotiateE2EEPublicKey.
-	pubKeysReq := line.GetLastE2EEPublicKeysRequest{
-		ChatMid: chatMid,
-		Members: members,
-	}
-	pubKeys, err := client.GetLastE2EEPublicKeys(pubKeysReq)
-	if err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				pubKeys, err = client.GetLastE2EEPublicKeys(pubKeysReq)
-			}
+		if _, ok := seen[mid]; ok {
+			continue
 		}
+		seen[mid] = struct{}{}
+		otherMembers = append(otherMembers, mid)
 	}
-	if err != nil {
-		// Batch call failed — try individual key negotiation per member
-		lc.UserLogin.Bridge.Log.Warn().Err(err).
+	return otherMembers
+}
+
+func (lc *LineClient) resolveGroupMemberPublicKeys(ctx context.Context, client *line.Client, chatMid string, members []string) (*line.Client, map[string]line.E2EEPeerPublicKey, error) {
+	req := line.GetLastE2EEPublicKeysRequest{ChatMid: chatMid, Members: members}
+	client, pubKeys, batchErr := callLineResultUsing(lc, ctx, client, func(client *line.Client) (map[string]line.E2EEPeerPublicKey, error) {
+		return getLastE2EEPublicKeysWithClient(client, req)
+	})
+	if batchErr != nil {
+		if ctx.Err() != nil || lc.isSessionInvalidated() || line.IsAuthError(batchErr) {
+			return client, nil, batchErr
+		}
+		lc.UserLogin.Bridge.Log.Warn().Err(batchErr).
 			Str("chat_mid", chatMid).
 			Int("members", len(members)).
-			Msg("Batch GetLastE2EEPublicKeys failed, falling back to per-member NegotiateE2EEPublicKey")
-		pubKeys = make(map[string]line.E2EEPeerPublicKey)
-		for _, mid := range members {
-			res, nErr := client.NegotiateE2EEPublicKey(mid)
-			if nErr != nil {
-				if line.IsNoUsableE2EEPublicKey(nErr) {
-					lc.UserLogin.Bridge.Log.Debug().Str("member", mid).Msg("Member has Letter Sealing disabled, skipping")
-					continue
-				}
-				if lc.isRefreshRequired(nErr) || lc.isLoggedOut(nErr) {
-					if errRecover := lc.recoverToken(ctx); errRecover == nil {
-						client = line.NewClient(lc.AccessToken)
-						res, nErr = client.NegotiateE2EEPublicKey(mid)
-					}
-				}
-				if nErr != nil {
-					lc.UserLogin.Bridge.Log.Warn().Err(nErr).Str("member", mid).Msg("Failed to negotiate key for member, skipping")
-					continue
-				}
+			Msg("Batch GetLastE2EEPublicKeys failed, resolving member keys individually")
+	}
+	if pubKeys == nil {
+		pubKeys = make(map[string]line.E2EEPeerPublicKey, len(members))
+	}
+
+	for _, mid := range members {
+		if pk, ok := pubKeys[mid]; ok && pk.KeyID > 0 && pk.KeyData != "" {
+			continue
+		}
+
+		var res *line.E2EEPublicKey
+		var err error
+		client, res, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.E2EEPublicKey, error) {
+			return negotiateE2EEPublicKeyWithClient(client, mid)
+		})
+		if err != nil {
+			if ctx.Err() != nil || lc.isSessionInvalidated() || line.IsAuthError(err) {
+				return client, nil, fmt.Errorf("negotiate E2EE key for member %s: %w", mid, err)
 			}
-			keyID, nErr := res.KeyID.Int64()
-			if nErr != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(nErr).Str("member", mid).Msg("Failed to parse key ID, skipping")
-				continue
+			if line.IsNoUsableE2EEPublicKey(err) {
+				return client, nil, fmt.Errorf("%w: member %s has Letter Sealing disabled", line.ErrNoUsableE2EEGroupKey, mid)
 			}
-			pubKeys[mid] = line.E2EEPeerPublicKey{KeyID: int(keyID), KeyData: res.PublicKey}
+			return client, nil, fmt.Errorf("%w: negotiate E2EE key for member %s: %w", line.ErrNoUsableE2EEGroupKey, mid, err)
+		}
+		if res == nil || res.PublicKey == "" {
+			return client, nil, fmt.Errorf("%w: member %s returned no public key", line.ErrNoUsableE2EEGroupKey, mid)
+		}
+		keyID, err := res.KeyID.Int64()
+		if err != nil {
+			return client, nil, fmt.Errorf("%w: parse E2EE key ID for member %s: %w", line.ErrNoUsableE2EEGroupKey, mid, err)
+		}
+		if keyID <= 0 {
+			return client, nil, fmt.Errorf("%w: member %s returned invalid key ID %d", line.ErrNoUsableE2EEGroupKey, mid, keyID)
+		}
+		pubKeys[mid] = line.E2EEPeerPublicKey{KeyID: int(keyID), KeyData: res.PublicKey}
+	}
+
+	return client, pubKeys, nil
+}
+
+// registerGroupKey generates a random 32-byte group key, wraps it for each member
+// using ECDH + AES-256-CBC, and registers it with the LINE server so all members
+// can decrypt group messages.
+func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, members []string) error {
+	members = lc.groupKeyMemberMIDs(chatMid, members)
+	if lc.E2EE == nil {
+		return fmt.Errorf("%w: E2EE manager not initialized", line.ErrNoUsableE2EEGroupKey)
+	}
+
+	client := lc.newClient()
+
+	// Batch responses can be partial without returning an error. Resolve every
+	// missing member individually so registration arrays retain the server's
+	// expected member count.
+	pubKeys := make(map[string]line.E2EEPeerPublicKey, len(members))
+	if len(members) > 0 {
+		var err error
+		client, pubKeys, err = lc.resolveGroupMemberPublicKeys(ctx, client, chatMid, members)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -216,28 +237,18 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 
 	for _, mid := range members {
 		pk, ok := pubKeys[mid]
-		if !ok {
-			lc.UserLogin.Bridge.Log.Debug().Str("member", mid).Msg("No E2EE public key for member, skipping")
-			continue
-		}
-		if pk.KeyData == "" {
-			lc.UserLogin.Bridge.Log.Debug().Str("member", mid).Int("key_id", pk.KeyID).Msg("Empty public key data for member, skipping")
-			continue
+		if !ok || pk.KeyID <= 0 || pk.KeyData == "" {
+			return fmt.Errorf("%w: incomplete E2EE public key for member %s", line.ErrNoUsableE2EEGroupKey, mid)
 		}
 
 		encryptedKey, err := lc.E2EE.WrapGroupKeyForMember(pk.KeyData, groupKeyID)
 		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("member", mid).Msg("Failed to wrap group key for member, skipping")
-			continue
+			return fmt.Errorf("wrap group key for member %s: %w", mid, err)
 		}
 
 		apiMembers = append(apiMembers, mid)
 		keyIds = append(keyIds, pk.KeyID)
 		encryptedKeys = append(encryptedKeys, encryptedKey)
-	}
-
-	if len(apiMembers) == 0 {
-		return fmt.Errorf("no members with valid E2EE keys")
 	}
 
 	// LINE's registerE2EEGroupKey requires the caller's own key entry as well — without it the
@@ -256,16 +267,11 @@ func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string, memb
 	keyIds = append(keyIds, selfRawID)
 	encryptedKeys = append(encryptedKeys, selfEncryptedKey)
 
-	if err := client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys); err != nil {
-		if lc.isRefreshRequired(err) || lc.isLoggedOut(err) {
-			if errRecover := lc.recoverToken(ctx); errRecover == nil {
-				client = line.NewClient(lc.AccessToken)
-				err = client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys)
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("registerE2EEGroupKey failed: %w", err)
-		}
+	_, err = lc.callLineUsing(ctx, client, func(client *line.Client) error {
+		return client.RegisterE2EEGroupKey(1, chatMid, apiMembers, keyIds, encryptedKeys)
+	})
+	if err != nil {
+		return fmt.Errorf("registerE2EEGroupKey failed: %w", err)
 	}
 
 	lc.UserLogin.Bridge.Log.Info().

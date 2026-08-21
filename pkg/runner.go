@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -20,6 +21,7 @@ type Runner struct {
 	token         string
 	clientVersion string
 	skPtr         uint32         // SecureKey from loadToken
+	signingSKPtr  uint32         // Separate SecureKey used for request signing
 	storageKey    uint32         // AesKey ptr (after StorageInit)
 	loginCurveKey uint32         // Curve25519Key ptr (after GenerateE2EESecret)
 	keyStore      map[int]uint32 // internal ID -> E2EEKey ptr
@@ -27,12 +29,22 @@ type Runner struct {
 	nextID        int
 	mu            sync.Mutex
 
+	signingContexts map[[sha256.Size]byte]signingContext
+	signingLRU      [][sha256.Size]byte
+
 	// Pure Go channels for encrypt/decrypt when raw key material is available.
 	// Currently populated when a Go-generated key (with known private key) is
 	// used to create a channel. WASM-unwrapped keys (from key chain) do NOT
 	// have raw private keys because of SKB (white-box crypto).
 	goKeys     map[int]*goKeyEntry   // internal ID -> raw key material
 	goChannels map[int]*ltsm.Channel // internal ID -> pure Go channel
+}
+
+const signingCacheCapacity = 4
+
+type signingContext struct {
+	derivedKeyPtr uint32
+	hmacPtr       uint32
 }
 
 type SecretResult struct {
@@ -84,15 +96,16 @@ func GetRunner() (*Runner, error) {
 		}
 
 		globalRunner = &Runner{
-			rt:            rt,
-			token:         token,
-			clientVersion: clientVersion,
-			skPtr:         skPtr,
-			keyStore:      make(map[int]uint32),
-			channelStore:  make(map[int]uint32),
-			nextID:        1,
-			goKeys:        make(map[int]*goKeyEntry),
-			goChannels:    make(map[int]*ltsm.Channel),
+			rt:              rt,
+			token:           token,
+			clientVersion:   clientVersion,
+			skPtr:           skPtr,
+			keyStore:        make(map[int]uint32),
+			channelStore:    make(map[int]uint32),
+			signingContexts: make(map[[sha256.Size]byte]signingContext),
+			nextID:          1,
+			goKeys:          make(map[int]*goKeyEntry),
+			goChannels:      make(map[int]*ltsm.Channel),
 		}
 	})
 	return globalRunner, runnerErr
@@ -205,6 +218,66 @@ func (r *Runner) decryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID
 	return r.rt.E2EEChannelDecryptV2(chanPtr, to, from, senderKeyID, receiverKeyID, contentType, ciphertext)
 }
 
+func (r *Runner) touchSigningContext(key [sha256.Size]byte) {
+	for i, existing := range r.signingLRU {
+		if existing != key {
+			continue
+		}
+		copy(r.signingLRU[i:], r.signingLRU[i+1:])
+		r.signingLRU[len(r.signingLRU)-1] = key
+		return
+	}
+}
+
+func (r *Runner) destroySigningContext(ctx signingContext) error {
+	hmacErr := r.rt.HmacDestroy(ctx.hmacPtr)
+	keyErr := r.rt.SecureKeyDestroy(ctx.derivedKeyPtr)
+	return errors.Join(hmacErr, keyErr)
+}
+
+func (r *Runner) signingHMAC(accessToken string) (uint32, error) {
+	key := sha256.Sum256([]byte(accessToken))
+	if ctx, ok := r.signingContexts[key]; ok {
+		r.touchSigningContext(key)
+		return ctx.hmacPtr, nil
+	}
+
+	if r.signingSKPtr == 0 {
+		var err error
+		r.signingSKPtr, err = r.rt.SecureKeyLoadToken(r.token)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	clientVersionHash := sha256.Sum256([]byte(r.clientVersion))
+	derivedKeyPtr, err := r.rt.SecureKeyDeriveKey(r.signingSKPtr, clientVersionHash[:], key[:])
+	if err != nil {
+		return 0, err
+	}
+	hmacPtr, err := r.rt.HmacNew(derivedKeyPtr)
+	if err != nil {
+		_ = r.rt.SecureKeyDestroy(derivedKeyPtr)
+		return 0, err
+	}
+	ctx := signingContext{derivedKeyPtr: derivedKeyPtr, hmacPtr: hmacPtr}
+
+	if len(r.signingLRU) >= signingCacheCapacity {
+		evictedKey := r.signingLRU[0]
+		evicted := r.signingContexts[evictedKey]
+		delete(r.signingContexts, evictedKey)
+		r.signingLRU = r.signingLRU[1:]
+		if err = r.destroySigningContext(evicted); err != nil {
+			_ = r.destroySigningContext(ctx)
+			return 0, fmt.Errorf("failed to destroy evicted signing context: %w", err)
+		}
+	}
+
+	r.signingContexts[key] = ctx
+	r.signingLRU = append(r.signingLRU, key)
+	return hmacPtr, nil
+}
+
 func (r *Runner) GetSignature(reqPath, body, accessToken string) (string, error) {
 	if reqPath == "" {
 		reqPath = "/"
@@ -215,14 +288,18 @@ func (r *Runner) GetSignature(reqPath, body, accessToken string) (string, error)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	sig, err := r.rt.Sign(r.token, r.clientVersion, accessToken, reqPath, body)
+	hmacPtr, err := r.signingHMAC(accessToken)
 	if err != nil {
 		return "", err
 	}
-	if sig == "" {
+	sig, err := r.rt.HmacDigest(hmacPtr, []byte(reqPath+body))
+	if err != nil {
+		return "", err
+	}
+	if len(sig) == 0 {
 		return "", fmt.Errorf("runner returned empty signature")
 	}
-	return sig, nil
+	return base64.StdEncoding.EncodeToString(sig), nil
 }
 
 // DebugExportDerivedSigningKey returns the derived SecureKey export blob used for
@@ -242,6 +319,7 @@ func (r *Runner) DebugExportDerivedSigningKey(accessToken string) (string, error
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = r.rt.SecureKeyDestroy(dkPtr) }()
 
 	// Mark the derived key as exportable by setting the C++ flag at ptr+16
 	r.rt.MarkSecureKeyExportable(dkPtr)
@@ -481,20 +559,13 @@ func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (int, error) {
 
 	id := r.putChannel(chanPtr)
 
-	// If we have raw key material, also create a pure Go channel
+	// If we have raw key material, also create a pure Go channel. This cache is
+	// best-effort; the WASM channel above is the authoritative channel.
 	if goKey, ok := r.goKeys[keyID]; ok && goKey.privKey != nil {
 		goChan, err := ltsm.NewChannel(goKey.privKey, peerPubBytes)
 		if err == nil {
 			r.goChannels[id] = goChan
-		} else {
-			fmt.Printf("DEBUG ChannelCreate: NewChannel failed: %v (keyID=%d len(privKey)=%d)\n", err, keyID, len(goKey.privKey))
 		}
-	} else {
-		fmt.Printf("DEBUG ChannelCreate: no goKey for keyID=%d (goKeys has keys: ", keyID)
-		for k := range r.goKeys {
-			fmt.Printf("%d ", k)
-		}
-		fmt.Printf(")\n")
 	}
 
 	return id, nil

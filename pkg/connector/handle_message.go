@@ -3,10 +3,10 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,17 +21,21 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/connector/handlers"
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
+	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
+)
+
+const (
+	lineDecryptFallbackText      = "[Unable to decrypt message. Open an issue on GitHub.]"
+	lineDecryptFailureNoticeText = "[Unable to decrypt LINE message.]"
 )
 
 func (lc *LineClient) newMessageHandler() *handlers.Handler {
 	return &handlers.Handler{
-		Log:               lc.UserLogin.Bridge.Log,
-		HTTPClient:        lc.HTTPClient,
-		RecoverToken:      lc.recoverToken,
-		IsRefreshRequired: lc.isRefreshRequired,
-		IsLoggedOut:       lc.isLoggedOut,
-		NewClient:         func() *line.Client { return line.NewClient(lc.AccessToken) },
-		DecryptMedia:      lc.decryptImageData,
+		Log:           lc.UserLogin.Bridge.Log,
+		HTTPClient:    lc.HTTPClient,
+		RecoverClient: lc.recoverClientAfterAuthError,
+		NewClient:     func() *line.Client { return lc.newClient() },
+		DecryptMedia:  lc.decryptImageData,
 	}
 }
 
@@ -43,7 +47,7 @@ func e2eeChunkLengths(chunks []string) []int {
 	return lengths
 }
 
-func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+func messageDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int, finalKeyIDField string) *zerolog.Event {
 	evt = evt.
 		Str("msg_id", msg.ID).
 		Str("chat_mid", chatMID).
@@ -64,17 +68,50 @@ func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID strin
 		} else {
 			evt = evt.Str("sender_key_id_error", err.Error())
 		}
-		if groupKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
-			evt = evt.Int("group_key_id", groupKeyID)
+		if finalKeyID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil {
+			evt = evt.Int(finalKeyIDField, finalKeyID)
 		} else {
-			evt = evt.Str("group_key_id_error", err.Error())
+			evt = evt.Str(finalKeyIDField+"_error", err.Error())
 		}
 	}
 
 	return evt
 }
 
-func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
+func groupDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+	return messageDecryptLogContext(evt, msg, chatMID, opType, "group_key_id")
+}
+
+func directDecryptLogContext(evt *zerolog.Event, msg *line.Message, chatMID string, opType int) *zerolog.Event {
+	return messageDecryptLogContext(evt, msg, chatMID, opType, "receiver_key_id")
+}
+
+type messageWithChatInfo struct {
+	*simplevent.Message[line.Message]
+	GetChatInfoFunc func(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error)
+}
+
+var _ bridgev2.RemoteChatResyncWithInfo = (*messageWithChatInfo)(nil)
+
+func (evt *messageWithChatInfo) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+	if evt.GetChatInfoFunc == nil {
+		return nil, nil
+	}
+	return evt.GetChatInfoFunc(ctx, portal)
+}
+
+func (lc *LineClient) getChatInfoForIncomingMessage(ctx context.Context, portal *bridgev2.Portal, chatMid string) (*bridgev2.ChatInfo, error) {
+	info, err := lc.GetChatInfo(ctx, portal)
+	if err != nil {
+		return nil, err
+	}
+	if isChatMID(chatMid) {
+		lc.stripRemoteMembersFromInitialChatInfo(info)
+	}
+	return info, nil
+}
+
+func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 	// Only process known content types; skip system messages (group created, member invited, etc.)
 	if !isBridgeableContentType(msg) {
 		lc.UserLogin.Bridge.Log.Debug().
@@ -84,18 +121,19 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 			Str("text", msg.Text).
 			Int("chunk_count", len(msg.Chunks)).
 			Msg("Skipping unsupported content type")
-		return
+		return false
 	}
-
-	senderID := makeUserID(msg.From)
 
 	portalIDStr := portalMIDForMessage(msg, opType)
 	portalKey := networkid.PortalKey{ID: makePortalID(portalIDStr), Receiver: lc.UserLogin.ID}
-
-	bodyText, unwrappedText := lc.decryptMessageBody(msg, portalIDStr, opType)
 	ts := lc.parseMessageTimestamp(msg)
 
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Message[line.Message]{
+	lc.ensureGroupMessageSenderKnown(portalIDStr, msg.From, ts)
+
+	senderID := makeUserID(msg.From)
+	bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, portalIDStr, opType)
+
+	messageEvent := &simplevent.Message[line.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventMessage,
 			LogContext:   func(c zerolog.Context) zerolog.Context { return c.Str("msg_id", msg.ID) },
@@ -103,27 +141,60 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) {
 			CreatePortal: true,
 			Sender:       bridgev2.EventSender{Sender: senderID, IsFromMe: OperationType(opType) == OpSendMessage},
 			Timestamp:    ts,
+			PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+				lc.hiddenJoinGroupMessageSender(ctx, portal, portalIDStr, msg.From, ts)
+			},
 		},
 		Data: *msg,
 		ID:   networkid.MessageID(msg.ID),
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message) (*bridgev2.ConvertedMessage, error) {
-			return lc.convertLineMessage(ctx, portal, intent, data, bodyText, unwrappedText)
+			return lc.convertLineMessage(ctx, portal, intent, data, bodyText, unwrappedText, decryptionFailed)
 		},
-	})
+	}
+
+	var remoteEvent bridgev2.RemoteEvent = messageEvent
+	if isChatMID(portalIDStr) {
+		remoteEvent = &messageWithChatInfo{
+			Message: messageEvent,
+			GetChatInfoFunc: func(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+				return lc.getChatInfoForIncomingMessage(ctx, portal, portalIDStr)
+			},
+		}
+	}
+
+	result := lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, remoteEvent)
+	return result.Success && !result.Ignored
 }
 
 // isBridgeableContentType reports whether an inbound LINE message should be
 // bridged to Matrix. System messages (group created, member invited, etc.) are
-// skipped, but call and contact notifications are let through regardless of
-// content type because LINE may wrap them in non-standard content type values.
+// skipped, but post, call, and contact notifications are let through regardless
+// of content type because LINE may wrap them in non-standard content types.
 func isBridgeableContentType(msg *line.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if isPostNotification(msg) {
+		return true
+	}
 	switch ContentType(msg.ContentType) {
 	case ContentText, ContentImage, ContentVideo, ContentAudio,
-		ContentSticker, ContentContact, ContentFile, ContentLocation:
+		ContentSticker, ContentContact, ContentFile, ContentLocation, ContentFlex:
 		return true
 	default:
 		return msg.ContentMetadata["ORGCONTP"] == "CALL" || msg.ContentMetadata["ORGCONTP"] == "CONTACT"
 	}
+}
+
+// isPostNotification reports whether a LINE message represents a note, album,
+// or another post notification. LINE sends native notifications as content
+// type 16 and shared notifications as text messages with ORGCONTP metadata.
+func isPostNotification(msg *line.Message) bool {
+	if msg == nil {
+		return false
+	}
+	return ContentType(msg.ContentType) == ContentPostNotification ||
+		msg.ContentMetadata["ORGCONTP"] == "POSTNOTIFICATION"
 }
 
 // portalMIDForMessage returns the chat MID that owns a message (the portal key).
@@ -162,11 +233,12 @@ func (lc *LineClient) parseMessageTimestamp(msg *line.Message) time.Time {
 // decryptMessageBody runs E2EE decryption (when needed) for an inbound message
 // and returns the plaintext body plus the JSON-unwrapped text. Shared by the
 // live message path (queueIncomingMessage) and the backfill path (FetchMessages).
-func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, opType int) (bodyText, unwrappedText string) {
+func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, opType int) (bodyText, unwrappedText string, decryptionFailed bool) {
 	// Handle Content
 	bodyText = msg.Text
-	if bodyText == "" && len(msg.Chunks) > 0 {
-		bodyText = "[Unable to decrypt message. Open an issue on GitHub.]"
+	if len(msg.Chunks) > 0 && (bodyText == "" || isLineDecryptFallbackText(bodyText)) {
+		bodyText = ""
+		decryptionFailed = true
 		if lc.E2EE != nil {
 			// Ensure peer keys are available before attempting decryption
 			lc.ensurePeerKeyForMessage(context.Background(), msg)
@@ -192,15 +264,17 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 				pt, keyID, err := lc.E2EE.DecryptGroupMessage(msg, portalIDStr)
 				if err == nil {
 					bodyText = pt
+					decryptionFailed = false
 				} else {
 					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
-						Msg("DecryptGroupMessage failed, trying to fetch key")
-					if keyID != 0 {
+						Msg("DecryptGroupMessage failed")
+					if !errors.Is(err, ltsm.ErrAbort) && keyID != 0 {
 						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Failed to fetch/unwrap group key")
 						} else if ptRetry, _, errRetry := lc.E2EE.DecryptGroupMessage(msg, portalIDStr); errRetry == nil {
 							bodyText = ptRetry
+							decryptionFailed = false
 						} else {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
 								Msg("DecryptGroupMessage failed after group key refresh")
@@ -211,36 +285,61 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 				// 1-1 Decryption
 				if pt, err := lc.E2EE.DecryptMessageV2(msg); err == nil {
 					bodyText = pt
+					decryptionFailed = false
 				} else {
-					lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("DecryptMessageV2 failed on first attempt")
-					if _, _, errKey := lc.E2EE.MyKeyIDs(); errKey != nil {
-						lc.UserLogin.Bridge.Log.Error().Msg("E2EE own key not loaded — cannot decrypt any messages. Re-login required.")
+					directDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
+						Msg("DecryptMessageV2 failed on first attempt")
+					if errors.Is(err, ltsm.ErrAbort) {
+						directDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(err), msg, portalIDStr, opType).
+							Msg("LTSM runtime aborted; skipping key refresh")
+					} else if _, _, errKey := lc.E2EE.MyKeyIDs(); errKey != nil {
+						directDecryptLogContext(lc.UserLogin.Bridge.Log.Error().Err(errKey), msg, portalIDStr, opType).
+							Msg("E2EE own key not loaded; cannot decrypt any messages. Re-login required")
+						lc.markMissingE2EEKey(context.Background(), fmt.Errorf("%w: %v", e2ee.ErrMissingOwnPrivateKey, errKey))
 					} else {
 						peerMid := msg.From
-						if peerMid == lc.Mid || peerMid == string(lc.UserLogin.ID) {
+						peerKeyID := 0
+						messageFromMe := peerMid == lc.Mid || peerMid == string(lc.UserLogin.ID)
+						if messageFromMe {
 							peerMid = msg.To
 						}
 						// Fetch the EXACT keyID the message used (handles peer key rotation)
 						// before falling back to negotiating the peer's current key.
 						fetched := false
 						if len(msg.Chunks) >= 5 {
-							if receiverKeyID, errKID := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); errKID == nil && receiverKeyID != 0 {
-								if _, _, errPeer := lc.ensurePeerKeyByID(context.Background(), peerMid, receiverKeyID); errPeer == nil {
+							senderKeyID, errSender := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-2])
+							receiverKeyID, errReceiver := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1])
+							if errSender == nil {
+								peerKeyID = senderKeyID
+							}
+							if messageFromMe && errReceiver == nil {
+								peerKeyID = receiverKeyID
+							}
+							if peerKeyID != 0 {
+								if _, _, errPeer := lc.ensurePeerKeyByID(context.Background(), peerMid, peerKeyID); errPeer == nil {
 									fetched = true
 								} else {
-									lc.UserLogin.Bridge.Log.Debug().Err(errPeer).Str("peer", peerMid).Int("key_id", receiverKeyID).Msg("ensurePeerKeyByID failed on retry, falling back to NegotiateE2EEPublicKey")
+									directDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(errPeer), msg, portalIDStr, opType).
+										Str("peer", peerMid).
+										Int("key_id", peerKeyID).
+										Msg("ensurePeerKeyByID failed on retry, falling back to NegotiateE2EEPublicKey")
 								}
 							}
 						}
 						if !fetched {
 							if _, _, errPeer := lc.ensurePeerKey(context.Background(), peerMid); errPeer != nil {
-								lc.UserLogin.Bridge.Log.Warn().Err(errPeer).Str("peer", peerMid).Msg("Failed to force-fetch peer key for retry")
+								directDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errPeer), msg, portalIDStr, opType).
+									Str("peer", peerMid).
+									Msg("Failed to force-fetch peer key for retry")
 							}
 						}
 						if ptRetry, errRetry := lc.E2EE.DecryptMessageV2(msg); errRetry == nil {
 							bodyText = ptRetry
+							decryptionFailed = false
 						} else {
-							lc.UserLogin.Bridge.Log.Warn().Err(errRetry).Msg("DecryptMessageV2 failed on retry")
+							directDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
+								Msg("DecryptMessageV2 failed on retry")
+							lc.markMissingE2EEKey(context.Background(), errRetry)
 						}
 					}
 				}
@@ -258,16 +357,46 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 			}
 		}
 	}
-	return bodyText, unwrappedText
+	return bodyText, unwrappedText, decryptionFailed
+}
+
+func isLineDecryptFallbackText(text string) bool {
+	// LINE may include this historical fallback in Text while still sending
+	// encrypted chunks. Treat it as a decrypt marker, not user-authored text.
+	return strings.TrimSpace(text) == lineDecryptFallbackText
 }
 
 // convertLineMessage converts an inbound LINE message into a Matrix
 // ConvertedMessage. bodyText/unwrappedText are the (decrypted) message text as
 // returned by decryptMessageBody. Shared by the live message path and backfill.
-func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, bodyText, unwrappedText string) (*bridgev2.ConvertedMessage, error) {
+func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, bodyText, unwrappedText string, decryptionFailed bool) (*bridgev2.ConvertedMessage, error) {
 	decryptedBody := bodyText
-	h := lc.newMessageHandler()
 	replyRelatesTo := lc.resolveReplyRelatesTo(ctx, &data)
+
+	// Handle LINE notes/albums before decryption failures and ordinary text
+	// conversion. Post metadata is unencrypted, so it remains useful even when
+	// a shared post's text fallback was marked as encrypted but could not be
+	// decrypted.
+	if isPostNotification(&data) {
+		return lc.newMessageHandler().ConvertPostNotification(ctx, portal, intent, data, replyRelatesTo)
+	}
+
+	if decryptionFailed && strings.TrimSpace(unwrappedText) == "" && ContentType(data.ContentType) == ContentText {
+		return &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{
+				{
+					Type: event.EventMessage,
+					Content: &event.MessageEventContent{
+						MsgType:   event.MsgNotice,
+						Body:      lineDecryptFailureNoticeText,
+						RelatesTo: replyRelatesTo,
+					},
+				},
+			},
+		}, nil
+	}
+
+	h := lc.newMessageHandler()
 
 	// Handle call events (ORGCONTP == "CALL")
 	if data.ContentMetadata["ORGCONTP"] == "CALL" {
@@ -290,6 +419,8 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 		return h.ConvertLocation(data, replyRelatesTo)
 	case ContentContact:
 		return h.ConvertContact(data, replyRelatesTo)
+	case ContentFlex:
+		return h.ConvertFlex(data, replyRelatesTo)
 	}
 
 	// Handle device/phone contact shared via ORGCONTP (contentType 0 with vCard)
@@ -297,32 +428,39 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 		return h.ConvertDeviceContact(ctx, portal, intent, data, unwrappedText, replyRelatesTo)
 	}
 
+	var converted *bridgev2.ConvertedMessage
+	var err error
+
 	// Handle inline emoji/stamp embedded in text messages
 	if data.ContentMetadata["STKID"] != "" || data.ContentMetadata["STKPKGID"] != "" ||
-		data.ContentMetadata["STICON_OWNERSHIP"] != "" {
+		data.ContentMetadata["STICON_OWNERSHIP"] != "" ||
+		handlers.HasSticonMetadata(data.ContentMetadata["REPLACE"]) ||
+		handlers.HasSticonBody(bodyText) ||
+		handlers.ContainsLineSticonPlaceholder(unwrappedText) {
 		if data.ContentMetadata["STICON_OWNERSHIP"] != "" {
 			h.Log.Debug().
-				Str("body_text", bodyText).
-				Str("unwrapped_text", unwrappedText).
-				Interface("content_metadata", data.ContentMetadata).
+				Int("body_length", len(bodyText)).
+				Int("unwrapped_length", len(unwrappedText)).
+				Int("metadata_count", len(data.ContentMetadata)).
 				Msg("STICON_OWNERSHIP: full message body")
 		}
-		return h.ConvertInlineEmoji(ctx, portal, intent, data, unwrappedText, bodyText, replyRelatesTo)
-	}
+		converted, err = h.ConvertInlineEmoji(ctx, portal, intent, data, unwrappedText, bodyText, replyRelatesTo)
+	} else {
+		// Skip empty/whitespace-only text messages (system messages that fell through)
+		if strings.TrimSpace(unwrappedText) == "" {
+			return nil, nil
+		}
 
-	// Skip empty/whitespace-only text messages (system messages that fell through)
-	if strings.TrimSpace(unwrappedText) == "" {
-		return nil, nil
+		// Default to text
+		converted, err = h.ConvertText(unwrappedText, replyRelatesTo)
 	}
-
-	// Default to text
-	converted, err := h.ConvertText(unwrappedText, replyRelatesTo)
 	if err != nil {
 		return nil, err
 	}
 
-	if mentionStr := data.ContentMetadata["MENTION"]; mentionStr != "" && len(converted.Parts) > 0 {
+	if mentionStr := data.ContentMetadata["MENTION"]; mentionStr != "" && converted != nil && len(converted.Parts) > 0 && converted.Parts[0].Content != nil {
 		lc.UserLogin.Bridge.Log.Debug().Str("raw_mention", mentionStr).Msg("Processing inbound LINE MENTION metadata")
+		canFormatMentions := converted.Parts[0].Content.Body == unwrappedText && converted.Parts[0].Content.FormattedBody == ""
 		var mentionData struct {
 			MENTIONEES []struct {
 				M string `json:"M,omitempty"`
@@ -367,17 +505,17 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 					}
 					lc.UserLogin.Bridge.Log.Debug().Str("mxid", string(mxid)).Msg("Formatted MXID from LINE MID")
 					mentions.UserIDs = append(mentions.UserIDs, mxid)
-					if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
-						if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
-							entries = append(entries, mentionEntry{start: s, end: e, mxid: string(mxid)})
+					if canFormatMentions {
+						if start, end, ok := resolveMentionRange(unwrappedText, ment.S, ment.E); ok {
+							entries = append(entries, mentionEntry{start: start, end: end, mxid: string(mxid)})
 						}
 					}
 				}
 				if ment.A == "1" {
 					mentions.Room = true
-					if s, errS := strconv.Atoi(ment.S); errS == nil && s >= 0 {
-						if e, errE := strconv.Atoi(ment.E); errE == nil && e <= len(unwrappedText) && e > s {
-							entries = append(entries, mentionEntry{start: s, end: e, mxid: "@room"})
+					if canFormatMentions {
+						if start, end, ok := resolveMentionRange(unwrappedText, ment.S, ment.E); ok {
+							entries = append(entries, mentionEntry{start: start, end: end, mxid: "@room"})
 						}
 					}
 				}

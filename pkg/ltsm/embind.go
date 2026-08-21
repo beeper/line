@@ -6,11 +6,15 @@ package ltsm
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
 )
+
+// ErrAbort identifies a fatal abort from the transpiled LTSM runtime.
+var ErrAbort = errors.New("ltsm: WASM abort called")
 
 // TypeInfo describes a registered embind type.
 type TypeInfo struct {
@@ -440,7 +444,7 @@ func (imp *Imports) Import_l(p0, p1 uint32) uint32 { // _emval_take_value
 }
 
 func (imp *Imports) Import_m() { // _abort
-	panic("ltsm: WASM abort called")
+	panic(ErrAbort)
 }
 
 func (imp *Imports) Import_n(p0, p1, p2 uint32) { // __embind_register_std_wstring
@@ -898,6 +902,22 @@ func (imp *Imports) Construct(className string, args ...uint32) (uint32, error) 
 	}
 
 	return 0, fmt.Errorf("ltsm: no constructor with %d args found for class %q", len(args), className)
+}
+
+// Destroy invokes the registered C++ destructor for an embind object.
+func (imp *Imports) Destroy(className string, ptr uint32) error {
+	if ptr == 0 {
+		return nil
+	}
+	ci := imp.classByName[className]
+	if ci == nil {
+		return fmt.Errorf("ltsm: class %q not found", className)
+	}
+	if ci.DestructorIdx == 0 {
+		return fmt.Errorf("ltsm: class %q has no destructor", className)
+	}
+	imp.mod.callIndirectT7(ci.DestructorIdx, ptr)
+	return nil
 }
 
 // WriteEmvalBytes stores a byte slice in the emval table and returns the handle.

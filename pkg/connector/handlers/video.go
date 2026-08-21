@@ -16,6 +16,10 @@ import (
 
 // ConvertVideo converts a LINE video message to a Matrix video message.
 func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
+	}
+
 	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
@@ -46,14 +50,15 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
 	dlStart := time.Now()
-	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
-	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
+	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
 		client = newClient
-		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+		videoData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 	}
-	_ = client
+	h.handleFinalAuthError(ctx, client, err)
 
 	if err != nil {
 		h.Log.Warn().
@@ -62,61 +67,18 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 			Str("msg_id", data.ID).
 			Bool("plain_media", isPlainMedia).
 			Dur("download_duration", time.Since(dlStart)).
-			Msg("Failed to download video from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[Video unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download video from OBS")
+		return mediaDownloadFailure("Video", err, relatesTo)
 	}
 
-	decrypted := false
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-			FileName    string `json:"fileName"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.KeyMaterial != "" {
-			h.Log.Debug().
-				Str("key_material_len", fmt.Sprintf("%d", len(decryptInfo.KeyMaterial))).
-				Str("file_name", decryptInfo.FileName).
-				Msg("Decrypting E2EE video")
-
-			decryptedVideo, err := h.DecryptMedia(videoData, decryptInfo.KeyMaterial)
-			if err != nil {
-				h.Log.Error().Err(err).Msg("Failed to decrypt video data")
-				return nil, fmt.Errorf("failed to decrypt video data: %w", err)
-			}
-			videoData = decryptedVideo
-			decrypted = true
-			h.Log.Info().Int("decrypted_size", len(videoData)).Msg("Successfully decrypted video")
-		}
+	videoData, err = h.decryptDownloadedMedia(videoData, decryptedBody, data.ContentMetadata, "video")
+	if err != nil {
+		h.Log.Error().Err(err).Msg("Failed to decrypt video data")
+		return nil, err
 	}
 
-	// ENC_KM is a fallback when the in-body keyMaterial path didn't decrypt
-	// (e.g. E2EE chunk decryption failed). Running it unconditionally would
-	// double-decrypt for bridge-sent LSON videos and corrupt the bytes.
-	if !decrypted {
-		if encKM := data.ContentMetadata["ENC_KM"]; encKM != "" && len(videoData) > 32 {
-			h.Log.Debug().
-				Str("enc_km_preview", encKM[:min(20, len(encKM))]+"...").
-				Msg("Decrypting video using ENC_KM from metadata (fallback)")
-
-			decryptedVideo, err := h.DecryptMedia(videoData, encKM)
-			if err != nil {
-				h.Log.Warn().Err(err).Msg("ENC_KM fallback decrypt failed, sending raw video")
-			} else {
-				videoData = decryptedVideo
-				h.Log.Info().Int("decrypted_size", len(videoData)).Msg("Successfully decrypted video from ENC_KM")
-			}
-		}
+	if oversized := h.oversizedMediaNotice(int64(len(videoData)), "downloaded", relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
 	fileName := data.ContentMetadata["FILE_NAME"]

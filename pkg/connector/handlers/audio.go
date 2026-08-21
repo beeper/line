@@ -15,6 +15,10 @@ import (
 
 // ConvertAudio converts a LINE audio message to a Matrix audio message.
 func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if oversized := h.oversizedMediaNoticeFromMetadata(data.ContentMetadata, relatesTo); oversized != nil {
+		return oversized, nil
+	}
+
 	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
@@ -45,13 +49,14 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 		sid = "m"
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
-	audioData, err := client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	audioData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
-	if newClient, ok := h.tryRecoverClient(ctx, err); ok {
+	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
 		client = newClient
-		audioData, err = client.DownloadOBSWithSIDOptions(ctx, oid, data.ID, sid, downloadOptions)
+		audioData, err = client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 	}
-	_ = client
+	h.handleFinalAuthError(ctx, client, err)
 
 	if err != nil {
 		h.Log.Warn().
@@ -59,50 +64,18 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 			Str("oid", oid).
 			Str("msg_id", data.ID).
 			Bool("plain_media", isPlainMedia).
-			Msg("Failed to download audio from OBS, sending placeholder")
-		return &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{
-				{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType:   event.MsgNotice,
-						Body:      "[Audio unavailable — LINE media expired before it could be bridged]",
-						RelatesTo: relatesTo,
-					},
-				},
-			},
-		}, nil
+			Msg("Failed to download audio from OBS")
+		return mediaDownloadFailure("Audio", err, relatesTo)
 	}
 
-	// Decrypt audio if it has keyMaterial (E2EE)
-	decrypted := false
-	if decryptedBody != "" && strings.Contains(decryptedBody, "keyMaterial") {
-		var decryptInfo struct {
-			KeyMaterial string `json:"keyMaterial"`
-		}
-		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err == nil && decryptInfo.KeyMaterial != "" {
-			decryptedAudio, err := h.DecryptMedia(audioData, decryptInfo.KeyMaterial)
-			if err != nil {
-				h.Log.Error().Err(err).Msg("Failed to decrypt audio data")
-				return nil, fmt.Errorf("failed to decrypt audio data: %w", err)
-			}
-			audioData = decryptedAudio
-			decrypted = true
-		}
+	audioData, err = h.decryptDownloadedMedia(audioData, decryptedBody, data.ContentMetadata, "audio")
+	if err != nil {
+		h.Log.Error().Err(err).Msg("Failed to decrypt audio data")
+		return nil, err
 	}
 
-	// ENC_KM is a fallback when the in-body keyMaterial path didn't decrypt
-	// (e.g. E2EE chunk decryption failed). Running it unconditionally would
-	// double-decrypt for bridge-sent LSON audio and corrupt the bytes.
-	if !decrypted {
-		if encKM := data.ContentMetadata["ENC_KM"]; encKM != "" && len(audioData) > 32 {
-			decryptedAudio, err := h.DecryptMedia(audioData, encKM)
-			if err != nil {
-				h.Log.Warn().Err(err).Msg("ENC_KM fallback decrypt failed, sending raw audio")
-			} else {
-				audioData = decryptedAudio
-			}
-		}
+	if oversized := h.oversizedMediaNotice(int64(len(audioData)), "downloaded", relatesTo); oversized != nil {
+		return oversized, nil
 	}
 
 	var duration int

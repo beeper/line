@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -12,6 +13,69 @@ var (
 	ErrNoUsableE2EEGroupKey  = errors.New("no usable E2EE group key")
 	ErrGroupKeyNotFound      = errors.New("group key not found")
 )
+
+// IsRefreshRequired returns true when LINE reports that the access token must
+// be refreshed before the request can be retried.
+func IsRefreshRequired(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "\"code\":119") ||
+		strings.Contains(msg, "access token refresh required")
+}
+
+func IsLoggedOut(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") ||
+		IsInvalidSenderKey(err) ||
+		IsRequestNeedLogin(err)
+}
+
+func IsInvalidSenderKey(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return hasResponseErrorCode(msg) &&
+		strings.Contains(msg, "talkexception") &&
+		strings.Contains(msg, "\"code\":83") &&
+		strings.Contains(msg, "invalid sender key")
+}
+
+func IsRequestNeedLogin(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "request_need_login") ||
+		hasJSONCode(msg, 10004)
+}
+
+func IsUnauthorizedStatus(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "api error 401") ||
+		strings.Contains(msg, "api error 403") ||
+		strings.Contains(msg, "http 401") ||
+		strings.Contains(msg, "http 403") ||
+		strings.Contains(msg, "sse error: 401") ||
+		strings.Contains(msg, "sse error: 403") ||
+		strings.Contains(msg, "obs upload failed (401)") ||
+		strings.Contains(msg, "obs upload failed (403)") ||
+		strings.Contains(msg, "obs object info failed (401)") ||
+		strings.Contains(msg, "obs object info failed (403)") ||
+		strings.Contains(msg, "obs download failed (401)") ||
+		strings.Contains(msg, "obs download failed (403)")
+}
+
+func IsAuthError(err error) bool {
+	return IsRefreshRequired(err) || IsLoggedOut(err) || IsUnauthorizedStatus(err)
+}
 
 // IsNoUsableE2EEPublicKey returns true when a peer has Letter Sealing disabled
 // (negotiateE2EEPublicKey returns empty allowedTypes / specVersion -1, or no key data).
@@ -95,6 +159,23 @@ func IsGroupKeyNotRegisteredError(err error) bool {
 		strings.Contains(msg, "group key is not registered")
 }
 
+// IsTalkExceptionNotFound returns true when LINE wraps a TalkException code 5
+// "not found" response. Callers must interpret the method context themselves:
+// the same code can mean different missing resources for different Talk APIs.
+func IsTalkExceptionNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return hasResponseErrorCode(msg) &&
+		strings.Contains(msg, "talkexception") &&
+		(strings.Contains(msg, "\"code\":5,") ||
+			strings.Contains(msg, "\"code\":5}") ||
+			strings.Contains(msg, "\"code\": 5,")) &&
+		(strings.Contains(msg, "\"reason\":\"not found\"") ||
+			strings.Contains(msg, "\"reason\": \"not found\""))
+}
+
 // IsNotAMemberError returns true when the API reports the user is not a member of a chat.
 func IsNotAMemberError(err error) bool {
 	if err == nil {
@@ -117,7 +198,22 @@ func IsInvalidPaidReactionType(err error) bool {
 }
 
 func hasResponseErrorCode(msg string) bool {
-	return strings.Contains(msg, "\"code\":10051") || strings.Contains(msg, "code 10051")
+	return strings.Contains(msg, "\"code\":10051") ||
+		strings.Contains(msg, "\"code\": 10051") ||
+		strings.Contains(msg, "code 10051")
+}
+
+func hasJSONCode(msg string, code int) bool {
+	value := strconv.Itoa(code)
+	for _, prefix := range []string{`"code":`, `"code": `} {
+		codeStart := prefix + value
+		for _, suffix := range []string{",", "}", " ", "\t", "\r", "\n"} {
+			if strings.Contains(msg, codeStart+suffix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isNoUsableE2EEGroupKeyTalkException(message string, data talkExceptionData) bool {
