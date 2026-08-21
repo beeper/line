@@ -20,6 +20,61 @@ type mentionTestMatrix struct {
 	ghosts map[id.UserID]networkid.UserID
 }
 
+func TestEffectiveLineMessageType(t *testing.T) {
+	tests := []struct {
+		name    string
+		content *event.MessageEventContent
+		want    event.MessageType
+	}{
+		{
+			name: "desktop raw GIF",
+			content: &event.MessageEventContent{
+				MsgType: event.MsgVideo,
+				Info: &event.FileInfo{
+					MimeType: "image/gif",
+					MauGIF:   true,
+				},
+			},
+			want: event.MsgImage,
+		},
+		{
+			name: "video-backed GIF remains video",
+			content: &event.MessageEventContent{
+				MsgType: event.MsgVideo,
+				Info: &event.FileInfo{
+					MimeType: "video/mp4",
+					MauGIF:   true,
+				},
+			},
+			want: event.MsgVideo,
+		},
+		{
+			name: "GIF file upload",
+			content: &event.MessageEventContent{
+				MsgType: event.MsgFile,
+				Info:    &event.FileInfo{MimeType: "image/gif"},
+			},
+			want: event.MsgImage,
+		},
+		{
+			name: "ordinary video",
+			content: &event.MessageEventContent{
+				MsgType: event.MsgVideo,
+				Info:    &event.FileInfo{MimeType: "video/mp4"},
+			},
+			want: event.MsgVideo,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := effectiveLineMessageType(test.content); got != test.want {
+				t.Fatalf("effectiveLineMessageType() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
 func (matrix *mentionTestMatrix) ParseGhostMXID(userID id.UserID) (networkid.UserID, bool) {
 	ghostID, ok := matrix.ghosts[userID]
 	return ghostID, ok

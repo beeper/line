@@ -16,6 +16,7 @@ func TestCapabilitiesAdvertiseFileSizeLimit(t *testing.T) {
 		event.MsgVideo,
 		event.MsgAudio,
 		event.CapMsgVoice,
+		event.CapMsgGIF,
 	} {
 		features := caps.File[messageType]
 		if features == nil {
@@ -24,5 +25,19 @@ func TestCapabilitiesAdvertiseFileSizeLimit(t *testing.T) {
 		if features.MaxSize != wantMaxFileSize {
 			t.Errorf("%s MaxSize = %d, want %d", messageType, features.MaxSize, wantMaxFileSize)
 		}
+	}
+}
+
+func TestCapabilitiesAdvertiseRawGIFSupport(t *testing.T) {
+	caps := (&LineClient{}).GetCapabilities(context.Background(), nil)
+	features := caps.File[event.CapMsgGIF]
+	if features == nil {
+		t.Fatal("GIF file features are missing")
+	}
+	if got := features.MimeTypes["image/gif"]; got != event.CapLevelFullySupported {
+		t.Fatalf("image/gif support = %v, want %v", got, event.CapLevelFullySupported)
+	}
+	if len(features.MimeTypes) != 1 {
+		t.Fatalf("GIF MIME type count = %d, want 1", len(features.MimeTypes))
 	}
 }

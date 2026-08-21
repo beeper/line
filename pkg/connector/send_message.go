@@ -57,6 +57,26 @@ func lineGroupE2EEFetchFailureError(err error) error {
 	return err
 }
 
+func effectiveLineMessageType(content *event.MessageEventContent) event.MessageType {
+	effectiveMsgType := content.MsgType
+	// Beeper Desktop represents GIFs as m.video with fi.mau.gif. Raw GIF data can
+	// use LINE's existing image path without media conversion.
+	if content.GetCapMsgType() == event.CapMsgGIF && content.Info != nil && content.Info.MimeType == "image/gif" {
+		return event.MsgImage
+	}
+	if effectiveMsgType == event.MsgFile && content.Info != nil {
+		mime := content.Info.MimeType
+		if strings.HasPrefix(mime, "audio/") {
+			return event.MsgAudio
+		} else if strings.HasPrefix(mime, "video/") {
+			return event.MsgVideo
+		} else if strings.HasPrefix(mime, "image/") {
+			return event.MsgImage
+		}
+	}
+	return effectiveMsgType
+}
+
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
@@ -119,20 +139,10 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata["e2eeVersion"] = "2"
 	}
 
-	// Detect media files sent as MsgFile and handle them with the correct LINE content type.
-	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
-	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
-	effectiveMsgType := msg.Content.MsgType
-	if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
-		mime := msg.Content.Info.MimeType
-		if strings.HasPrefix(mime, "audio/") {
-			effectiveMsgType = event.MsgAudio
-		} else if strings.HasPrefix(mime, "video/") {
-			effectiveMsgType = event.MsgVideo
-		} else if strings.HasPrefix(mime, "image/") {
-			effectiveMsgType = event.MsgImage
-		}
-	}
+	// Normalize special GIF events and media files sent as MsgFile to the correct LINE content
+	// type. Matrix clients often use MsgFile for drag-and-drop media, which would otherwise be
+	// sent as ContentFile (14).
+	effectiveMsgType := effectiveLineMessageType(msg.Content)
 
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
 	// This must happen before media processing since it affects the upload path.
