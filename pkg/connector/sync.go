@@ -1154,8 +1154,13 @@ func (lc *LineClient) cacheGroupMembersFromSystemMessage(msg *line.Message) {
 		lc.addGroupMembersToCache(chatMid, append(midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"]), msg.From)...)
 	case "C_MJ", "A_MJ":
 		lc.addGroupMembersToCache(chatMid, msg.From)
-	case "C_ML", "A_ML", "C_MR", "A_MR":
+	case "C_ML", "A_ML":
 		lc.removeGroupMemberFromCache(chatMid, msg.From)
+	case "C_MR", "A_MR":
+		_, removedMID, ok := memberRemovalMIDs(msg)
+		if ok {
+			lc.removeGroupMemberFromCache(chatMid, removedMID)
+		}
 	case "C_IC":
 		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
 		if len(parts) == 2 {
@@ -1205,6 +1210,23 @@ func midsFromSystemLocArgs(locArgs string) []string {
 		}
 	}
 	return mids
+}
+
+// memberRemovalMIDs returns the actor and target encoded by LINE's C_MR/A_MR
+// system records. msg.From is the member who performed the removal, while
+// LOC_ARGS contains the removed member MID (and may also repeat the actor MID).
+func memberRemovalMIDs(msg *line.Message) (removerMID, removedMID string, ok bool) {
+	if msg == nil || !isUserMID(msg.From) || msg.ContentMetadata == nil {
+		return "", "", false
+	}
+	removerMID = msg.From
+	mids := midsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"])
+	for i := len(mids) - 1; i >= 0; i-- {
+		if mids[i] != removerMID {
+			return removerMID, mids[i], true
+		}
+	}
+	return "", "", false
 }
 
 func isUserMID(mid string) bool {
@@ -2374,8 +2396,11 @@ func isHandledSystemMessage(msg *line.Message) bool {
 	case "C_PN":
 		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
 		return len(parts) == 2 && parts[1] != ""
-	case "C_MJ", "A_MJ", "C_ML", "A_ML", "C_MR", "A_MR", "A_MC":
+	case "C_MJ", "A_MJ", "C_ML", "A_ML", "A_MC":
 		return msg.From != ""
+	case "C_MR", "A_MR":
+		_, _, ok := memberRemovalMIDs(msg)
+		return ok
 	case "C_GI", "C_MI", "A_MI", "C_IC":
 		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
 		return len(parts) == 2 && parts[1] != ""
@@ -2431,12 +2456,18 @@ func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.Cha
 		leaver := lc.eventSenderForMID(msg.From)
 		return makeMemberChangeEvent(portalKey, leaver, leaver, event.MembershipLeave, ts, false), true
 	case "C_MR", "A_MR":
-		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("removed_mid", msg.From).Msg("System message: member removed")
-		lc.removeGroupMemberFromCache(msg.To, msg.From)
+		removerMID, removedMID, _ := memberRemovalMIDs(msg)
+		lc.UserLogin.Bridge.Log.Debug().
+			Str("loc_key", locKey).
+			Str("chat_mid", msg.To).
+			Str("remover_mid", removerMID).
+			Str("removed_mid", removedMID).
+			Msg("System message: member removed")
+		lc.removeGroupMemberFromCache(msg.To, removedMID)
 		return makeMemberChangeEvent(
 			portalKey,
-			lc.eventSenderForMID(msg.From),
-			bridgev2.EventSender{},
+			lc.eventSenderForMID(removedMID),
+			lc.eventSenderForMID(removerMID),
 			event.MembershipLeave,
 			ts,
 			false,
