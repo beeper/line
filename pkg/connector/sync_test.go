@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -119,6 +120,153 @@ func TestMakeSystemMessageEventForHistoricalMembership(t *testing.T) {
 	leaveChange, ok := leave.ChatInfoChange.MemberChanges.MemberMap["Uleaver"]
 	if !ok || leaveChange.Membership != event.MembershipLeave {
 		t.Fatalf("leave member change = %#v", leave.ChatInfoChange.MemberChanges.MemberMap)
+	}
+}
+
+func TestMemberRemovalSystemMessageAttribution(t *testing.T) {
+	tests := []struct {
+		name           string
+		locKey         string
+		fromMID        string
+		locArgs        string
+		removedMID     string
+		senderIsFromMe bool
+	}{
+		{
+			name:           "connected user removes another member",
+			locKey:         "C_MR",
+			fromMID:        "Uself",
+			locArgs:        "Uself\x1eUremoved",
+			removedMID:     "Uremoved",
+			senderIsFromMe: true,
+		},
+		{
+			name:       "another member removes connected user",
+			locKey:     "A_MR",
+			fromMID:    "Uremover",
+			locArgs:    "Uself",
+			removedMID: "Uself",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lc := &LineClient{
+				Mid: "Uself",
+				UserLogin: &bridgev2.UserLogin{
+					UserLogin: &database.UserLogin{ID: "Uself"},
+					Bridge:    &bridgev2.Bridge{Log: zerolog.Nop()},
+				},
+				groupMemberCache: map[string][]string{
+					"Cgroup": {"Uself", "Uremover", "Uremoved"},
+				},
+			}
+
+			removal, handled := lc.makeSystemMessageEvent(line.Operation{Message: &line.Message{
+				ID:          "remove-message",
+				From:        test.fromMID,
+				To:          "Cgroup",
+				ContentType: int(ContentSystem),
+				CreatedTime: json.Number("1784930400123"),
+				ContentMetadata: map[string]string{
+					"LOC_KEY":  test.locKey,
+					"LOC_ARGS": test.locArgs,
+				},
+			}})
+			if !handled || removal == nil {
+				t.Fatalf("removal handled/event = %v/%#v, want true/non-nil", handled, removal)
+			}
+			if removal.EventMeta.Sender.Sender != networkid.UserID(test.fromMID) || removal.EventMeta.Sender.IsFromMe != test.senderIsFromMe {
+				t.Fatalf("removal sender = %#v, want MID %q with IsFromMe=%v", removal.EventMeta.Sender, test.fromMID, test.senderIsFromMe)
+			}
+			if changes := removal.ChatInfoChange.MemberChanges.MemberMap; len(changes) != 1 {
+				t.Fatalf("member changes = %#v, want exactly one", changes)
+			} else if change, ok := changes[networkid.UserID(test.removedMID)]; !ok {
+				t.Fatalf("removed member %q missing from %#v", test.removedMID, changes)
+			} else if change.Membership != event.MembershipLeave || change.EventSender.Sender != networkid.UserID(test.removedMID) {
+				t.Fatalf("removed member change = %#v", change)
+			}
+
+			members := lc.getCachedGroupMembers("Cgroup")
+			if slices.Contains(members, test.removedMID) {
+				t.Fatalf("removed member %q remained cached: %v", test.removedMID, members)
+			}
+			if test.fromMID != test.removedMID && !slices.Contains(members, test.fromMID) {
+				t.Fatalf("remover %q was incorrectly evicted: %v", test.fromMID, members)
+			}
+		})
+	}
+}
+
+func TestMemberRemovalSystemMessageCacheTarget(t *testing.T) {
+	for _, locKey := range []string{"C_MR", "A_MR"} {
+		t.Run(locKey, func(t *testing.T) {
+			lc := &LineClient{
+				Mid: "Uself",
+				groupMemberCache: map[string][]string{
+					"Cgroup": {"Uself", "Uremoved"},
+				},
+			}
+			lc.cacheGroupMembersFromSystemMessage(&line.Message{
+				From:        "Uself",
+				To:          "Cgroup",
+				ContentType: int(ContentSystem),
+				ContentMetadata: map[string]string{
+					"LOC_KEY":  locKey,
+					"LOC_ARGS": "Uself\x1eUremoved",
+				},
+			})
+
+			members := lc.getCachedGroupMembers("Cgroup")
+			if slices.Contains(members, "Uremoved") {
+				t.Fatalf("removed member remained cached: %v", members)
+			}
+			if !slices.Contains(members, "Uself") {
+				t.Fatalf("connected remover was incorrectly evicted: %v", members)
+			}
+		})
+	}
+}
+
+func TestMemberRemovalSystemMessageValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		fromMID string
+		locArgs string
+	}{
+		{name: "missing target", fromMID: "Uremover"},
+		{name: "only repeats remover", fromMID: "Uremover", locArgs: "Uremover"},
+		{name: "target is not a user MID", fromMID: "Uremover", locArgs: "not-a-mid"},
+		{name: "remover is not a user MID", fromMID: "Cgroup", locArgs: "Uremoved"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			msg := &line.Message{
+				From:        test.fromMID,
+				To:          "Cgroup",
+				ContentType: int(ContentSystem),
+				ContentMetadata: map[string]string{
+					"LOC_KEY":  "C_MR",
+					"LOC_ARGS": test.locArgs,
+				},
+			}
+			if isHandledSystemMessage(msg) {
+				t.Fatal("malformed removal was unexpectedly accepted")
+			}
+		})
+	}
+
+	valid := &line.Message{
+		From:        "Uremover",
+		To:          "Cgroup",
+		ContentType: int(ContentSystem),
+		ContentMetadata: map[string]string{
+			"LOC_KEY":  "A_MR",
+			"LOC_ARGS": "Uremoved",
+		},
+	}
+	if !isHandledSystemMessage(valid) {
+		t.Fatal("valid removal with a distinct target was rejected")
 	}
 }
 
