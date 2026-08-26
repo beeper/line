@@ -291,7 +291,7 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 			Members: &bridgev2.ChatMemberList{
 				IsFull:                     true,
 				ExcludeChangesFromTimeline: true,
-				Members: []bridgev2.ChatMember{
+				MemberMap: chatMemberMapFromList([]bridgev2.ChatMember{
 					{
 						EventSender: bridgev2.EventSender{
 							IsFromMe: true,
@@ -307,7 +307,7 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 						Membership: event.MembershipJoin,
 						PowerLevel: ptr.Ptr(0),
 					},
-				},
+				}),
 			},
 			ExcludeChangesFromTimeline: true,
 		},
@@ -1417,13 +1417,13 @@ func (lc *LineClient) hiddenJoinGroupMessageSender(ctx context.Context, portal *
 	portal.ProcessChatInfoChange(ctx, bridgev2.EventSender{}, lc.UserLogin, &bridgev2.ChatInfoChange{
 		MemberChanges: &bridgev2.ChatMemberList{
 			ExcludeChangesFromTimeline: true,
-			Members: []bridgev2.ChatMember{
+			MemberMap: chatMemberMapFromList([]bridgev2.ChatMember{
 				{
 					EventSender:      bridgev2.EventSender{Sender: makeUserID(senderMid)},
 					Membership:       event.MembershipJoin,
 					MemberEventExtra: hiddenMemberEventExtra(true),
 				},
-			},
+			}),
 		},
 	}, ts)
 }

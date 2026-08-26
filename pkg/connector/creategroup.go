@@ -124,8 +124,8 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 			Type: &ct,
 			Name: &chatName,
 			Members: &bridgev2.ChatMemberList{
-				IsFull:  true,
-				Members: members,
+				IsFull:    true,
+				MemberMap: chatMemberMapFromList(members),
 			},
 		},
 	}, nil

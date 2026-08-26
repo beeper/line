@@ -24,6 +24,7 @@ func EncryptPassword(email, password, sessionKey, nHex, eHex string) (string, er
 	}
 
 	// 3. Encrypt using RSA-PKCS1-v1.5
+	//lint:ignore SA1019 LINE's login protocol requires RSA PKCS #1 v1.5 encryption.
 	encryptedBytes, err := rsa.EncryptPKCS1v15(rand.Reader, pubKey, payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt payload: %w", err)
