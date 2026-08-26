@@ -87,6 +87,31 @@ func TestInitDisablesManagementRoomBridgeStatusNotices(t *testing.T) {
 	}
 }
 
+func TestStartSupportsMatrixConnectorWithoutServer(t *testing.T) {
+	matrix := &bridgeStateTestMatrix{}
+	if _, ok := any(matrix).(bridgev2.MatrixConnectorWithServer); ok {
+		t.Fatal("test Matrix connector unexpectedly implements MatrixConnectorWithServer")
+	}
+
+	bridge := &bridgev2.Bridge{
+		Config: &bridgeconfig.BridgeConfig{},
+		Matrix: matrix,
+	}
+	connector := &LineConnector{}
+	connector.Init(bridge)
+
+	if err := connector.Start(context.Background()); err != nil {
+		t.Fatalf("Start rejected a Matrix connector without a server: %v", err)
+	}
+}
+
+func TestGetNameUsesCanonicalBeeperBridgeType(t *testing.T) {
+	name := (&LineConnector{}).GetName()
+	if name.BeeperBridgeType != "line" {
+		t.Fatalf("BeeperBridgeType = %q, want line", name.BeeperBridgeType)
+	}
+}
+
 func TestBridgeStateUpdatesDoNotUseManagementRoom(t *testing.T) {
 	tests := map[string]id.RoomID{
 		"room must not be created":   "",

@@ -41,11 +41,7 @@ func (lc *LineConnector) Init(bridge *bridgev2.Bridge) {
 	lc.br = bridge
 }
 
-func (lc *LineConnector) Start(ctx context.Context) error {
-	_, ok := lc.br.Matrix.(bridgev2.MatrixConnectorWithServer)
-	if !ok {
-		return fmt.Errorf("matrix connector does not implement MatrixConnectorWithServer")
-	}
+func (lc *LineConnector) Start(context.Context) error {
 	return nil
 }
 
@@ -88,7 +84,7 @@ func (lc *LineConnector) GetName() bridgev2.BridgeName {
 		NetworkURL:       "https://line.me",
 		NetworkIcon:      "",
 		NetworkID:        "line",
-		BeeperBridgeType: "github.com/highesttt/matrix-line-messenger",
+		BeeperBridgeType: "line",
 		DefaultPort:      29322,
 	}
 }
