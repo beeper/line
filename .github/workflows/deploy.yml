@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ["1.25"]
+        go-version: ["1.26"]
     name: Lint with ${{ matrix.go-version }}
 
     steps:
@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ["1.25"]
+        go-version: ["1.26"]
     name: Build ${{ matrix.go-version }}
 
     steps:

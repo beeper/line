@@ -10,7 +10,7 @@ The bridge identifies as a LINE Chrome Extension client, so it cannot coexist wi
 
 ## Build & Development
 
-**Requirements:** Go 1.25+, libolm (`libolm-dev` on Ubuntu, `olm` via Homebrew on macOS)
+**Requirements:** Go 1.26+, libolm (`libolm-dev` on Ubuntu, `olm` via Homebrew on macOS)
 
 **Build:**
 ```bash

@@ -171,7 +171,7 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 		Avatar: lc.avatarFromPicturePath(contact.PicturePath),
 		Members: &bridgev2.ChatMemberList{
 			IsFull: true,
-			Members: []bridgev2.ChatMember{
+			MemberMap: chatMemberMapFromList([]bridgev2.ChatMember{
 				{
 					EventSender: bridgev2.EventSender{
 						IsFromMe: true,
@@ -187,7 +187,7 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 					Membership: event.MembershipJoin,
 					PowerLevel: ptr.Ptr(0),
 				},
-			},
+			}),
 		},
 	}, nil
 }

@@ -2,9 +2,9 @@
 
 ARG DOCKER_HUB="docker.io"
 
-FROM ${DOCKER_HUB}/alpine:3.23 AS builder
+FROM ${DOCKER_HUB}/golang:1.26-alpine3.23 AS builder
 
-RUN apk add --no-cache go git build-base olm-dev
+RUN apk add --no-cache git build-base olm-dev
 
 WORKDIR /build
 ENV GOPATH=/go \
