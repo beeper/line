@@ -26,6 +26,8 @@ const (
 	OpUnblockContact         OperationType = 7
 )
 
+const OpNotifiedDeleteOtherFromChat OperationType = 133
+
 // ContentType values for LINE messages.
 type ContentType int
 
