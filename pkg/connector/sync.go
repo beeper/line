@@ -1888,6 +1888,16 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpDeleteOtherFromChat:
 		lc.handleMemberLeave(op.Param1, op.Param2)
 
+	case OpNotifiedDeleteOtherFromChat:
+		removal, ok := lc.makeNotifiedMemberRemovalEvent(op)
+		if !ok {
+			lc.UserLogin.Bridge.Log.Warn().
+				Int("op_type", op.Type).
+				Msg("Ignoring malformed notified member removal")
+			return
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, removal)
+
 	case OpNotifiedLeaveChat:
 		lower1 := strings.ToLower(op.Param1)
 		if strings.HasPrefix(lower1, "c") || strings.HasPrefix(lower1, "r") {
@@ -2279,6 +2289,30 @@ func (lc *LineClient) handleMemberLeave(chatMid, leaverMid string) {
 
 func (lc *LineClient) handleMemberLeft(chatMid, leaverMid string) {
 	lc.handleMemberLeaveWithSender(chatMid, leaverMid, lc.eventSenderForMID(leaverMid))
+}
+
+func (lc *LineClient) makeNotifiedMemberRemovalEvent(op line.Operation) (*simplevent.ChatInfoChange, bool) {
+	if OperationType(op.Type) != OpNotifiedDeleteOtherFromChat ||
+		!isChatMID(op.Param1) ||
+		!isUserMID(op.Param2) ||
+		!isUserMID(op.Param3) ||
+		op.Param2 == op.Param3 {
+		return nil, false
+	}
+
+	ts := time.Now()
+	if timestamp, err := op.CreatedTime.Int64(); err == nil && timestamp > 0 {
+		ts = time.UnixMilli(timestamp)
+	}
+	lc.removeGroupMemberFromCache(op.Param1, op.Param3)
+	return makeMemberChangeEvent(
+		networkid.PortalKey{ID: makePortalID(op.Param1), Receiver: lc.UserLogin.ID},
+		lc.eventSenderForMID(op.Param3),
+		lc.eventSenderForMID(op.Param2),
+		event.MembershipLeave,
+		ts,
+		false,
+	), true
 }
 
 func (lc *LineClient) handleMemberLeaveWithSender(chatMid, leaverMid string, changeSender bridgev2.EventSender) {
