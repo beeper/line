@@ -123,6 +123,14 @@ func TestLineGroupE2EEFetchFailureErrorAllowsNoUsableGroupKeyFallback(t *testing
 	}
 }
 
+func TestLineGroupE2EEFetchFailureErrorAllowsOversizedGroupFallback(t *testing.T) {
+	registerErr := errors.New(`registerE2EEGroupKey failed: API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":100,"reason":"exceed max member","parameterMap":{}}}`)
+	err := lineGroupE2EEFetchFailureError(fmt.Errorf("auto-register group key: %w", registerErr))
+	if err != nil {
+		t.Fatalf("err = %v, want nil to allow plaintext fallback", err)
+	}
+}
+
 func TestLineGroupE2EEFetchFailureErrorWrapsMissingPrivateKeyStatus(t *testing.T) {
 	err := lineGroupE2EEFetchFailureError(fmt.Errorf("failed to unwrap group key: %w", e2ee.ErrMissingOwnPrivateKey))
 	var status bridgev2.MessageStatus
