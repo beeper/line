@@ -129,11 +129,14 @@ func IsNoUsableE2EEGroupKey(err error) bool {
 		return true
 	}
 	// Detect TalkException codes in raw API error strings (HTTP 400 with code 10051).
-	// Code 98 = member has LS off; Code 1 = auth failed.
+	// Code 98 = member has LS off; Code 1 = auth failed;
+	// Code 100 "exceed max member" = the group is too large for key registration.
 	// NOTE: Code 5 "not found" is handled by IsGroupKeyNotFound (auto-register), NOT here.
-	if strings.Contains(msg, "\"code\":10051") && strings.Contains(msg, "talkexception") {
+	if hasResponseErrorCode(msg) && strings.Contains(msg, "talkexception") {
 		if strings.Contains(msg, "\"code\":98,") || strings.Contains(msg, "\"code\":98}") ||
-			strings.Contains(msg, "\"code\":1,") || strings.Contains(msg, "\"code\":1}") {
+			strings.Contains(msg, "\"code\":1,") || strings.Contains(msg, "\"code\":1}") ||
+			(hasJSONCode(msg, 100) && (strings.Contains(msg, `"reason":"exceed max member"`) ||
+				strings.Contains(msg, `"reason": "exceed max member"`))) {
 			return true
 		}
 	}
@@ -222,8 +225,10 @@ func isNoUsableE2EEGroupKeyTalkException(message string, data talkExceptionData)
 	}
 	// Error 5 "not found" = no group shared key exists
 	// Error 98 "member settings off" = at least one member has LS disabled
+	// Error 100 "exceed max member" = the group is too large for key registration
 	return (data.Code == 5 && strings.EqualFold(data.Reason, "not found")) ||
-		(data.Code == 98 && strings.Contains(strings.ToLower(data.Reason), "member settings off"))
+		(data.Code == 98 && strings.Contains(strings.ToLower(data.Reason), "member settings off")) ||
+		(data.Code == 100 && strings.EqualFold(strings.TrimSpace(data.Reason), "exceed max member"))
 }
 
 func parseTalkExceptionData(raw json.RawMessage) talkExceptionData {

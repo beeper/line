@@ -121,3 +121,30 @@ func TestIsTalkExceptionNotFound(t *testing.T) {
 		t.Fatal("nil should not be classified as not-found")
 	}
 }
+
+func TestIsNoUsableE2EEGroupKeyExceedMaxMember(t *testing.T) {
+	err := errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":100,"reason":"exceed max member","parameterMap":{}}}`)
+	if !IsNoUsableE2EEGroupKey(err) {
+		t.Fatal("expected exceed max member to disable group E2EE")
+	}
+
+	otherCode100 := errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","message":"TalkException","code":100,"reason":"different reason","parameterMap":{}}}`)
+	if IsNoUsableE2EEGroupKey(otherCode100) {
+		t.Fatal("unrelated TalkException code 100 must not disable group E2EE")
+	}
+
+	phraseOutsideReason := errors.New(`API error 400: {"code":10051,"message":"exceed max member","data":{"name":"TalkException","code":100,"reason":"different reason"}}`)
+	if IsNoUsableE2EEGroupKey(phraseOutsideReason) {
+		t.Fatal("exceed max member outside the reason field must not disable group E2EE")
+	}
+}
+
+func TestNoUsableE2EEGroupKeyTalkExceptionExceedMaxMember(t *testing.T) {
+	if !isNoUsableE2EEGroupKeyTalkException("RESPONSE_ERROR", talkExceptionData{
+		Name:   "TalkException",
+		Code:   100,
+		Reason: "exceed max member",
+	}) {
+		t.Fatal("expected structured exceed max member response to disable group E2EE")
+	}
+}
