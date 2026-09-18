@@ -18,7 +18,6 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 		return oversized, nil
 	}
 
-	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
 
@@ -41,6 +40,21 @@ func (h *Handler) ConvertFile(ctx context.Context, portal *bridgev2.Portal, inte
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	if h.GenerateDirectMediaURI != nil {
+		directMedia, err := newDirectMedia(
+			"file", oid, "", sid, downloadOptions, decryptedBody, data.ContentMetadata,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
+			MsgType: event.MsgFile, RelatesTo: relatesTo,
+		}); converted != nil || err != nil {
+			return converted, err
+		}
+	}
+
+	client := h.NewClient()
 	fileData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
 	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {

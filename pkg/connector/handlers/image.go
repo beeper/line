@@ -18,7 +18,6 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	client := h.NewClient()
 	downloadSource := lineImageDownloadSource(data)
 	if downloadSource.publicPath == "" && downloadSource.oid == "" {
 		return nil, nil
@@ -27,7 +26,28 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	mediaCategory := lineMediaCategory(data.ContentMetadata)
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, downloadSource.isPlainMedia)
 	talkMetaMessageID := obsTalkMetaMessageID(data.ID, downloadSource.isPlainMedia)
+	sid := "emi"
+	if downloadSource.isPlainMedia {
+		sid = "m"
+	} else if downloadSource.publicPath != "" {
+		sid = ""
+	}
+	if h.GenerateDirectMediaURI != nil {
+		directMedia, err := newDirectMedia(
+			"image", downloadSource.oid, downloadSource.publicPath, sid, downloadOptions,
+			decryptedBody, data.ContentMetadata,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
+			MsgType: event.MsgImage, RelatesTo: relatesTo,
+		}); converted != nil || err != nil {
+			return converted, err
+		}
+	}
 
+	client := h.NewClient()
 	var imgData []byte
 	var err error
 	dlStart := time.Now()

@@ -20,6 +20,11 @@ type Handler struct {
 	Log        zerolog.Logger
 	HTTPClient *http.Client
 
+	// GenerateDirectMediaURI is set when bridgev2 direct media is enabled. It
+	// returns both the Matrix content URI and the DB metadata that must be stored
+	// with the converted message part.
+	GenerateDirectMediaURI GenerateDirectMediaURI
+
 	// RecoverClient classifies auth errors using the client that made the failed
 	// request, and returns a client that may be used for one retry.
 	RecoverClient func(ctx context.Context, failedClient *line.Client, err error) (*line.Client, error)
@@ -38,17 +43,25 @@ type Handler struct {
 }
 
 func (h *Handler) decryptDownloadedMedia(data []byte, decryptedBody string, metadata map[string]string, kind string) ([]byte, error) {
+	keys, encrypted, err := mediaDecryptionKeys(decryptedBody, metadata, kind)
+	if err != nil {
+		return nil, err
+	}
+	return h.decryptMediaWithKeys(data, keys, encrypted, kind)
+}
+
+func mediaDecryptionKeys(decryptedBody string, metadata map[string]string, kind string) ([]string, bool, error) {
 	var bodyKey string
 	var bodyKeyDeclared bool
 	if strings.Contains(decryptedBody, "keyMaterial") {
 		var decryptInfo map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(decryptedBody), &decryptInfo); err != nil {
-			return nil, fmt.Errorf("%w: failed to parse encrypted %s payload: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), err)
+			return nil, false, fmt.Errorf("%w: failed to parse encrypted %s payload: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), err)
 		}
 		if rawKey, ok := decryptInfo["keyMaterial"]; ok {
 			bodyKeyDeclared = true
 			if err := json.Unmarshal(rawKey, &bodyKey); err != nil {
-				return nil, fmt.Errorf("%w: failed to parse encrypted %s key material: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), err)
+				return nil, false, fmt.Errorf("%w: failed to parse encrypted %s key material: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), err)
 			}
 		}
 	}
@@ -63,9 +76,19 @@ func (h *Handler) decryptDownloadedMedia(data []byte, decryptedBody string, meta
 	}
 	if len(keys) == 0 {
 		if bodyKeyDeclared || metadataKeyDeclared {
-			return nil, fmt.Errorf("%w: encrypted %s has no usable media key", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))
+			return nil, true, fmt.Errorf("%w: encrypted %s has no usable media key", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))
 		}
+		return nil, false, nil
+	}
+	return keys, true, nil
+}
+
+func (h *Handler) decryptMediaWithKeys(data []byte, keys []string, encrypted bool, kind string) ([]byte, error) {
+	if !encrypted {
 		return data, nil
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%w: encrypted %s has no usable media key", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))
 	}
 	if h.DecryptMedia == nil {
 		return nil, fmt.Errorf("%w: encrypted %s has no media decryptor", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))

@@ -20,7 +20,6 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	client := h.NewClient()
 	oid := data.ContentMetadata["OID"]
 	isPlainMedia := oid == ""
 
@@ -51,6 +50,21 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	if h.GenerateDirectMediaURI != nil {
+		directMedia, err := newDirectMedia(
+			"video", oid, "", sid, downloadOptions, decryptedBody, data.ContentMetadata,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
+			MsgType: event.MsgVideo, RelatesTo: relatesTo,
+		}); converted != nil || err != nil {
+			return converted, err
+		}
+	}
+
+	client := h.NewClient()
 	dlStart := time.Now()
 	videoData, err := client.DownloadOBSWithSIDOptions(ctx, oid, talkMetaMessageID, sid, downloadOptions)
 
