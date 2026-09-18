@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/util/configupgrade"
@@ -29,6 +30,7 @@ const (
 type LineConnector struct {
 	br              *bridgev2.Bridge
 	loginFinalizeMu sync.Mutex
+	directMedia     atomic.Bool
 }
 
 var _ bridgev2.NetworkConnector = (*LineConnector)(nil)
@@ -99,9 +101,11 @@ func (lc *LineConnector) GetConfig() (example string, data any, upgrader configu
 
 func (lc *LineConnector) GetDBMetaTypes() database.MetaTypes {
 	return database.MetaTypes{
-		Portal:  nil,
-		Ghost:   nil,
-		Message: nil,
+		Portal: nil,
+		Ghost:  nil,
+		Message: func() any {
+			return &MessageMetadata{}
+		},
 		Reaction: func() any {
 			return &ReactionMetadata{}
 		},

@@ -30,13 +30,28 @@ const (
 )
 
 func (lc *LineClient) newMessageHandler() *handlers.Handler {
-	return &handlers.Handler{
+	handler := &handlers.Handler{
 		Log:           lc.UserLogin.Bridge.Log,
 		HTTPClient:    lc.HTTPClient,
 		RecoverClient: lc.recoverClientAfterAuthError,
 		NewClient:     func() *line.Client { return lc.newClient() },
 		DecryptMedia:  lc.decryptImageData,
 	}
+	connector, ok := lc.UserLogin.Bridge.Network.(*LineConnector)
+	if ok && connector.directMedia.Load() {
+		handler.GenerateDirectMediaURI = func(ctx context.Context, messageID string, metadata *handlers.DirectMedia) (id.ContentURIString, any, error) {
+			mediaID, err := makeLineDirectMediaID(lc.UserLogin.ID, networkid.MessageID(messageID))
+			if err != nil {
+				return "", nil, err
+			}
+			uri, err := lc.UserLogin.Bridge.Matrix.GenerateContentURI(ctx, mediaID)
+			if err != nil {
+				return "", nil, fmt.Errorf("failed to generate LINE direct media URI: %w", err)
+			}
+			return uri, &MessageMetadata{DirectMedia: metadata}, nil
+		}
+	}
+	return handler
 }
 
 func e2eeChunkLengths(chunks []string) []int {
