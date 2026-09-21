@@ -2,6 +2,7 @@ package connector
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -15,11 +16,77 @@ import (
 	_ "image/png"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/image/draw"
 )
+
+func isHEICImage(mimeType, fileName string) bool {
+	mimeType, _, _ = strings.Cut(strings.ToLower(mimeType), ";")
+	switch strings.TrimSpace(mimeType) {
+	case "image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence":
+		return true
+	}
+	extension := strings.ToLower(filepath.Ext(fileName))
+	return extension == ".heic" || extension == ".heif"
+}
+
+func jpegFileName(fileName string) string {
+	if fileName == "" {
+		return "image.jpg"
+	}
+	return strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+}
+
+func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	input, err := os.CreateTemp("", "line-image-*.heic")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary HEIC file: %w", err)
+	}
+	inputPath := input.Name()
+	defer os.Remove(inputPath)
+
+	if _, err = input.Write(imageData); err != nil {
+		input.Close()
+		return nil, fmt.Errorf("failed to write temporary HEIC file: %w", err)
+	}
+	if err = input.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close temporary HEIC file: %w", err)
+	}
+
+	var output bytes.Buffer
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-i", inputPath,
+		"-frames:v", "1", "-q:v", "2",
+		"-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+	)
+	cmd.Stdout = &output
+	err = cmd.Run()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("ffmpeg failed: %w", ctxErr)
+		}
+		return nil, fmt.Errorf("ffmpeg failed: %w", err)
+	}
+
+	jpegData := output.Bytes()
+	config, format, err := image.DecodeConfig(bytes.NewReader(jpegData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate converted JPEG: %w", err)
+	}
+	if format != "jpeg" || config.Width <= 0 || config.Height <= 0 {
+		return nil, fmt.Errorf("ffmpeg produced invalid JPEG output")
+	}
+	return jpegData, nil
+}
 
 // AES-256-CTR
 // LINE's E2EE file format: [encrypted_data][32-byte HMAC]
