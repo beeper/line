@@ -186,6 +186,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		mimeType := msg.Content.Info.MimeType
+		fileName := msg.Content.GetFileName()
+		if isHEICImage(mimeType, fileName) {
+			data, err = convertHEICToJPEG(ctx, data)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert HEIC image to JPEG: %w", err)
+			}
+			mimeType = "image/jpeg"
+			fileName = jpegFileName(fileName)
+		}
 		isGif := mimeType == "image/gif"
 		isAnimated := isGif && isAnimatedGif(data)
 
@@ -219,7 +228,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 
-			fileName := msg.Content.GetFileName()
 			if fileName == "" {
 				fileName = "image." + extension
 			}
@@ -293,7 +301,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 			contentMetadata["ENC_KM"] = keyMaterialB64
 
-			fileName := msg.Content.GetFileName()
 			if fileName == "" {
 				fileName = "image." + extension
 			}
