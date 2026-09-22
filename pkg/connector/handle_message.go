@@ -287,6 +287,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Failed to fetch/unwrap group key")
+							lc.markMissingE2EEKey(context.Background(), errFetch)
 						} else if ptRetry, _, errRetry := lc.E2EE.DecryptGroupMessage(msg, portalIDStr); errRetry == nil {
 							bodyText = ptRetry
 							decryptionFailed = false
