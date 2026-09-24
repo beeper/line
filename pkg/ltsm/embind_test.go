@@ -466,3 +466,40 @@ func TestCurve25519KeyGenerate(t *testing.T) {
 		t.Errorf("expected 32-byte public key, got %d bytes", len(pubKey))
 	}
 }
+
+func TestCallIndirectConvertsPanicToError(t *testing.T) {
+	_, imp := initModule(t)
+
+	// A nil argTypes slice panics inside the dispatch; the fatal panic must
+	// be converted to an error and mark the runtime dead.
+	ret, err := imp.callIndirect(0, nil, nil)
+	if ret != 0 {
+		t.Fatalf("ret = %d, want 0", ret)
+	}
+	if err == nil {
+		t.Fatal("expected error from recovered panic")
+	}
+	if !imp.dead {
+		t.Fatal("runtime not marked dead after recovered panic")
+	}
+}
+
+func TestDeadRuntimeFailsFast(t *testing.T) {
+	_, imp := initModule(t)
+
+	imp.markDead(ErrAbort)
+	imp.markDead("second fatal error") // first fatal error wins
+
+	if _, err := imp.CallMethod("SecureKey", "loadToken", 0); !errors.Is(err, ErrAbort) {
+		t.Fatalf("CallMethod on dead runtime: %v", err)
+	}
+	if _, err := imp.CallStatic("SecureKey", "loadToken", 0); !errors.Is(err, ErrAbort) {
+		t.Fatalf("CallStatic on dead runtime: %v", err)
+	}
+	if _, err := imp.Construct("Hmac"); !errors.Is(err, ErrAbort) {
+		t.Fatalf("Construct on dead runtime: %v", err)
+	}
+	if err := imp.Destroy("SecureKey", 1); !errors.Is(err, ErrAbort) {
+		t.Fatalf("Destroy on dead runtime: %v", err)
+	}
+}

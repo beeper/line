@@ -151,6 +151,11 @@ type Imports struct {
 	classByName map[string]*ClassInfo
 	emval       *EmvalTable
 
+	// dead is set when a WASM call hits a fatal path (_abort, C++ throw,
+	// EM_JS throw) that cannot be recovered. Later calls return deadErr.
+	dead    bool
+	deadErr error
+
 	// File descriptor state for /dev/urandom emulation
 	urandomFD uint32
 	nextFD    uint32
@@ -170,6 +175,29 @@ func NewImports() *Imports {
 // SetModule sets the Module reference (must be called before running).
 func (imp *Imports) SetModule(m *Module) {
 	imp.mod = m
+}
+
+// markDead records a fatal WASM error so subsequent calls fail fast.
+// The first fatal error is retained.
+func (imp *Imports) markDead(v any) {
+	if imp.dead {
+		return
+	}
+	imp.dead = true
+	if err, ok := v.(error); ok {
+		imp.deadErr = err
+	} else {
+		imp.deadErr = fmt.Errorf("%v", v)
+	}
+}
+
+// checkDead is the defer target for functions that dispatch into the WASM
+// module: a fatal panic is converted to the dead-runtime error.
+func (imp *Imports) checkDead(err *error) {
+	if v := recover(); v != nil {
+		imp.markDead(v)
+		*err = imp.deadErr
+	}
 }
 
 // readCStr reads a null-terminated C string from module memory.
@@ -838,6 +866,9 @@ func toFloat64(v any) float64 {
 
 // CallMethod calls an embind instance method on a C++ object.
 func (imp *Imports) CallMethod(className, methodName string, thisPtr uint32, args ...uint32) (uint32, error) {
+	if imp.dead {
+		return 0, imp.deadErr
+	}
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -866,6 +897,9 @@ func (imp *Imports) CallMethod(className, methodName string, thisPtr uint32, arg
 
 // CallStatic calls an embind static method.
 func (imp *Imports) CallStatic(className, methodName string, args ...uint32) (uint32, error) {
+	if imp.dead {
+		return 0, imp.deadErr
+	}
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -886,6 +920,9 @@ func (imp *Imports) CallStatic(className, methodName string, args ...uint32) (ui
 
 // Construct calls an embind class constructor.
 func (imp *Imports) Construct(className string, args ...uint32) (uint32, error) {
+	if imp.dead {
+		return 0, imp.deadErr
+	}
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -905,7 +942,11 @@ func (imp *Imports) Construct(className string, args ...uint32) (uint32, error) 
 }
 
 // Destroy invokes the registered C++ destructor for an embind object.
-func (imp *Imports) Destroy(className string, ptr uint32) error {
+func (imp *Imports) Destroy(className string, ptr uint32) (err error) {
+	defer imp.checkDead(&err)
+	if imp.dead {
+		return imp.deadErr
+	}
 	if ptr == 0 {
 		return nil
 	}
@@ -947,7 +988,8 @@ func (imp *Imports) MarkSecureKeyExportable(ptr uint32) {
 
 // callIndirect dispatches to the appropriate callIndirectTN based on parameter count and types.
 // Most embind methods use all-uint32 params, but some have uint64 (bigint) params or returns.
-func (imp *Imports) callIndirect(invokerIdx uint32, argTypes []uint32, callArgs []uint32) (uint32, error) {
+func (imp *Imports) callIndirect(invokerIdx uint32, argTypes []uint32, callArgs []uint32) (ret uint32, err error) {
+	defer imp.checkDead(&err)
 	m := imp.mod
 	nArgs := len(callArgs)
 

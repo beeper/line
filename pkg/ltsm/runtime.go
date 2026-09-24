@@ -21,10 +21,25 @@ func NewRuntime() (*Runtime, error) {
 	mod := NewModule(imp)
 	imp.SetModule(mod)
 
-	// Phase 1: __wasm_call_ctors
-	mod.fP()
-	// Phase 2: embind type/class registrations
-	mod.fT()
+	var initErr error
+	func() {
+		defer func() {
+			if v := recover(); v != nil {
+				if err, ok := v.(error); ok {
+					initErr = err
+				} else {
+					initErr = fmt.Errorf("%v", v)
+				}
+			}
+		}()
+		// Phase 1: __wasm_call_ctors
+		mod.fP()
+		// Phase 2: embind type/class registrations
+		mod.fT()
+	}()
+	if initErr != nil {
+		return nil, fmt.Errorf("ltsm: runtime init failed: %w", initErr)
+	}
 
 	return &Runtime{mod: mod, imp: imp}, nil
 }
@@ -33,6 +48,12 @@ func NewRuntime() (*Runtime, error) {
 func (rt *Runtime) ModuleMem() []byte {
 	return rt.mod.mem
 }
+
+// Dead reports whether the runtime suffered a fatal WASM error.
+func (rt *Runtime) Dead() bool { return rt.imp.dead }
+
+// DeadError returns the fatal error that stopped the runtime, if any.
+func (rt *Runtime) DeadError() error { return rt.imp.deadErr }
 
 // Close releases resources. No-op for the transpiled module.
 func (rt *Runtime) Close() {}
