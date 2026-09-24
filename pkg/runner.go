@@ -67,48 +67,97 @@ type goKeyEntry struct {
 
 var (
 	globalRunner *Runner
-	runnerOnce   sync.Once
+	runnerMu     sync.Mutex
 	runnerErr    error
 )
 
+// runtimeDead is a seam for tests to simulate a dead runtime.
+var runtimeDead = func(rt *ltsm.Runtime) bool { return rt.Dead() }
+
+// GetRunner returns the process-wide Runner. If the underlying LTSM runtime
+// died on a fatal WASM error, the runner is reinitialized in place: the
+// runtime is recreated, the secure key reloaded, and cached WASM state
+// discarded. The same *Runner object is returned so existing references
+// (e.g. the E2EE manager) stay valid.
 func GetRunner() (*Runner, error) {
-	runnerOnce.Do(func() {
-		token := os.Getenv("SECURE_KEY")
-		if token == "" {
-			token = "wODdrvWqmdP4Zliay-iF3cz3KZcK0ekrial868apg06TXeCo7A1hIQO0ESElHg6D"
-		}
-		clientVersion := os.Getenv("CLIENT_VERSION")
-		if clientVersion == "" {
-			clientVersion = "3.7.2"
-		}
+	runnerMu.Lock()
+	defer runnerMu.Unlock()
 
-		rt, err := ltsm.NewRuntime()
-		if err != nil {
-			runnerErr = fmt.Errorf("failed to initialize LTSM runtime: %w", err)
-			return
+	if globalRunner != nil && runtimeDead(globalRunner.rt) {
+		if err := globalRunner.reset(); err != nil {
+			runnerErr = err
+			return nil, err
 		}
-
-		skPtr, err := rt.SecureKeyLoadToken(token)
-		if err != nil {
-			rt.Close()
-			runnerErr = fmt.Errorf("failed to load secure key: %w", err)
-			return
-		}
-
-		globalRunner = &Runner{
-			rt:              rt,
-			token:           token,
-			clientVersion:   clientVersion,
-			skPtr:           skPtr,
-			keyStore:        make(map[int]uint32),
-			channelStore:    make(map[int]uint32),
-			signingContexts: make(map[[sha256.Size]byte]signingContext),
-			nextID:          1,
-			goKeys:          make(map[int]*goKeyEntry),
-			goChannels:      make(map[int]*ltsm.Channel),
-		}
-	})
+	}
+	if globalRunner == nil {
+		globalRunner, runnerErr = newRunner()
+	}
 	return globalRunner, runnerErr
+}
+
+func newRunner() (*Runner, error) {
+	token := os.Getenv("SECURE_KEY")
+	if token == "" {
+		token = "wODdrvWqmdP4Zliay-iF3cz3KZcK0ekrial868apg06TXeCo7A1hIQO0ESElHg6D"
+	}
+	clientVersion := os.Getenv("CLIENT_VERSION")
+	if clientVersion == "" {
+		clientVersion = "3.7.2"
+	}
+
+	rt, err := ltsm.NewRuntime()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize LTSM runtime: %w", err)
+	}
+
+	skPtr, err := rt.SecureKeyLoadToken(token)
+	if err != nil {
+		rt.Close()
+		return nil, fmt.Errorf("failed to load secure key: %w", err)
+	}
+
+	return &Runner{
+		rt:              rt,
+		token:           token,
+		clientVersion:   clientVersion,
+		skPtr:           skPtr,
+		keyStore:        make(map[int]uint32),
+		channelStore:    make(map[int]uint32),
+		signingContexts: make(map[[sha256.Size]byte]signingContext),
+		nextID:          1,
+		goKeys:          make(map[int]*goKeyEntry),
+		goChannels:      make(map[int]*ltsm.Channel),
+	}, nil
+}
+
+// reset reinitializes the LTSM runtime after a fatal WASM error. Cached
+// WASM pointers are invalid after an abort, so they are discarded; pure-Go
+// key material (goKeys) is kept.
+func (r *Runner) reset() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	rt, err := ltsm.NewRuntime()
+	if err != nil {
+		return fmt.Errorf("failed to reinitialize LTSM runtime: %w", err)
+	}
+	skPtr, err := rt.SecureKeyLoadToken(r.token)
+	if err != nil {
+		rt.Close()
+		return fmt.Errorf("failed to reload secure key: %w", err)
+	}
+
+	r.rt = rt
+	r.skPtr = skPtr
+	r.signingSKPtr = 0
+	r.storageKey = 0
+	r.loginCurveKey = 0
+	r.keyStore = make(map[int]uint32)
+	r.channelStore = make(map[int]uint32)
+	r.signingContexts = make(map[[sha256.Size]byte]signingContext)
+	r.signingLRU = nil
+	r.goChannels = make(map[int]*ltsm.Channel)
+	return nil
 }
 
 func (r *Runner) putKey(ptr uint32) int {
@@ -149,73 +198,6 @@ func (r *Runner) getChannel(id int) (uint32, error) {
 		return 0, fmt.Errorf("unknown channel: %d", id)
 	}
 	return ptr, nil
-}
-
-func ltsmPanicError(operation string, recovered any) error {
-	if err, ok := recovered.(error); ok {
-		return fmt.Errorf("%s panicked: %w", operation, err)
-	}
-	return fmt.Errorf("%s panicked: %v", operation, recovered)
-}
-
-func (r *Runner) exportE2EEKeyPanicSafe(keyPtr uint32) (exported []byte, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			exported = nil
-			err = ltsmPanicError("ltsm E2EEKey.exportKey", recovered)
-		}
-	}()
-	return r.rt.E2EEKeyExportKey(keyPtr)
-}
-
-func (r *Runner) unwrapGroupSharedKeyPanicSafe(chanPtr uint32, encKey []byte) (keyPtr uint32, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			keyPtr = 0
-			err = ltsmPanicError("ltsm E2EEChannel.unwrapGroupSharedKey", recovered)
-		}
-	}()
-	return r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, encKey)
-}
-
-func (r *Runner) encryptV1PanicSafe(chanPtr uint32, plaintext []byte) (ciphertext []byte, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			ciphertext = nil
-			err = ltsmPanicError("ltsm E2EEChannel.encryptV1", recovered)
-		}
-	}()
-	return r.rt.E2EEChannelEncryptV1(chanPtr, plaintext)
-}
-
-func (r *Runner) encryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID, receiverKeyID, contentType int, seq int64, plaintext []byte) (ciphertext []byte, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			ciphertext = nil
-			err = ltsmPanicError("ltsm E2EEChannel.encryptV2", recovered)
-		}
-	}()
-	return r.rt.E2EEChannelEncryptV2(chanPtr, to, from, senderKeyID, receiverKeyID, contentType, seq, plaintext)
-}
-
-func (r *Runner) decryptV1PanicSafe(chanPtr uint32, ciphertext []byte) (plaintext []byte, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			plaintext = nil
-			err = ltsmPanicError("ltsm E2EEChannel.decryptV1", recovered)
-		}
-	}()
-	return r.rt.E2EEChannelDecryptV1(chanPtr, ciphertext)
-}
-
-func (r *Runner) decryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID, receiverKeyID, contentType int, ciphertext []byte) (plaintext []byte, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			plaintext = nil
-			err = ltsmPanicError("ltsm E2EEChannel.decryptV2", recovered)
-		}
-	}()
-	return r.rt.E2EEChannelDecryptV2(chanPtr, to, from, senderKeyID, receiverKeyID, contentType, ciphertext)
 }
 
 func (r *Runner) touchSigningContext(key [sha256.Size]byte) {
@@ -450,7 +432,7 @@ func (r *Runner) LoginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64 string) 
 
 		id := r.putKey(keyPtr)
 
-		exported, err := r.exportE2EEKeyPanicSafe(keyPtr)
+		exported, err := r.rt.E2EEKeyExportKey(keyPtr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to export key %d: %w", i, err)
 		}
@@ -586,7 +568,7 @@ func (r *Runner) ChannelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB6
 		return 0, fmt.Errorf("invalid encrypted shared key: %w", err)
 	}
 
-	keyPtr, err := r.unwrapGroupSharedKeyPanicSafe(chanPtr, encBytes)
+	keyPtr, err := r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, encBytes)
 	if err != nil {
 		return 0, err
 	}
@@ -615,7 +597,7 @@ func (r *Runner) ChannelEncryptV1(channelID int, plaintext string) (string, erro
 		return "", err
 	}
 
-	ctBytes, err := r.encryptV1PanicSafe(chanPtr, []byte(plaintext))
+	ctBytes, err := r.rt.E2EEChannelEncryptV1(chanPtr, []byte(plaintext))
 	if err != nil {
 		return "", err
 	}
@@ -645,7 +627,7 @@ func (r *Runner) ChannelEncryptV2(channelID int, to, from string, senderKeyID, r
 		return "", err
 	}
 
-	ctBytes, err := r.encryptV2PanicSafe(chanPtr,
+	ctBytes, err := r.rt.E2EEChannelEncryptV2(chanPtr,
 		to, from, senderKeyID, receiverKeyID, contentType, int64(seq), []byte(plaintext))
 	if err != nil {
 		return "", err
@@ -680,7 +662,7 @@ func (r *Runner) ChannelDecryptV1(channelID, senderKeyID, receiverKeyID int, cip
 		return "", "", err
 	}
 
-	ptBytes, err := r.decryptV1PanicSafe(chanPtr, ctBytes)
+	ptBytes, err := r.rt.E2EEChannelDecryptV1(chanPtr, ctBytes)
 	if err != nil {
 		return "", "", err
 	}
@@ -714,7 +696,7 @@ func (r *Runner) ChannelDecryptV2(channelID int, to, from string, senderKeyID, r
 		return "", "", err
 	}
 
-	ptBytes, err := r.decryptV2PanicSafe(chanPtr,
+	ptBytes, err := r.rt.E2EEChannelDecryptV2(chanPtr,
 		to, from, senderKeyID, receiverKeyID, contentType, ctBytes)
 	if err != nil {
 		return "", "", err
