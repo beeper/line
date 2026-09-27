@@ -17,7 +17,7 @@ func TestDecryptDownloadedMediaUsesBodyKey(t *testing.T) {
 	ciphertext := []byte("ciphertext")
 	plaintext := []byte("plaintext")
 	var keys []string
-	h := &Handler{DecryptMedia: func(data []byte, key string) ([]byte, error) {
+	h := &Handler{DecryptMedia: func(data []byte, key, kind string) ([]byte, error) {
 		if !bytes.Equal(data, ciphertext) {
 			t.Fatalf("decrypt input = %q, want ciphertext", data)
 		}
@@ -40,7 +40,7 @@ func TestDecryptDownloadedMediaUsesBodyKey(t *testing.T) {
 func TestDecryptDownloadedMediaFallsBackToENCKM(t *testing.T) {
 	ciphertext := []byte("ciphertext")
 	var keys []string
-	h := &Handler{DecryptMedia: func(data []byte, key string) ([]byte, error) {
+	h := &Handler{DecryptMedia: func(data []byte, key, kind string) ([]byte, error) {
 		if !bytes.Equal(data, ciphertext) {
 			t.Fatalf("decrypt input = %q, want original ciphertext", data)
 		}
@@ -88,7 +88,7 @@ func TestDecryptDownloadedMediaFailsClosed(t *testing.T) {
 	ciphertext := []byte("ciphertext")
 	decryptErr := errors.New("invalid media key")
 	var calls int
-	h := &Handler{DecryptMedia: func([]byte, string) ([]byte, error) {
+	h := &Handler{DecryptMedia: func([]byte, string, string) ([]byte, error) {
 		calls++
 		return nil, decryptErr
 	}}
