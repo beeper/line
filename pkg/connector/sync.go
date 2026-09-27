@@ -283,7 +283,7 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 			Timestamp:    time.Now(),
 			CreatePortal: createPortal,
 		},
-		ChatInfo: &bridgev2.ChatInfo{
+		ChatInfo: lc.withStickerPacks(&bridgev2.ChatInfo{
 			Type:        &dmType,
 			Name:        &chatName,
 			Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
@@ -310,7 +310,7 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 				}),
 			},
 			ExcludeChangesFromTimeline: true,
-		},
+		}),
 		CheckNeedsBackfillFunc: checkNeedsBackfill,
 	})
 }
@@ -1074,7 +1074,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	if selfInvitePending {
 		info.MessageRequest = ptr.Ptr(true)
 	}
-	return info
+	return lc.withStickerPacks(info)
 }
 
 func (lc *LineClient) generateNameFromMemberList(ctx context.Context, members []string) string {

@@ -94,9 +94,22 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			WithErrorReason(event.MessageStatusGenericError)
 	}
 
+	var nativeSticker *lineSticker
+	if (msg.Content.MsgType == event.CapMsgSticker || msg.Content.MsgType == event.MsgImage) && msg.Content.File == nil {
+		sticker, err := lc.resolveSticker(ctx, msg.Content.URL)
+		if err != nil {
+			lc.UserLogin.Log.Warn().Err(err).Msg("Failed to resolve LINE sticker, sending as image")
+		}
+		if sticker != nil && sticker.Shop == line.StickerShop {
+			nativeSticker = sticker
+		}
+	}
+
 	// Determine whether we need to send as plain text (peer/group has Letter Sealing off).
 	plainText := false
-	if lc.E2EE == nil {
+	if nativeSticker != nil {
+		plainText = true
+	} else if lc.E2EE == nil {
 		plainText = true
 		lc.UserLogin.Bridge.Log.Warn().Msg("E2EE not initialized, sending as plain text")
 	} else if isGroup {
@@ -126,7 +139,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
 	effectiveMsgType := msg.Content.MsgType
 	isSticker := effectiveMsgType == event.CapMsgSticker
-	if isSticker {
+	if nativeSticker != nil {
+		effectiveMsgType = event.CapMsgSticker
+	} else if isSticker {
 		effectiveMsgType = event.MsgImage
 	}
 	if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
@@ -179,6 +194,10 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var rawFileName string
 
 	switch effectiveMsgType {
+	case event.CapMsgSticker:
+		contentType = int(ContentSticker)
+		contentMetadata = nativeSticker.metadata()
+
 	case event.MsgText:
 		contentType = int(ContentText)
 		if plainText {

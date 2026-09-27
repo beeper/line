@@ -183,7 +183,7 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	contact := lc.getContact(ctx, string(portal.ID))
 	dmType := database.RoomTypeDM
 	chatName := contact.EffectiveDisplayName()
-	return &bridgev2.ChatInfo{
+	return lc.withStickerPacks(&bridgev2.ChatInfo{
 		Type:   &dmType,
 		Name:   &chatName,
 		Avatar: lc.avatarFromPicturePath(contact.PicturePath),
@@ -207,7 +207,7 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 				},
 			}),
 		},
-	}, nil
+	}), nil
 }
 
 func (lc *LineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {

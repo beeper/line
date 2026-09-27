@@ -82,10 +82,16 @@ type LineClient struct {
 	paidReactionIconMXC     map[string]string   // LINE sticon URL -> cached MXC URI
 	unblockBackfills        sync.Map            // chat MID -> *unblockBackfillState while unblock history restoration is active
 
+	stickerSyncMu       sync.Mutex
+	stickerMu           sync.Mutex
+	stickerCatalogs     map[string]stickerCatalog
+	pendingStickerRooms sync.Map
+
 	wg sync.WaitGroup
 }
 
 type lineClientRun struct {
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -156,7 +162,7 @@ func (lc *LineClient) isSessionInvalidated() bool {
 
 func (lc *LineClient) beginRun(parent context.Context) (context.Context, *lineClientRun, bool) {
 	ctx, cancel := context.WithCancel(parent)
-	run := &lineClientRun{cancel: cancel}
+	run := &lineClientRun{ctx: ctx, cancel: cancel}
 	lc.runMu.Lock()
 	if lc.stopped {
 		lc.runMu.Unlock()
@@ -182,6 +188,16 @@ func (lc *LineClient) cancelActiveRun() {
 	if run != nil {
 		run.cancel()
 	}
+}
+
+func (lc *LineClient) startRunTask() (context.Context, bool) {
+	lc.runMu.Lock()
+	defer lc.runMu.Unlock()
+	if lc.stopped || lc.activeRun == nil || lc.activeRun.ctx.Err() != nil {
+		return nil, false
+	}
+	lc.wg.Add(1)
+	return lc.activeRun.ctx, true
 }
 
 func (lc *LineClient) retire() {
@@ -641,7 +657,8 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		return
 	}
 
-	lc.wg.Add(3)
+	lc.wg.Add(4)
+	go lc.syncStickerPacks(ctx)
 	go lc.syncDMChats(ctx)
 	go lc.prefetchMessages(ctx)
 	go lc.pollLoop(ctx)
