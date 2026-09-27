@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -141,7 +142,20 @@ func directMediaDuration(contentMetadata map[string]string) int {
 func directMediaContent(kind, decryptedBody string, metadata map[string]string) (name, contentType string, err error) {
 	switch kind {
 	case "image":
-		return "image.jpg", "image/jpeg", nil
+		var original struct {
+			Extension string `json:"extension"`
+		}
+		_ = json.Unmarshal([]byte(metadata["MEDIA_CONTENT_INFO"]), &original)
+		ext := strings.ToLower(original.Extension)
+		if ext == "" {
+			ext = strings.TrimPrefix(strings.ToLower(filepath.Ext(metadata["FILE_NAME"])), ".")
+		}
+		mimeType := "image/jpeg"
+		switch ext {
+		case "gif", "png", "webp", "bmp":
+			mimeType = "image/" + ext
+		}
+		return "image" + imageSuffix(mimeType), mimeType, nil
 	case "audio":
 		return "audio.m4a", "audio/mp4", nil
 	case "video":

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"net/http"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -123,6 +125,10 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
 	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
 	effectiveMsgType := msg.Content.MsgType
+	isSticker := effectiveMsgType == event.CapMsgSticker
+	if isSticker {
+		effectiveMsgType = event.MsgImage
+	}
 	if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
 		mime := msg.Content.Info.MimeType
 		if strings.HasPrefix(mime, "audio/") {
@@ -132,6 +138,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		} else if strings.HasPrefix(mime, "image/") {
 			effectiveMsgType = event.MsgImage
 		}
+	}
+
+	videoGIF := effectiveMsgType == event.MsgVideo && msg.Content.Info != nil && msg.Content.Info.MauGIF
+	if videoGIF {
+		effectiveMsgType = event.MsgImage
 	}
 
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
@@ -185,73 +196,60 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			return nil, fmt.Errorf("failed to download media from matrix: %w", err)
 		}
 
-		mimeType := msg.Content.Info.MimeType
+		mimeType := ""
+		if msg.Content.Info != nil {
+			mimeType = msg.Content.Info.MimeType
+		}
 		fileName := msg.Content.GetFileName()
-		if isHEICImage(mimeType, fileName) {
+		if videoGIF {
+			data, err = convertVideoToGIF(ctx, data)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert GIF video: %w", err)
+			}
+			mimeType = "image/gif"
+		}
+		data, err = preparePNGSticker(ctx, data, isSticker)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare PNG sticker: %w", err)
+		}
+		detectedMimeType := http.DetectContentType(data)
+		if strings.HasPrefix(detectedMimeType, "image/") {
+			mimeType = detectedMimeType
+		} else if isHEICImage(mimeType, fileName) {
 			data, err = convertHEICToJPEG(ctx, data)
 			if err != nil {
 				return nil, fmt.Errorf("failed to convert HEIC image to JPEG: %w", err)
 			}
 			mimeType = "image/jpeg"
-			fileName = jpegFileName(fileName)
 		}
-		isGif := mimeType == "image/gif"
-		isAnimated := isGif && isAnimatedGif(data)
-
-		extension := "jpg"
-		if isGif {
-			extension = "gif"
-		} else if mimeType == "image/png" {
-			extension = "png"
+		extension := imageExtension(mimeType)
+		if extension == "" {
+			return nil, fmt.Errorf("unsupported image MIME type %q", mimeType)
 		}
+		if fileName == "" {
+			fileName = "image"
+		}
+		fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + "." + extension
 
 		contentType = int(ContentImage)
+
+		mediaContentInfo := originalImageInfo(data, extension)
+		if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
+			contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
+		}
 
 		if plainText {
 			// Plain media: save data for post-send upload to r/talk/m/{msgId}
 			plainMediaData = data
-
-			thumbnailData, thumbWidth, thumbHeight, err := generateThumbnail(data)
-			if err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to generate thumbnail, continuing without it")
-			} else {
-				plainThumbData = thumbnailData
-				mediaThumbInfo := map[string]interface{}{
-					"width":  thumbWidth,
-					"height": thumbHeight,
-				}
-				if thumbInfoJSON, err := json.Marshal(mediaThumbInfo); err == nil {
-					contentMetadata["MEDIA_THUMB_INFO"] = string(thumbInfoJSON)
-				}
-			}
-
 			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 
-			if fileName == "" {
-				fileName = "image." + extension
-			}
 			contentMetadata["FILE_NAME"] = fileName
-
-			mediaContentInfo := map[string]interface{}{
-				"category":  "original",
-				"fileSize":  len(data),
-				"extension": extension,
-			}
-			if isAnimated {
-				mediaContentInfo["animated"] = true
-			}
-			if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
-				contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
-			}
 		} else {
 			// E2EE: encrypt, upload to OBS first, send with OID
 			// Save original data for potential group E2EE fallback
 			if isGroup {
 				originalMediaData = data
-				if thumbData, _, _, tErr := generateThumbnail(data); tErr == nil {
-					originalThumbData = thumbData
-				}
 			}
 
 			uploadData, keyMaterialB64, err := lc.encryptFileData(data)
@@ -297,26 +295,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			contentMetadata["OID"] = oid
 			contentMetadata["SID"] = "emi"
-			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(uploadData))
+			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 			contentMetadata["ENC_KM"] = keyMaterialB64
 
-			if fileName == "" {
-				fileName = "image." + extension
-			}
 			contentMetadata["FILE_NAME"] = fileName
-
-			mediaContentInfo := map[string]interface{}{
-				"category":  "original",
-				"fileSize":  len(uploadData),
-				"extension": extension,
-			}
-			if isAnimated {
-				mediaContentInfo["animated"] = true
-			}
-			if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
-				contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
-			}
 
 			imgPayload := map[string]string{"keyMaterial": keyMaterialB64}
 			payload, _ = json.Marshal(imgPayload)
@@ -637,6 +620,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 						delete(contentMetadata, "ENC_KM")
 						plainMediaData = originalMediaData
 						plainThumbData = originalThumbData
+						if contentType == int(ContentImage) {
+							delete(contentMetadata, "MEDIA_THUMB_INFO")
+						}
 					}
 				}
 			}
@@ -833,6 +819,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		if err := callLineErr(func(client *line.Client) error {
+			if contentType == int(ContentImage) {
+				return client.UploadOBSPlainOriginalImage(plainMediaData, sentMsg.ID, contentMetadata["FILE_NAME"])
+			}
 			return client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType)
 		}); err != nil {
 			return nil, fmt.Errorf("failed to upload plain media to OBS: %w", err)

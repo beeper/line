@@ -63,6 +63,24 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			AcceptWithButton: event.CapLevelFullySupported,
 		},
 		File: event.FileFeatureMap{
+			event.CapMsgSticker: {
+				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
+				MimeTypes: map[string]event.CapabilitySupportLevel{
+					"image/png":  event.CapLevelPartialSupport,
+					"image/gif":  event.CapLevelPartialSupport,
+					"image/webp": event.CapLevelPartialSupport,
+				},
+			},
+			event.CapMsgGIF: {
+				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
+				MimeTypes: map[string]event.CapabilitySupportLevel{
+					"image/gif":  event.CapLevelFullySupported,
+					"video/mp4":  event.CapLevelPartialSupport,
+					"video/webm": event.CapLevelPartialSupport,
+				},
+			},
 			event.MsgImage: {
 				Caption: event.CapLevelRejected,
 				MaxSize: handlers.BeeperMaxFileSize,
