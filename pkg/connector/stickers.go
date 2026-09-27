@@ -31,12 +31,18 @@ var _ bridgev2.StickerImportingNetworkAPI = (*LineClient)(nil)
 
 var lineAssetID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,100}$`)
 
-var stickerShops = []string{line.StickerShop}
+var stickerShops = []string{line.StickerShop, line.SticonShop}
 
 const (
 	stickerCDN               = "https://stickershop.line-scdn.net"
 	maxStickerAssetSize      = 10 * 1024 * 1024
 	maxStickersPerPack       = 1000
+	maxSticonMetaSize        = 1024 * 1024
+	maxEmotesPerMessage      = 250
+	maxTextLength            = 5000
+	maxShortcodeLength       = 100
+	sticonMetaTTL            = time.Hour
+	maxSticonMetaCacheSize   = 256
 	stickerCatalogTTL        = 5 * time.Minute
 	stickerSyncInterval      = time.Hour
 	stickerRoomCreateTimeout = 10 * time.Minute
@@ -45,6 +51,11 @@ const (
 type stickerCatalog struct {
 	Products []line.ShopProduct
 	Fetched  time.Time
+}
+
+type sticonMetaCache struct {
+	Emotes  []lineSticker
+	Fetched time.Time
 }
 
 type lineSticker struct {
@@ -78,6 +89,13 @@ func (s lineSticker) metadata() map[string]string {
 }
 
 func (s lineSticker) assetPath() string {
+	if s.Shop == line.SticonShop {
+		suffix := ""
+		if s.Option == "A" {
+			suffix = "_animation"
+		}
+		return "/sticonshop/v1/sticon/" + s.ProductID + "/android/" + s.ID + suffix + ".png"
+	}
 	prefix := "/stickershop/v1/sticker/" + s.ID
 	if s.Hash != "" {
 		prefix = "/stickershop/v2/sticker/" + s.ID + "/" + s.Hash
@@ -134,7 +152,7 @@ func parseLinePackURL(rawURL string) (shop, productID string, err error) {
 		}
 		productID = parts[2]
 	default:
-		return "", "", fmt.Errorf("use a LINE Store product URL or line://stickershop/PACK_ID")
+		return "", "", fmt.Errorf("use a LINE Store product URL or line://stickershop/PACK_ID or line://sticonshop/PACK_ID")
 	}
 	if !lineAssetID.MatchString(productID) {
 		return "", "", fmt.Errorf("invalid LINE product ID")
@@ -146,6 +164,8 @@ func shopFromStorePath(path string) (string, error) {
 	switch path {
 	case "stickershop":
 		return line.StickerShop, nil
+	case "emojishop":
+		return line.SticonShop, nil
 	default:
 		return "", fmt.Errorf("unsupported LINE Store section %q", path)
 	}
@@ -186,9 +206,13 @@ func (lc *LineClient) resetStickerCatalogs() {
 }
 
 func packMetadata(shop string, product line.ShopProduct) *event.ImagePackMetadata {
+	usage := []event.ImagePackUsage{event.ImagePackUsageSticker}
+	if shop == line.SticonShop {
+		usage = []event.ImagePackUsage{event.ImagePackUsageEmoji, event.ImagePackUsageSticker}
+	}
 	return &event.ImagePackMetadata{
 		DisplayName: product.Name,
-		Usage:       []event.ImagePackUsage{event.ImagePackUsageSticker},
+		Usage:       usage,
 		BridgedPack: &event.BridgedStickerPack{
 			Network: "line",
 			URL:     "line://" + shop + "/" + product.ID,
@@ -200,12 +224,20 @@ func supportedProduct(shop string, product line.ShopProduct) bool {
 	if !lineAssetID.MatchString(product.ID) || !activeProduct(product, time.Now()) {
 		return false
 	}
-	summary := product.ProductTypeSummary.Sticker
-	if shop != line.StickerShop || summary == nil {
+	switch shop {
+	case line.StickerShop:
+		summary := product.ProductTypeSummary.Sticker
+		if summary == nil {
+			return false
+		}
+		_, err := stickerOption(summary.ResourceType)
+		return err == nil
+	case line.SticonShop:
+		summary := product.ProductTypeSummary.Sticon
+		return summary != nil && (summary.ResourceType == 1 || summary.ResourceType == 2)
+	default:
 		return false
 	}
-	_, err := stickerOption(summary.ResourceType)
-	return err == nil
 }
 
 func (lc *LineClient) ListImagePacks(ctx context.Context) ([]*event.ImagePackMetadata, error) {
@@ -268,10 +300,13 @@ func (lc *LineClient) fetchStickerAsset(ctx context.Context, path string, limit 
 	return data, nil
 }
 
-func (lc *LineClient) productStickers(_ context.Context, shop string, product line.ShopProduct) ([]lineSticker, error) {
+func (lc *LineClient) productStickers(ctx context.Context, shop string, product line.ShopProduct) ([]lineSticker, error) {
 	version := product.LatestVersion.String()
 	if n, err := strconv.ParseUint(version, 10, 32); err != nil || n == 0 {
 		return nil, fmt.Errorf("invalid LINE pack version")
+	}
+	if shop == line.SticonShop {
+		return lc.productEmotes(ctx, product, version)
 	}
 	summary := product.ProductTypeSummary.Sticker
 	if summary == nil {
@@ -309,6 +344,106 @@ func (lc *LineClient) productStickers(_ context.Context, shop string, product li
 		return nil, fmt.Errorf("LINE pack is empty")
 	}
 	return stickers, nil
+}
+
+func (lc *LineClient) productEmotes(ctx context.Context, product line.ShopProduct, version string) ([]lineSticker, error) {
+	cacheKey := product.ID + "/" + version
+	lc.sticonMetaMu.Lock()
+	defer lc.sticonMetaMu.Unlock()
+	if cached, ok := lc.sticonMeta[cacheKey]; ok && time.Since(cached.Fetched) < sticonMetaTTL {
+		return cached.Emotes, nil
+	}
+	summary := product.ProductTypeSummary.Sticon
+	if summary == nil {
+		return nil, fmt.Errorf("missing sticon summary")
+	}
+	data, err := lc.fetchStickerAsset(ctx, "/sticonshop/v1/product/"+product.ID+"/android/meta.json", maxSticonMetaSize)
+	if err != nil {
+		return nil, err
+	}
+	var meta struct {
+		Orders   []string          `json:"orders"`
+		AltTexts map[string]string `json:"altTexts"`
+	}
+	if err = json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	if len(meta.Orders) == 0 {
+		return nil, fmt.Errorf("LINE pack is empty")
+	}
+	if len(meta.Orders) > maxStickersPerPack {
+		return nil, fmt.Errorf("emoji pack too large")
+	}
+	option := ""
+	if summary.ResourceType == 2 {
+		option = "A"
+	}
+	emotes := make([]lineSticker, 0, len(meta.Orders))
+	for _, emoteID := range meta.Orders {
+		if !lineAssetID.MatchString(emoteID) {
+			return nil, fmt.Errorf("invalid sticon ID")
+		}
+		body := "(emoji)"
+		if alt := meta.AltTexts[emoteID]; alt != "" {
+			body = "(" + alt + ")"
+		}
+		emotes = append(emotes, lineSticker{
+			Shop:      line.SticonShop,
+			ProductID: product.ID,
+			ID:        emoteID,
+			Version:   version,
+			Option:    option,
+			Body:      body,
+		})
+	}
+	if lc.sticonMeta == nil || len(lc.sticonMeta) >= maxSticonMetaCacheSize {
+		lc.sticonMeta = make(map[string]sticonMetaCache)
+	}
+	lc.sticonMeta[cacheKey] = sticonMetaCache{Emotes: emotes, Fetched: time.Now()}
+	return emotes, nil
+}
+
+func shortcodeWords(text string) string {
+	var words strings.Builder
+	for _, r := range strings.ToLower(text) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			words.WriteRune(r)
+		} else if words.Len() > 0 && !strings.HasSuffix(words.String(), "_") {
+			words.WriteByte('_')
+		}
+	}
+	return strings.Trim(words.String(), "_")
+}
+
+func truncateShortcode(shortcode string, limit int) string {
+	if len(shortcode) <= limit {
+		return shortcode
+	}
+	return strings.TrimRight(shortcode[:limit], "_")
+}
+
+func emoteShortcodes(packName string, emotes []lineSticker) []string {
+	pack := shortcodeWords(packName)
+	if pack == "" {
+		pack = "line"
+	}
+	shortcodes := make([]string, len(emotes))
+	used := make(map[string]bool, len(emotes))
+	for i, emote := range emotes {
+		name := shortcodeWords(strings.TrimSuffix(strings.TrimPrefix(emote.Body, "("), ")"))
+		if name == "" {
+			name = strconv.Itoa(i + 1)
+		}
+		base := truncateShortcode(pack+"_"+name, maxShortcodeLength)
+		shortcode := base
+		for n := 2; used[shortcode]; n++ {
+			suffix := "_" + strconv.Itoa(n)
+			shortcode = truncateShortcode(base, maxShortcodeLength-len(suffix)) + suffix
+		}
+		used[shortcode] = true
+		shortcodes[i] = shortcode
+	}
+	return shortcodes
 }
 
 func stickerKey(kind, value string) database.Key {
@@ -399,12 +534,20 @@ func (lc *LineClient) DownloadImagePack(ctx context.Context, rawURL string) (*br
 			Images:   make(map[string]*event.ImagePackImage, len(stickers)),
 		},
 	}
-	for _, sticker := range stickers {
+	var shortcodes []string
+	if shop == line.SticonShop {
+		shortcodes = emoteShortcodes(product.Name, stickers)
+	}
+	for i, sticker := range stickers {
 		img, err := lc.importSticker(ctx, sticker)
 		if err != nil {
 			return nil, err
 		}
-		pack.Content.Images["line_"+sticker.ID] = img
+		shortcode := "line_" + sticker.ID
+		if shortcodes != nil {
+			shortcode = shortcodes[i]
+		}
+		pack.Content.Images[shortcode] = img
 	}
 	return pack, nil
 }
@@ -601,7 +744,7 @@ func (lc *LineClient) syncStickerPacks(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		if err := lc.syncStickerPacksOnce(ctx); err != nil && ctx.Err() == nil {
-			lc.UserLogin.Log.Warn().Err(err).Msg("Failed to synchronize LINE sticker packs")
+			lc.UserLogin.Log.Warn().Err(err).Msg("Failed to synchronize LINE sticker and emoji packs")
 		}
 		select {
 		case <-ctx.Done():

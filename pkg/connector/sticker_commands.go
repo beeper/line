@@ -6,7 +6,7 @@ var commandStickers = &commands.FullHandler{
 	Name: "stickers",
 	Help: commands.HelpMeta{
 		Section:     commands.HelpSectionMisc,
-		Description: "Add your LINE sticker packs to this room and refresh them",
+		Description: "Add your LINE sticker and emoji packs to this room and refresh them",
 	},
 	RequiresPortal: true,
 	RequiresLogin:  true,
@@ -23,9 +23,9 @@ var commandStickers = &commands.FullHandler{
 		}
 		client.resetStickerCatalogs()
 		if err = client.enableRoomStickers(ce.Ctx, ce.RoomID); err != nil {
-			ce.Reply("Failed to synchronize LINE sticker packs: %s", err)
+			ce.Reply("Failed to synchronize LINE sticker and emoji packs: %s", err)
 			return
 		}
-		ce.Reply("LINE sticker packs are now available in this room. Pack images are not end-to-end encrypted.")
+		ce.Reply("LINE sticker and emoji packs are now available in this room. Pack images are not end-to-end encrypted.")
 	},
 }

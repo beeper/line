@@ -46,7 +46,9 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	return &event.RoomFeatures{
-		MaxTextLength:         5000,
+		MaxTextLength:         maxTextLength,
+		Formatting:            event.FormattingFeatureMap{event.FmtCustomEmoji: event.CapLevelPartialSupport},
+		CustomEmojiReactions:  true,
 		Reply:                 event.CapLevelFullySupported,
 		Reaction:              event.CapLevelPartialSupport,
 		ReactionCount:         1,

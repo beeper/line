@@ -86,6 +86,8 @@ type LineClient struct {
 	stickerMu           sync.Mutex
 	stickerCatalogs     map[string]stickerCatalog
 	pendingStickerRooms sync.Map
+	sticonMetaMu        sync.Mutex
+	sticonMeta          map[string]sticonMetaCache
 
 	wg sync.WaitGroup
 }

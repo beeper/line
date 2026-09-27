@@ -9,7 +9,9 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -96,6 +98,7 @@ func stickerTestClient(t *testing.T) (*LineClient, *stickerTestMatrix) {
 		},
 		stickerCatalogs: map[string]stickerCatalog{
 			line.StickerShop: {Products: []line.ShopProduct{stickerTestProduct(t)}, Fetched: time.Now()},
+			line.SticonShop:  {Fetched: time.Now()},
 		},
 	}
 	var pngData bytes.Buffer
@@ -320,5 +323,128 @@ func TestStickerPacksNotAppliedAfterDisconnect(t *testing.T) {
 	}
 	if matrix.stateWrites != 0 {
 		t.Fatalf("state writes after disconnect: %d", matrix.stateWrites)
+	}
+}
+
+func emojiTestPack(t *testing.T, lc *LineClient) (*bridgev2.ImportedImagePack, *int) {
+	t.Helper()
+	var product line.ShopProduct
+	productJSON := `{"id":"emojipack","name":"Brown Bear","latestVersion":"2","validUntil":"-1",` +
+		`"productTypeSummary":{"sticonSummary":{"sticonResourceType":2}}}`
+	if err := json.Unmarshal([]byte(productJSON), &product); err != nil {
+		t.Fatal(err)
+	}
+	lc.stickerCatalogs[line.SticonShop] = stickerCatalog{Products: []line.ShopProduct{product}, Fetched: time.Now()}
+	assetTransport := lc.HTTPClient.Transport
+	metadataFetches := 0
+	lc.HTTPClient.Transport = stickerTestTransport(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "meta.json") {
+			metadataFetches++
+			return stickerResponse(`{"orders":["001","002"],"altTexts":{"001":"cat","002":"dog"}}`), nil
+		}
+		return assetTransport.RoundTrip(r)
+	})
+	pack, err := lc.DownloadImagePack(t.Context(), "line://sticonshop/emojipack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pack, &metadataFetches
+}
+
+func TestEmojiPackSendsNativeInlineEmoji(t *testing.T) {
+	lc, _ := stickerTestClient(t)
+	pack, metadataFetches := emojiTestPack(t, lc)
+	if len(pack.Content.Metadata.Usage) != 2 || pack.Content.Metadata.Usage[0] != event.ImagePackUsageEmoji {
+		t.Fatalf("emoji pack usage = %v", pack.Content.Metadata.Usage)
+	}
+	cat := pack.Content.Images["brown_bear_cat"]
+	if cat == nil || pack.Content.Images["brown_bear_dog"] == nil {
+		t.Fatalf("unexpected emote keys: %v", slices.Collect(maps.Keys(pack.Content.Images)))
+	}
+	for range 20 {
+		for _, img := range pack.Content.Images {
+			if _, err := lc.resolveSticker(t.Context(), img.URL); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if *metadataFetches != 1 {
+		t.Fatalf("downloaded meta.json %d times", *metadataFetches)
+	}
+
+	previous := newLineAPIClient
+	t.Cleanup(func() { newLineAPIClient = previous })
+	var sent []line.Message
+	newLineAPIClient = func(token string) *line.Client {
+		c := line.NewClient(token)
+		c.HTTPClient = &http.Client{Transport: stickerTestTransport(func(r *http.Request) (*http.Response, error) {
+			var args []json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+				t.Fatal(err)
+			}
+			var msg line.Message
+			if err := json.Unmarshal(args[1], &msg); err != nil {
+				t.Fatal(err)
+			}
+			sent = append(sent, msg)
+			return stickerResponse(`{"code":0,"data":{"id":"text"}}`), nil
+		})}
+		return c
+	}
+	inline := &event.MessageEventContent{
+		MsgType:       event.MsgText,
+		Body:          "fallback",
+		Format:        event.FormatHTML,
+		FormattedBody: fmt.Sprintf(`🙂 <img data-mx-emoticon src="%s" alt="(cat)">`, cat.URL),
+	}
+	standalone := &event.MessageEventContent{MsgType: event.CapMsgSticker, Body: "cat", URL: cat.URL}
+	for _, content := range []*event.MessageEventContent{inline, standalone} {
+		if _, err := lc.HandleMatrixMessage(t.Context(), testMatrixMessage("ufriend", content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if inline.Body != "fallback" || standalone.MsgType != event.CapMsgSticker {
+		t.Fatal("original event content was mutated")
+	}
+	if len(sent) != 2 || sent[0].Text != "🙂 (cat)" || sent[1].Text != "(cat)" {
+		t.Fatalf("unexpected messages: %+v", sent)
+	}
+	for _, msg := range sent {
+		if msg.ContentType != 0 || msg.ContentMetadata["REPLACE"] == "" ||
+			msg.ContentMetadata["STICON_OWNERSHIP"] != `["emojipack"]` {
+			t.Fatalf("invalid inline emoji message: %+v", msg)
+		}
+	}
+
+	lc.stickerCatalogs[line.SticonShop] = stickerCatalog{Fetched: time.Now()}
+	if _, err := lc.HandleMatrixMessage(t.Context(), testMatrixMessage("ufriend", inline)); err != nil {
+		t.Fatalf("unowned emoji failed the send: %v", err)
+	}
+	fallback := sent[len(sent)-1]
+	if fallback.Text != "fallback" || fallback.ContentMetadata["REPLACE"] != "" {
+		t.Fatalf("unowned emoji was not sent as plain text: %+v", fallback)
+	}
+}
+
+func TestEmoteShortcodes(t *testing.T) {
+	emotes := []lineSticker{
+		{Body: "(Happy!)"},
+		{Body: "(happy)"},
+		{Body: "(猫)"},
+		{Body: "(" + strings.Repeat("very long description ", 10) + ")"},
+	}
+	shortcodes := emoteShortcodes("Brown Bear", emotes)
+	expected := []string{"brown_bear_happy", "brown_bear_happy_2", "brown_bear_3"}
+	for i, want := range expected {
+		if shortcodes[i] != want {
+			t.Fatalf("shortcode %d = %q, want %q", i, shortcodes[i], want)
+		}
+	}
+	long := shortcodes[3]
+	if len(long) > maxShortcodeLength || !lineAssetID.MatchString(long) || !strings.HasPrefix(long, "brown_bear_very_long") {
+		t.Fatalf("invalid long shortcode %q", long)
+	}
+	if got := emoteShortcodes("", []lineSticker{{Body: "(cat)"}}); got[0] != "line_cat" {
+		t.Fatalf("unnamed pack shortcode = %q", got[0])
 	}
 }
