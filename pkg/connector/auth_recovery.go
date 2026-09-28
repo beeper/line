@@ -52,7 +52,7 @@ func (lc *LineClient) isTokenError(err error) bool {
 		return false
 	}
 	if lc.isSessionInvalidated() {
-		return false
+		return line.IsInvalidSenderKey(err)
 	}
 	return line.IsAuthError(err)
 }
@@ -70,6 +70,17 @@ func (lc *LineClient) recoverClientAfterAuthError(ctx context.Context, failedCli
 	// makes the comparison authoritative even when the failed request completed
 	// while another goroutine was rotating the access token.
 	lc.recoverMu.Lock()
+	if lc.isSessionInvalidated() {
+		lc.tokenMu.RLock()
+		sameSession := failedClient != nil && failedClient.AccessToken != "" && failedClient.AccessToken == lc.invalidatedAccessToken
+		lc.tokenMu.RUnlock()
+		if line.IsInvalidSenderKey(err) && sameSession {
+			// A send can finish after another request invalidated this same session.
+			lc.markLoggedOutByOtherClientLocked(context.WithoutCancel(ctx), err)
+		}
+		lc.recoverMu.Unlock()
+		return nil, nil
+	}
 	if ctx.Err() != nil {
 		lc.recoverMu.Unlock()
 		return nil, ctx.Err()
