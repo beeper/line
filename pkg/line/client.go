@@ -281,19 +281,19 @@ func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
 
 	// LSON path: confirm E2EE handshake first, then finalize with verifier
 	if meta.EncryptedKeyChain != "" && meta.PublicKey != "" {
-		if err := c.ConfirmE2EELogin(verifier, meta.PublicKey, meta.EncryptedKeyChain); err != nil {
-			log.Printf("[LINE] ConfirmE2EELogin failed: %v", err)
-		} else {
-			if res, err := c.LoginV2WithVerifier(verifier); err != nil {
-				log.Printf("[LINE] LoginV2WithVerifier failed: %v", err)
-			} else {
-				res.EncryptedKeyChain = meta.EncryptedKeyChain
-				res.E2EEPublicKey = meta.PublicKey
-				res.E2EEVersion = meta.E2EEVersion
-				res.E2EEKeyID = meta.KeyID
-				return res, nil
-			}
+		confirmedVerifier, err := c.ConfirmE2EELogin(verifier, meta.PublicKey, meta.EncryptedKeyChain)
+		if err != nil {
+			return nil, fmt.Errorf("E2EE login confirmation failed: %w", err)
 		}
+		res, err := c.LoginV2WithVerifier(confirmedVerifier)
+		if err != nil {
+			return nil, fmt.Errorf("E2EE login finalization failed: %w", err)
+		}
+		res.EncryptedKeyChain = meta.EncryptedKeyChain
+		res.E2EEPublicKey = meta.PublicKey
+		res.E2EEVersion = meta.E2EEVersion
+		res.E2EEKeyID = meta.KeyID
+		return res, nil
 	}
 
 	// Direct token in LF1 response (some login flows)
@@ -403,26 +403,26 @@ func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service
 
 // ConfirmE2EELogin completes the E2EE handshake after LF1 by hashing the encrypted key
 // chain and posting it alongside the verifier.
-func (c *Client) ConfirmE2EELogin(verifier, serverPublicKeyB64, encryptedKeyChainB64 string) error {
+func (c *Client) ConfirmE2EELogin(verifier, serverPublicKeyB64, encryptedKeyChainB64 string) (string, error) {
 	runner, err := gen.GetRunner()
 	if err != nil {
-		return fmt.Errorf("failed to init runner: %w", err)
+		return "", fmt.Errorf("failed to init runner: %w", err)
 	}
 
 	hash, err := runner.GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64)
 	if err != nil {
-		return fmt.Errorf("failed to derive confirm hash: %w", err)
+		return "", fmt.Errorf("failed to derive confirm hash: %w", err)
 	}
 
 	bodyBytes, err := json.Marshal([]string{verifier, hash})
 	if err != nil {
-		return fmt.Errorf("failed to marshal confirm payload: %w", err)
+		return "", fmt.Errorf("failed to marshal confirm payload: %w", err)
 	}
 
 	url := "https://line-chrome-gw.line-apps.com/api/talk/thrift/Talk/AuthService/confirmE2EELogin"
 	respBytes, err := c.postWithHMAC(url, bodyBytes)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	var wrapper struct {
@@ -431,13 +431,15 @@ func (c *Client) ConfirmE2EELogin(verifier, serverPublicKeyB64, encryptedKeyChai
 		Data    string `json:"data"`
 	}
 	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		return fmt.Errorf("failed to parse confirmE2EELogin response: %w", err)
+		return "", fmt.Errorf("failed to parse confirmE2EELogin response: %w", err)
 	}
 	if wrapper.Code != 0 {
-		return fmt.Errorf("confirmE2EELogin failed: %s", wrapper.Message)
+		return "", fmt.Errorf("confirmE2EELogin failed: %s", wrapper.Message)
 	}
-
-	return nil
+	if wrapper.Data == "" {
+		return "", fmt.Errorf("confirmE2EELogin returned an empty verifier")
+	}
+	return wrapper.Data, nil
 }
 
 // postWithHMAC is a small helper for non-standard RPC endpoints that still expect
