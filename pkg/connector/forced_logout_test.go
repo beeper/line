@@ -3,16 +3,145 @@ package connector
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"testing"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/status"
 
 	"github.com/rs/zerolog"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
+
+func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
+	for _, mode := range []string{"ordinary", "invalid-key", "late-invalid-key", "late-stale-key"} {
+		t.Run(mode, func(t *testing.T) {
+			invalidKey := mode == "invalid-key" || mode == "late-invalid-key"
+			ctx := context.Background()
+			rawDB, err := dbutil.NewWithDialect("file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "bridge.db")), "sqlite3")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = rawDB.Close() })
+			connector := &LineConnector{}
+			db := database.New("test", connector.GetDBMetaTypes(), rawDB)
+			if err := db.Upgrade(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.User.Insert(ctx, &database.User{MXID: "@test:example.com"}); err != nil {
+				t.Fatal(err)
+			}
+			stored := &database.UserLogin{ID: "test", UserMXID: "@test:example.com", Metadata: &UserLoginMetadata{
+				AccessToken: "token", Email: "test@example.com", Password: "password", Certificate: "certificate",
+				ExportedKeyMap: map[string]string{"1": "preserved-key"},
+			}}
+			if err := db.UserLogin.Insert(ctx, stored); err != nil {
+				t.Fatal(err)
+			}
+			matrix := &bridgeStateTestMatrix{states: make(chan status.BridgeState, 2)}
+			bridge := &bridgev2.Bridge{DB: db, Log: zerolog.New(io.Discard), Matrix: matrix,
+				Config: &bridgeconfig.BridgeConfig{BridgeStatusNotices: "none"}, BackgroundCtx: ctx, Network: connector}
+			login := &bridgev2.UserLogin{UserLogin: stored, Bridge: bridge,
+				User: &bridgev2.User{User: &database.User{MXID: stored.UserMXID}, Bridge: bridge}}
+			login.BridgeState = bridge.NewBridgeStateQueue(login)
+			t.Cleanup(login.BridgeState.Destroy)
+			lc := &LineClient{AccessToken: "token", UserLogin: login}
+			login.Client = lc
+			failure := errLoggedOut
+			if mode == "invalid-key" {
+				failure = errSenderKey
+			}
+			recovered := make(chan error, 1)
+			if mode == "invalid-key" {
+				lc.missingE2EEKeyMu.Lock()
+			}
+			go func() {
+				_, err := lc.recoverClientAfterAuthError(ctx, line.NewClient("token"), failure)
+				recovered <- err
+			}()
+			if mode == "invalid-key" {
+				select {
+				case <-recovered:
+					lc.missingE2EEKeyMu.Unlock()
+					t.Fatal("key invalidation did not wait for the E2EE metadata lock")
+				case <-time.After(100 * time.Millisecond):
+				}
+				lc.missingE2EEKeyMu.Unlock()
+			}
+			if err := <-recovered; err != nil {
+				t.Fatal(err)
+			}
+			if mode == "late-invalid-key" || mode == "late-stale-key" {
+				if !lc.isTokenError(errSenderKey) {
+					t.Fatal("late sender-key response would skip auth recovery")
+				}
+				lateCtx, cancel := context.WithCancel(ctx)
+				cancel()
+				failedToken := "token"
+				if mode == "late-stale-key" {
+					failedToken = "older-token"
+				}
+				if _, err := lc.recoverClientAfterAuthError(lateCtx, line.NewClient(failedToken), errSenderKey); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantStateError := status.BridgeStateErrorCode("line-logged-out")
+			if mode == "invalid-key" {
+				wantStateError = "line-e2ee-key-missing"
+			}
+			select {
+			case state := <-matrix.states:
+				if state.StateEvent != status.StateBadCredentials || state.Error != wantStateError || state.UserAction != status.UserActionRelogin {
+					t.Fatalf("unexpected reconnect state: %v", state)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("reconnect state was not delivered")
+			}
+			reloaded, err := db.UserLogin.GetByID(ctx, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta := reloaded.Metadata.(*UserLoginMetadata)
+			if !meta.SessionInvalidated || meta.AccessToken != "" || lc.hasAccessToken() {
+				t.Fatal("failed session remained usable")
+			}
+			if meta.ForceFullE2EELogin != invalidKey {
+				t.Fatalf("persisted full verification = %v, want %v", meta.ForceFullE2EELogin, invalidKey)
+			}
+			if meta.ExportedKeyMap["1"] != "preserved-key" {
+				t.Fatal("existing key material was erased")
+			}
+			if shouldPreserveExistingE2EEKeys(false, meta) == invalidKey {
+				t.Fatal("reconnect would reuse rejected keys or discard ordinary logout keys")
+			}
+			oldLogin := loginWithCredentials
+			t.Cleanup(func() { loginWithCredentials = oldLogin })
+			var gotCertificate string
+			loginWithCredentials = func(_, _, certificate string) (*line.LoginResult, error) {
+				gotCertificate = certificate
+				return &line.LoginResult{Certificate: "123456"}, nil
+			}
+			process := &LineEmailLogin{}
+			step, err := process.StartWithOverride(ctx, &bridgev2.UserLogin{UserLogin: reloaded, Bridge: bridge})
+			if err != nil || step == nil || step.Type != bridgev2.LoginStepTypeDisplayAndWait {
+				t.Fatalf("reconnect verification step = %v, error = %v", step, err)
+			}
+			wantCertificate := "certificate"
+			if invalidKey {
+				wantCertificate = ""
+			}
+			if gotCertificate != wantCertificate {
+				t.Fatalf("reconnect certificate = %q, want %q", gotCertificate, wantCertificate)
+			}
+		})
+	}
+}
 
 func TestEnsureValidTokenReturnsLoggedOutWithoutRelogin(t *testing.T) {
 	oldGetProfile := getProfileWithToken

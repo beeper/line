@@ -59,13 +59,14 @@ type LineClient struct {
 	// sessionInvalidated is set when LINE forcefully logs out this Chrome-style
 	// session. It prevents background calls from re-logging in before the user
 	// clicks Reconnect.
-	sessionInvalidated bool
-	runMu              sync.Mutex
-	activeRun          *lineClientRun
-	stopped            bool
-	superseded         atomic.Bool
-	forcedLogoutMu     sync.Mutex
-	forcedLogoutSent   bool
+	sessionInvalidated     bool
+	invalidatedAccessToken string
+	runMu                  sync.Mutex
+	activeRun              *lineClientRun
+	stopped                bool
+	superseded             atomic.Bool
+	forcedLogoutMu         sync.Mutex
+	forcedLogoutSent       bool
 
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
 	// noE2EEGroups, groupMemberCache, generatedGroupNameCache, and knownMemberChatMIDs.
@@ -130,6 +131,7 @@ func (lc *LineClient) setTokens(accessToken, refreshToken string) (string, strin
 	lc.AccessToken = accessToken
 	if accessToken != "" {
 		lc.sessionInvalidated = false
+		lc.invalidatedAccessToken = ""
 	}
 	if refreshToken != "" {
 		lc.RefreshToken = refreshToken
@@ -139,6 +141,9 @@ func (lc *LineClient) setTokens(accessToken, refreshToken string) (string, strin
 
 func (lc *LineClient) invalidateAccessToken() {
 	lc.tokenMu.Lock()
+	if lc.AccessToken != "" {
+		lc.invalidatedAccessToken = lc.AccessToken
+	}
 	lc.AccessToken = ""
 	lc.sessionInvalidated = true
 	lc.tokenMu.Unlock()
@@ -339,15 +344,29 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 	sendState := lc.claimForcedLogoutState()
 	lc.invalidateAccessToken()
 	line.InvalidateOBSTokenCache()
+	stateError := status.BridgeStateErrorCode("line-logged-out")
+	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
+	if line.IsInvalidSenderKey(err) {
+		lc.missingE2EEKeyMu.Lock()
+		if lc.UserLogin.UserLogin != nil {
+			if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
+				meta.ForceFullE2EELogin = true
+				meta.Certificate = ""
+			}
+		}
+		lc.missingE2EEKeyMu.Unlock()
+		stateError = "line-e2ee-key-missing"
+		stateMessage = lineMissingE2EEKeyMessage
+	}
 	lc.saveSessionInvalidated(ctx)
 	if sendState && lc.UserLogin.Bridge != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated by another client; marking login bad credentials")
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated; marking login bad credentials")
 	}
 	if sendState && lc.UserLogin.BridgeState != nil {
 		lc.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
-			Error:      "line-logged-out",
-			Message:    "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE.",
+			Error:      stateError,
+			Message:    stateMessage,
 			UserAction: status.UserActionRelogin,
 		})
 	}
@@ -591,14 +610,6 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to init E2EE manager")
 	} else {
 		lc.E2EE = mgr
-		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok && len(meta.ExportedKeyMap) > 0 {
-			if err := mgr.LoadMyKeyFromExportedMap(meta.ExportedKeyMap); err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to load E2EE key from DB metadata")
-			} else {
-				lc.UserLogin.Bridge.Log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
-			}
-		}
-
 		// Storage key is optional for runtime decrypt/encrypt; try it for file support
 		client := lc.newClient()
 		ei3, err := client.GetEncryptedIdentityV3()
@@ -611,6 +622,15 @@ func (lc *LineClient) Connect(ctx context.Context) {
 				if err := mgr.LoadMyKeyFromSecureData(data); err != nil {
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to load E2EE key from secure data")
 				}
+			}
+		}
+		// DB metadata reflects the latest login, even if writing the secure file failed.
+		// Load it last so an older file cannot replace the freshly verified key.
+		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok && len(meta.ExportedKeyMap) > 0 {
+			if err := mgr.LoadMyKeyFromExportedMap(meta.ExportedKeyMap); err != nil {
+				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to load E2EE key from DB metadata")
+			} else {
+				lc.UserLogin.Bridge.Log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
 			}
 		}
 	}
