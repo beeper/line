@@ -489,7 +489,7 @@ func TestAbortRemainsFatal(t *testing.T) {
 		}
 	}()
 	func() {
-		defer recoverError(&err)
+		defer recoverError(&err, nil, 0)
 		panic(ErrAbort)
 	}()
 }
@@ -574,4 +574,28 @@ func TestV1FallbackAfterOrdinaryV2DecryptError(t *testing.T) {
 		t.Fatalf("second V1 decrypt = (%q, %v)", got, err)
 	}
 	assertChannelCryptoDidNotMutateRuntime()
+	func() {
+		defer func() {
+			fatal, ok := recover().(error)
+			if !ok || !errors.Is(fatal, ErrAbort) {
+				t.Fatalf("channel abort was swallowed: %v", fatal)
+			}
+		}()
+		_, _ = rt.channelCrypto(func() ([]byte, error) {
+			rt.mod.g0 -= 160
+			rt.mod.mem[100] ^= 1
+			rt.imp.Import_m()
+			return nil, nil
+		})
+	}()
+	assertChannelCryptoDidNotMutateRuntime()
+	if got, err := rt.E2EEChannelDecryptV1(receiverChannel, second); err != nil || string(got) != "another message" {
+		t.Fatalf("V1 decrypt after channel abort = (%q, %v)", got, err)
+	}
+	if _, err := rt.imp.CallMethod("E2EEChannel", "decryptV1", receiverChannel, rt.imp.WriteEmvalBytes(tampered)); err == nil {
+		t.Fatal("direct embind decrypt accepted tampered ciphertext")
+	}
+	if rt.mod.g0 != stackPointer {
+		t.Fatal("recovered embind exception did not restore the native stack pointer")
+	}
 }

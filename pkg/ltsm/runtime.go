@@ -49,14 +49,16 @@ func (rt *Runtime) channelCrypto(call func() ([]byte, error)) ([]byte, error) {
 	stackPointer := rt.mod.g0
 	values, refCnts, free := rt.imp.emval.snapshot()
 	urandomFD, nextFD := rt.imp.urandomFD, rt.imp.nextFD
+	defer func() {
+		copy(rt.mod.mem, rt.rollbackMem)
+		rt.mod.g0 = stackPointer
+		rt.imp.emval.restore(values, refCnts, free)
+		rt.imp.urandomFD, rt.imp.nextFD = urandomFD, nextFD
+	}()
 	data, err := call()
 	if err == nil {
 		data = append([]byte(nil), data...)
 	}
-	copy(rt.mod.mem, rt.rollbackMem)
-	rt.mod.g0 = stackPointer
-	rt.imp.emval.restore(values, refCnts, free)
-	rt.imp.urandomFD, rt.imp.nextFD = urandomFD, nextFD
 	return data, err
 }
 

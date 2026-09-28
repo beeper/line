@@ -189,9 +189,10 @@ type wasmException string
 
 // recoverError converts ordinary WASM exceptions to errors. An abort or
 // unexpected panic may leave the runtime unusable, so propagate it.
-func recoverError(err *error) {
+func recoverError(err *error, mod *Module, stackPointer uint32) {
 	if v := recover(); v != nil {
 		if exception, ok := v.(wasmException); ok {
+			mod.g0 = stackPointer
 			*err = errors.New(string(exception))
 			return
 		}
@@ -933,10 +934,10 @@ func (imp *Imports) Construct(className string, args ...uint32) (uint32, error) 
 
 // Destroy invokes the registered C++ destructor for an embind object.
 func (imp *Imports) Destroy(className string, ptr uint32) (err error) {
-	defer recoverError(&err)
 	if ptr == 0 {
 		return nil
 	}
+	defer recoverError(&err, imp.mod, imp.mod.g0)
 	ci := imp.classByName[className]
 	if ci == nil {
 		return fmt.Errorf("ltsm: class %q not found", className)
@@ -976,7 +977,7 @@ func (imp *Imports) MarkSecureKeyExportable(ptr uint32) {
 // callIndirect dispatches to the appropriate callIndirectTN based on parameter count and types.
 // Most embind methods use all-uint32 params, but some have uint64 (bigint) params or returns.
 func (imp *Imports) callIndirect(invokerIdx uint32, argTypes []uint32, callArgs []uint32) (ret uint32, err error) {
-	defer recoverError(&err)
+	defer recoverError(&err, imp.mod, imp.mod.g0)
 	m := imp.mod
 	nArgs := len(callArgs)
 
