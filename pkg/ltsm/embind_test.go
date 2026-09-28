@@ -1,6 +1,7 @@
 package ltsm
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -527,14 +528,24 @@ func TestV1FallbackAfterOrdinaryV2DecryptError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	before := append([]byte(nil), rt.mod.mem...)
+	stackPointer := rt.mod.g0
+	assertChannelCryptoDidNotMutateRuntime := func() {
+		t.Helper()
+		if rt.mod.g0 != stackPointer || !bytes.Equal(rt.mod.mem, before) {
+			t.Fatal("channel crypto changed the native module state")
+		}
+	}
 	if _, err := rt.E2EEChannelDecryptV2(receiverChannel, "to", "from", 1, 2, 0, ciphertext); err == nil || !strings.Contains(err.Error(), "C++ exception thrown") {
 		t.Fatalf("V2 error = %v, want ordinary C++ exception", err)
 	}
+	assertChannelCryptoDidNotMutateRuntime()
 	tampered := append([]byte(nil), ciphertext...)
 	tampered[len(tampered)-1] ^= 1
 	if _, err := rt.E2EEChannelDecryptV1(receiverChannel, tampered); err == nil || !strings.Contains(err.Error(), "EM_JS error") {
 		t.Fatalf("tampered V1 error = %v, want ordinary EM_JS exception", err)
 	}
+	assertChannelCryptoDidNotMutateRuntime()
 	decrypted, err := rt.E2EEChannelDecryptV1(receiverChannel, ciphertext)
 	if err != nil {
 		t.Fatalf("V1 fallback failed: %v", err)
@@ -542,4 +553,25 @@ func TestV1FallbackAfterOrdinaryV2DecryptError(t *testing.T) {
 	if string(decrypted) != string(plaintext) {
 		t.Fatalf("V1 fallback = %q, want %q", decrypted, plaintext)
 	}
+	assertChannelCryptoDidNotMutateRuntime()
+	fresh, err := rt.E2EEChannelEncryptV1(senderChannel, []byte("another message"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertChannelCryptoDidNotMutateRuntime()
+	second, err := rt.E2EEChannelEncryptV1(senderChannel, []byte("another message"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(fresh, second) {
+		t.Fatal("two encryptions reused the same ciphertext")
+	}
+	assertChannelCryptoDidNotMutateRuntime()
+	if got, err := rt.E2EEChannelDecryptV1(receiverChannel, fresh); err != nil || string(got) != "another message" {
+		t.Fatalf("subsequent V1 decrypt = (%q, %v)", got, err)
+	}
+	if got, err := rt.E2EEChannelDecryptV1(receiverChannel, second); err != nil || string(got) != "another message" {
+		t.Fatalf("second V1 decrypt = (%q, %v)", got, err)
+	}
+	assertChannelCryptoDidNotMutateRuntime()
 }

@@ -142,6 +142,18 @@ func (t *EmvalTable) DecRef(handle uint32) {
 	}
 }
 
+func (t *EmvalTable) snapshot() (values []any, refCnts []int, free []uint32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]any(nil), t.values...), append([]int(nil), t.refCnts...), append([]uint32(nil), t.free...)
+}
+
+func (t *EmvalTable) restore(values []any, refCnts []int, free []uint32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.values, t.refCnts, t.free = values, refCnts, free
+}
+
 // Imports implements ModuleImports for the transpiled WASM Module.
 // It handles embind registrations and provides the runtime environment.
 type Imports struct {

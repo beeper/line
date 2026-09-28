@@ -11,8 +11,9 @@ import (
 // Runtime wraps the transpiled Module and embind Imports to provide
 // the same high-level API as wasm.Runtime.
 type Runtime struct {
-	mod *Module
-	imp *Imports
+	mod         *Module
+	imp         *Imports
+	rollbackMem []byte
 }
 
 // NewRuntime creates and initializes a new transpiled LTSM runtime.
@@ -36,6 +37,28 @@ func (rt *Runtime) ModuleMem() []byte {
 
 // Close releases resources. No-op for the transpiled module.
 func (rt *Runtime) Close() {}
+
+// Channel encryption and decryption are stateless, but the translated module
+// retains native allocations on both success and exception. Preserve the
+// output while restoring the native allocator and the existing key objects.
+func (rt *Runtime) channelCrypto(call func() ([]byte, error)) ([]byte, error) {
+	if len(rt.rollbackMem) != len(rt.mod.mem) {
+		rt.rollbackMem = make([]byte, len(rt.mod.mem))
+	}
+	copy(rt.rollbackMem, rt.mod.mem)
+	stackPointer := rt.mod.g0
+	values, refCnts, free := rt.imp.emval.snapshot()
+	urandomFD, nextFD := rt.imp.urandomFD, rt.imp.nextFD
+	data, err := call()
+	if err == nil {
+		data = append([]byte(nil), data...)
+	}
+	copy(rt.mod.mem, rt.rollbackMem)
+	rt.mod.g0 = stackPointer
+	rt.imp.emval.restore(values, refCnts, free)
+	rt.imp.urandomFD, rt.imp.nextFD = urandomFD, nextFD
+	return data, err
+}
 
 // --- SecureKey ---
 
@@ -338,69 +361,77 @@ func (rt *Runtime) E2EEChannelGenerateConfirmHash(chanPtr uint32, encKeyChain []
 }
 
 func (rt *Runtime) E2EEChannelEncryptV1(chanPtr uint32, plaintext []byte) ([]byte, error) {
-	handle, err := rt.imp.CallMethod("E2EEChannel", "encryptV1", chanPtr, rt.imp.WriteEmvalBytes(plaintext))
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: E2EEChannel.encryptV1 failed: %w", err)
-	}
-	data, err := rt.imp.ReadEmvalBytes(handle)
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: failed to read encryptV1 result: %w", err)
-	}
-	rt.imp.emval.DecRef(handle)
-	return data, nil
+	return rt.channelCrypto(func() ([]byte, error) {
+		handle, err := rt.imp.CallMethod("E2EEChannel", "encryptV1", chanPtr, rt.imp.WriteEmvalBytes(plaintext))
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: E2EEChannel.encryptV1 failed: %w", err)
+		}
+		data, err := rt.imp.ReadEmvalBytes(handle)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: failed to read encryptV1 result: %w", err)
+		}
+		rt.imp.emval.DecRef(handle)
+		return data, nil
+	})
 }
 
 func (rt *Runtime) E2EEChannelEncryptV2(chanPtr uint32,
 	to, from string, senderKeyID, receiverKeyID, contentType int, seq int64, plaintext []byte) ([]byte, error) {
-	toPtr := rt.imp.writeStdString(to)
-	fromPtr := rt.imp.writeStdString(from)
-	ptHandle := rt.imp.WriteEmvalBytes(plaintext)
-	handle, err := rt.imp.CallMethod("E2EEChannel", "encryptV2", chanPtr,
-		toPtr, fromPtr,
-		uint32(senderKeyID), uint32(receiverKeyID), uint32(contentType),
-		uint32(seq), ptHandle)
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: E2EEChannel.encryptV2 failed: %w", err)
-	}
-	data, err := rt.imp.ReadEmvalBytes(handle)
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: failed to read encryptV2 result: %w", err)
-	}
-	rt.imp.emval.DecRef(handle)
-	return data, nil
+	return rt.channelCrypto(func() ([]byte, error) {
+		toPtr := rt.imp.writeStdString(to)
+		fromPtr := rt.imp.writeStdString(from)
+		ptHandle := rt.imp.WriteEmvalBytes(plaintext)
+		handle, err := rt.imp.CallMethod("E2EEChannel", "encryptV2", chanPtr,
+			toPtr, fromPtr,
+			uint32(senderKeyID), uint32(receiverKeyID), uint32(contentType),
+			uint32(seq), ptHandle)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: E2EEChannel.encryptV2 failed: %w", err)
+		}
+		data, err := rt.imp.ReadEmvalBytes(handle)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: failed to read encryptV2 result: %w", err)
+		}
+		rt.imp.emval.DecRef(handle)
+		return data, nil
+	})
 }
 
 func (rt *Runtime) E2EEChannelDecryptV1(chanPtr uint32, ciphertext []byte) ([]byte, error) {
-	handle, err := rt.imp.CallMethod("E2EEChannel", "decryptV1", chanPtr, rt.imp.WriteEmvalBytes(ciphertext))
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: E2EEChannel.decryptV1 failed: %w", err)
-	}
-	data, err := rt.imp.ReadEmvalBytes(handle)
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: failed to read decryptV1 result: %w", err)
-	}
-	rt.imp.emval.DecRef(handle)
-	return data, nil
+	return rt.channelCrypto(func() ([]byte, error) {
+		handle, err := rt.imp.CallMethod("E2EEChannel", "decryptV1", chanPtr, rt.imp.WriteEmvalBytes(ciphertext))
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: E2EEChannel.decryptV1 failed: %w", err)
+		}
+		data, err := rt.imp.ReadEmvalBytes(handle)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: failed to read decryptV1 result: %w", err)
+		}
+		rt.imp.emval.DecRef(handle)
+		return data, nil
+	})
 }
 
 func (rt *Runtime) E2EEChannelDecryptV2(chanPtr uint32,
 	to, from string, senderKeyID, receiverKeyID, contentType int, ciphertext []byte) ([]byte, error) {
-	toPtr := rt.imp.writeStdString(to)
-	fromPtr := rt.imp.writeStdString(from)
-	ctHandle := rt.imp.WriteEmvalBytes(ciphertext)
-	handle, err := rt.imp.CallMethod("E2EEChannel", "decryptV2", chanPtr,
-		toPtr, fromPtr,
-		uint32(senderKeyID), uint32(receiverKeyID), uint32(contentType),
-		ctHandle)
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: E2EEChannel.decryptV2 failed: %w", err)
-	}
-	data, err := rt.imp.ReadEmvalBytes(handle)
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: failed to read decryptV2 result: %w", err)
-	}
-	rt.imp.emval.DecRef(handle)
-	return data, nil
+	return rt.channelCrypto(func() ([]byte, error) {
+		toPtr := rt.imp.writeStdString(to)
+		fromPtr := rt.imp.writeStdString(from)
+		ctHandle := rt.imp.WriteEmvalBytes(ciphertext)
+		handle, err := rt.imp.CallMethod("E2EEChannel", "decryptV2", chanPtr,
+			toPtr, fromPtr,
+			uint32(senderKeyID), uint32(receiverKeyID), uint32(contentType),
+			ctHandle)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: E2EEChannel.decryptV2 failed: %w", err)
+		}
+		data, err := rt.imp.ReadEmvalBytes(handle)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: failed to read decryptV2 result: %w", err)
+		}
+		rt.imp.emval.DecRef(handle)
+		return data, nil
+	})
 }
 
 // --- E2EEKeychain ---
