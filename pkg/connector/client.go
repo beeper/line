@@ -346,15 +346,20 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 	line.InvalidateOBSTokenCache()
 	stateError := status.BridgeStateErrorCode("line-logged-out")
 	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
-	if line.IsInvalidSenderKey(err) {
-		lc.missingE2EEKeyMu.Lock()
-		if lc.UserLogin.UserLogin != nil {
-			if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
+	invalidSenderKey := line.IsInvalidSenderKey(err)
+	needsFullE2EELogin := invalidSenderKey
+	lc.missingE2EEKeyMu.Lock()
+	if lc.UserLogin.UserLogin != nil {
+		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
+			if invalidSenderKey {
 				meta.ForceFullE2EELogin = true
 				meta.Certificate = ""
 			}
+			needsFullE2EELogin = meta.ForceFullE2EELogin
 		}
-		lc.missingE2EEKeyMu.Unlock()
+	}
+	lc.missingE2EEKeyMu.Unlock()
+	if needsFullE2EELogin {
 		stateError = "line-e2ee-key-missing"
 		stateMessage = lineMissingE2EEKeyMessage
 	}

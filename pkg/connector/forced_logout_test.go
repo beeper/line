@@ -120,6 +120,27 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 			if shouldPreserveExistingE2EEKeys(false, meta) == invalidKey {
 				t.Fatal("reconnect would reuse rejected keys or discard ordinary logout keys")
 			}
+			restarted := &bridgev2.UserLogin{UserLogin: reloaded, Bridge: bridge, User: login.User}
+			restarted.BridgeState = bridge.NewBridgeStateQueue(restarted)
+			t.Cleanup(restarted.BridgeState.Destroy)
+			if err := connector.LoadUserLogin(ctx, restarted); err != nil {
+				t.Fatal(err)
+			}
+			restarted.Client.(*LineClient).Connect(ctx)
+			select {
+			case state := <-matrix.states:
+				wantRestartError := status.BridgeStateErrorCode("line-logged-out")
+				wantRestartMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
+				if invalidKey {
+					wantRestartError = "line-e2ee-key-missing"
+					wantRestartMessage = lineMissingE2EEKeyMessage
+				}
+				if state.StateEvent != status.StateBadCredentials || state.Error != wantRestartError || state.Message != wantRestartMessage || state.UserAction != status.UserActionRelogin {
+					t.Fatalf("unexpected state after bridge restart: %v", state)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("restart reconnect state was not delivered")
+			}
 			oldLogin := loginWithCredentials
 			t.Cleanup(func() { loginWithCredentials = oldLogin })
 			var gotCertificate string
