@@ -1162,9 +1162,8 @@ func (lc *LineClient) cacheGroupMembersFromSystemMessage(msg *line.Message) {
 			lc.removeGroupMemberFromCache(chatMid, removedMID)
 		}
 	case "C_IC":
-		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
-		if len(parts) == 2 {
-			lc.removeGroupMemberFromCache(chatMid, parts[1])
+		for _, mid := range inviteeMIDsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"]) {
+			lc.removeGroupMemberFromCache(chatMid, mid)
 		}
 	}
 }
@@ -1210,6 +1209,14 @@ func midsFromSystemLocArgs(locArgs string) []string {
 		}
 	}
 	return mids
+}
+
+func inviteeMIDsFromSystemLocArgs(locArgs string) []string {
+	_, invitees, ok := strings.Cut(locArgs, "\x1e")
+	if !ok {
+		return nil
+	}
+	return midsFromSystemLocArgs(invitees)
 }
 
 // memberRemovalMIDs returns the actor and target encoded by LINE's C_MR/A_MR
@@ -2265,6 +2272,29 @@ func makeMemberChangeEvent(
 	}
 }
 
+func (lc *LineClient) makeSystemMemberChangesEvent(
+	portalKey networkid.PortalKey,
+	mids []string,
+	membership event.Membership,
+	ts time.Time,
+) *simplevent.ChatInfoChange {
+	members := make(bridgev2.ChatMemberMap, len(mids))
+	for _, mid := range mids {
+		sender := lc.eventSenderForMID(mid)
+		members[sender.Sender] = bridgev2.ChatMember{EventSender: sender, Membership: membership}
+	}
+	return &simplevent.ChatInfoChange{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventChatInfoChange,
+			PortalKey: portalKey,
+			Timestamp: ts,
+		},
+		ChatInfoChange: &bridgev2.ChatInfoChange{
+			MemberChanges: &bridgev2.ChatMemberList{MemberMap: members},
+		},
+	}
+}
+
 func (lc *LineClient) handleSelfLeave(chatMid string) {
 	selfID := string(lc.UserLogin.ID)
 	lc.handleSelfLeaveWithSender(chatMid, lc.eventSenderForMID(selfID))
@@ -2436,8 +2466,7 @@ func isHandledSystemMessage(msg *line.Message) bool {
 		_, _, ok := memberRemovalMIDs(msg)
 		return ok
 	case "C_GI", "C_MI", "A_MI", "C_IC":
-		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
-		return len(parts) == 2 && parts[1] != ""
+		return len(inviteeMIDsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"])) > 0
 	default:
 		return false
 	}
@@ -2507,11 +2536,15 @@ func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.Cha
 			false,
 		), true
 	case "C_GI", "C_MI", "A_MI":
-		// msg.From is the inviter, not the invitee. LOC_ARGS has the
-		// format inviterMid\x1einviteeMid.
-		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
-		inviteeMID := parts[1]
-		if lc.isOwnMID(inviteeMID) {
+		// msg.From is the inviter. LOC_ARGS has inviterMid\x1e followed by
+		// one or more invitee MIDs separated by \x1f.
+		invitees := inviteeMIDsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"])
+		otherInvitees := make([]string, 0, len(invitees))
+		for _, inviteeMID := range invitees {
+			if !lc.isOwnMID(inviteeMID) {
+				otherInvitees = append(otherInvitees, inviteeMID)
+				continue
+			}
 			// Defense-in-depth in case no invite operation arrives. Only do
 			// the network fallback if a portal does not already exist.
 			chatMID := msg.To
@@ -2524,30 +2557,17 @@ func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.Cha
 				}
 				lc.handleInviteForSelf(context.Background(), chatMID)
 			}()
+		}
+		if len(otherInvitees) == 0 {
 			return nil, true
 		}
-		return makeMemberChangeEvent(
-			portalKey,
-			lc.eventSenderForMID(inviteeMID),
-			bridgev2.EventSender{},
-			event.MembershipInvite,
-			ts,
-			false,
-		), true
+		return lc.makeSystemMemberChangesEvent(portalKey, otherInvitees, event.MembershipInvite, ts), true
 	case "C_IC":
-		// Invitation cancelled. LOC_ARGS has the format
-		// cancellerMid\x1einviteeMid.
-		parts := strings.SplitN(msg.ContentMetadata["LOC_ARGS"], "\x1e", 2)
-		inviteeMID := parts[1]
-		lc.removeGroupMemberFromCache(msg.To, inviteeMID)
-		return makeMemberChangeEvent(
-			portalKey,
-			lc.eventSenderForMID(inviteeMID),
-			bridgev2.EventSender{},
-			event.MembershipLeave,
-			ts,
-			false,
-		), true
+		invitees := inviteeMIDsFromSystemLocArgs(msg.ContentMetadata["LOC_ARGS"])
+		for _, inviteeMID := range invitees {
+			lc.removeGroupMemberFromCache(msg.To, inviteeMID)
+		}
+		return lc.makeSystemMemberChangesEvent(portalKey, invitees, event.MembershipLeave, ts), true
 	case "A_MC":
 		// Auto-join via call / member added. msg.From is the person added.
 		lc.addGroupMembersToCache(msg.To, msg.From)
