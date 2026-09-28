@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -467,39 +468,78 @@ func TestCurve25519KeyGenerate(t *testing.T) {
 	}
 }
 
-func TestCallIndirectConvertsPanicToError(t *testing.T) {
+func TestUnexpectedDispatchPanicIsFatal(t *testing.T) {
 	_, imp := initModule(t)
-
-	// A nil argTypes slice panics inside the dispatch; the fatal panic must
-	// be converted to an error and mark the runtime dead.
-	ret, err := imp.callIndirect(0, nil, nil)
-	if ret != 0 {
-		t.Fatalf("ret = %d, want 0", ret)
-	}
-	if err == nil {
-		t.Fatal("expected error from recovered panic")
-	}
-	if !imp.dead {
-		t.Fatal("runtime not marked dead after recovered panic")
-	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("unexpected dispatch panic was swallowed")
+		}
+	}()
+	_, _ = imp.callIndirect(0, nil, nil)
 }
 
-func TestDeadRuntimeFailsFast(t *testing.T) {
-	_, imp := initModule(t)
+func TestAbortRemainsFatal(t *testing.T) {
+	var err error
+	defer func() {
+		recovered := recover()
+		fatal, ok := recovered.(error)
+		if !ok || !errors.Is(fatal, ErrAbort) || err != nil {
+			t.Fatalf("abort was swallowed: recovered=%v, err=%v", recovered, err)
+		}
+	}()
+	func() {
+		defer recoverError(&err)
+		panic(ErrAbort)
+	}()
+}
 
-	imp.markDead(ErrAbort)
-	imp.markDead("second fatal error") // first fatal error wins
-
-	if _, err := imp.CallMethod("SecureKey", "loadToken", 0); !errors.Is(err, ErrAbort) {
-		t.Fatalf("CallMethod on dead runtime: %v", err)
+func TestV1FallbackAfterOrdinaryV2DecryptError(t *testing.T) {
+	rt, err := NewRuntime()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := imp.CallStatic("SecureKey", "loadToken", 0); !errors.Is(err, ErrAbort) {
-		t.Fatalf("CallStatic on dead runtime: %v", err)
+	senderKey, err := rt.Curve25519KeyGenerate()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := imp.Construct("Hmac"); !errors.Is(err, ErrAbort) {
-		t.Fatalf("Construct on dead runtime: %v", err)
+	receiverKey, err := rt.Curve25519KeyGenerate()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := imp.Destroy("SecureKey", 1); !errors.Is(err, ErrAbort) {
-		t.Fatalf("Destroy on dead runtime: %v", err)
+	senderPub, err := rt.Curve25519KeyGetPublicKey(senderKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverPub, err := rt.Curve25519KeyGetPublicKey(receiverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	senderChannel, err := rt.Curve25519KeyCreateChannel(senderKey, receiverPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverChannel, err := rt.Curve25519KeyCreateChannel(receiverKey, senderPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte("iOS V1 message")
+	ciphertext, err := rt.E2EEChannelEncryptV1(senderChannel, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.E2EEChannelDecryptV2(receiverChannel, "to", "from", 1, 2, 0, ciphertext); err == nil || !strings.Contains(err.Error(), "C++ exception thrown") {
+		t.Fatalf("V2 error = %v, want ordinary C++ exception", err)
+	}
+	tampered := append([]byte(nil), ciphertext...)
+	tampered[len(tampered)-1] ^= 1
+	if _, err := rt.E2EEChannelDecryptV1(receiverChannel, tampered); err == nil || !strings.Contains(err.Error(), "EM_JS error") {
+		t.Fatalf("tampered V1 error = %v, want ordinary EM_JS exception", err)
+	}
+	decrypted, err := rt.E2EEChannelDecryptV1(receiverChannel, ciphertext)
+	if err != nil {
+		t.Fatalf("V1 fallback failed: %v", err)
+	}
+	if string(decrypted) != string(plaintext) {
+		t.Fatalf("V1 fallback = %q, want %q", decrypted, plaintext)
 	}
 }

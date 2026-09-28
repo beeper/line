@@ -151,11 +151,6 @@ type Imports struct {
 	classByName map[string]*ClassInfo
 	emval       *EmvalTable
 
-	// dead is set when a WASM call hits a fatal path (_abort, C++ throw,
-	// EM_JS throw) that cannot be recovered. Later calls return deadErr.
-	dead    bool
-	deadErr error
-
 	// File descriptor state for /dev/urandom emulation
 	urandomFD uint32
 	nextFD    uint32
@@ -177,26 +172,18 @@ func (imp *Imports) SetModule(m *Module) {
 	imp.mod = m
 }
 
-// markDead records a fatal WASM error so subsequent calls fail fast.
-// The first fatal error is retained.
-func (imp *Imports) markDead(v any) {
-	if imp.dead {
-		return
-	}
-	imp.dead = true
-	if err, ok := v.(error); ok {
-		imp.deadErr = err
-	} else {
-		imp.deadErr = fmt.Errorf("%v", v)
-	}
-}
+// wasmException marks a normal exception reported by the embedded module.
+type wasmException string
 
-// checkDead is the defer target for functions that dispatch into the WASM
-// module: a fatal panic is converted to the dead-runtime error.
-func (imp *Imports) checkDead(err *error) {
+// recoverError converts ordinary WASM exceptions to errors. An abort or
+// unexpected panic may leave the runtime unusable, so propagate it.
+func recoverError(err *error) {
 	if v := recover(); v != nil {
-		imp.markDead(v)
-		*err = imp.deadErr
+		if exception, ok := v.(wasmException); ok {
+			*err = errors.New(string(exception))
+			return
+		}
+		panic(v)
 	}
 }
 
@@ -523,7 +510,7 @@ func (imp *Imports) Import_o(p0, p1, p2 uint32) uint32 { // EM_JS dispatcher
 		if len(args) >= 2 {
 			errMsg = imp.readCStr(args[1])
 		}
-		panic(fmt.Sprintf("ltsm: EM_JS error: %s: %s", errType, errMsg))
+		panic(wasmException(fmt.Sprintf("ltsm: EM_JS error: %s: %s", errType, errMsg)))
 
 	case 1456985: // init getRandomValues
 		return 0
@@ -713,7 +700,7 @@ func (imp *Imports) Import_A(p0, p1 uint32) uint32 { // _emval_get_property
 }
 
 func (imp *Imports) Import_B(p0, p1, p2 uint32) { // __cxa_throw
-	panic(fmt.Sprintf("ltsm: C++ exception thrown (type=%d, ptr=%d)", p1, p0))
+	panic(wasmException(fmt.Sprintf("ltsm: C++ exception thrown (type=%d, ptr=%d)", p1, p0)))
 }
 
 func (imp *Imports) Import_C(p0 uint32) uint32 { // emscripten_resize_heap
@@ -866,9 +853,6 @@ func toFloat64(v any) float64 {
 
 // CallMethod calls an embind instance method on a C++ object.
 func (imp *Imports) CallMethod(className, methodName string, thisPtr uint32, args ...uint32) (uint32, error) {
-	if imp.dead {
-		return 0, imp.deadErr
-	}
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -897,9 +881,6 @@ func (imp *Imports) CallMethod(className, methodName string, thisPtr uint32, arg
 
 // CallStatic calls an embind static method.
 func (imp *Imports) CallStatic(className, methodName string, args ...uint32) (uint32, error) {
-	if imp.dead {
-		return 0, imp.deadErr
-	}
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -920,9 +901,6 @@ func (imp *Imports) CallStatic(className, methodName string, args ...uint32) (ui
 
 // Construct calls an embind class constructor.
 func (imp *Imports) Construct(className string, args ...uint32) (uint32, error) {
-	if imp.dead {
-		return 0, imp.deadErr
-	}
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -943,10 +921,7 @@ func (imp *Imports) Construct(className string, args ...uint32) (uint32, error) 
 
 // Destroy invokes the registered C++ destructor for an embind object.
 func (imp *Imports) Destroy(className string, ptr uint32) (err error) {
-	defer imp.checkDead(&err)
-	if imp.dead {
-		return imp.deadErr
-	}
+	defer recoverError(&err)
 	if ptr == 0 {
 		return nil
 	}
@@ -989,7 +964,7 @@ func (imp *Imports) MarkSecureKeyExportable(ptr uint32) {
 // callIndirect dispatches to the appropriate callIndirectTN based on parameter count and types.
 // Most embind methods use all-uint32 params, but some have uint64 (bigint) params or returns.
 func (imp *Imports) callIndirect(invokerIdx uint32, argTypes []uint32, callArgs []uint32) (ret uint32, err error) {
-	defer imp.checkDead(&err)
+	defer recoverError(&err)
 	m := imp.mod
 	nArgs := len(callArgs)
 
