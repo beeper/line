@@ -56,6 +56,17 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 	if err != nil || got != plaintext || groupKey != myRaw {
 		t.Fatalf("group V1 decrypt = (%q, %d, %v)", got, groupKey, err)
 	}
+	salt, _ := base64.StdEncoding.DecodeString(chunks[0])
+	body, _ := base64.StdEncoding.DecodeString(chunks[1])
+	for _, n := range []int{4, 8} {
+		repacked := append([]string(nil), chunks...)
+		repacked[0] = base64.StdEncoding.EncodeToString(append(salt, body[:n]...))
+		repacked[1] = base64.StdEncoding.EncodeToString(body[n:])
+		repackedMsg := &line.Message{Chunks: repacked, From: "u-sender", To: "u-receiver", ContentMetadata: map[string]string{"e2eeVersion": "1"}}
+		if got, err := m.DecryptMessageV2(repackedMsg); err != nil || got != plaintext {
+			t.Fatalf("repacked V1 decrypt (body bytes %d) = (%q, %v)", n, got, err)
+		}
+	}
 	fallback, err := m.EncryptMessageV2Raw("c-test", "u-sender", myKey, myPub, myRaw, myRaw, 0, []byte(plaintext))
 	if err != nil {
 		t.Fatalf("V2 encrypt with V1 fallback: %v", err)
@@ -67,7 +78,7 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 	if got, err := m.DecryptMessageV2(&line.Message{Chunks: fallback, From: "u-sender", To: "u-receiver"}); err != nil || got != plaintext {
 		t.Fatalf("V1 fallback decrypt = (%q, %v)", got, err)
 	}
-	for _, first := range []string{base64.StdEncoding.EncodeToString(make([]byte, 12)), "!!!"} {
+	for _, first := range []string{base64.StdEncoding.EncodeToString(make([]byte, 12)), "!!!", ""} {
 		invalid := *msg
 		invalid.Chunks = append([]string(nil), chunks...)
 		invalid.Chunks[0] = first

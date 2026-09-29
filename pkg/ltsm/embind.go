@@ -158,6 +158,7 @@ func (t *EmvalTable) restore(values []any, refCnts []int, free []uint32) {
 // It handles embind registrations and provides the runtime environment.
 type Imports struct {
 	mod         *Module
+	owner       *Runtime
 	types       map[uint32]*TypeInfo
 	classes     map[uint32]*ClassInfo
 	classByName map[string]*ClassInfo
@@ -866,6 +867,7 @@ func toFloat64(v any) float64 {
 
 // CallMethod calls an embind instance method on a C++ object.
 func (imp *Imports) CallMethod(className, methodName string, thisPtr uint32, args ...uint32) (uint32, error) {
+	imp.noteChannelState(className)
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -894,6 +896,7 @@ func (imp *Imports) CallMethod(className, methodName string, thisPtr uint32, arg
 
 // CallStatic calls an embind static method.
 func (imp *Imports) CallStatic(className, methodName string, args ...uint32) (uint32, error) {
+	imp.noteChannelState(className)
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -914,6 +917,7 @@ func (imp *Imports) CallStatic(className, methodName string, args ...uint32) (ui
 
 // Construct calls an embind class constructor.
 func (imp *Imports) Construct(className string, args ...uint32) (uint32, error) {
+	imp.noteChannelState(className)
 	ci := imp.classByName[className]
 	if ci == nil {
 		return 0, fmt.Errorf("ltsm: class %q not found", className)
@@ -937,6 +941,7 @@ func (imp *Imports) Destroy(className string, ptr uint32) (err error) {
 	if ptr == 0 {
 		return nil
 	}
+	imp.noteChannelState(className)
 	defer recoverError(&err, imp.mod, imp.mod.g0)
 	ci := imp.classByName[className]
 	if ci == nil {
@@ -947,6 +952,16 @@ func (imp *Imports) Destroy(className string, ptr uint32) (err error) {
 	}
 	imp.mod.callIndirectT7(ci.DestructorIdx, ptr)
 	return nil
+}
+
+func (imp *Imports) noteChannelState(className string) {
+	if imp.owner == nil || imp.owner.isCrypto {
+		return
+	}
+	switch className {
+	case "Curve25519Key", "E2EEKey", "E2EEChannel", "E2EEKeychain":
+		imp.owner.cryptoDirty = true
+	}
 }
 
 // WriteEmvalBytes stores a byte slice in the emval table and returns the handle.
