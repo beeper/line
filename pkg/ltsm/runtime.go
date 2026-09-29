@@ -78,12 +78,10 @@ func (rt *Runtime) channelCrypto(call func(*Runtime) ([]byte, error)) (data []by
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			rt.cryptoDirty = true
-			_ = rt.refreshCrypto()
 			panic(recovered)
 		}
 		if err != nil {
 			rt.cryptoDirty = true
-			_ = rt.refreshCrypto()
 		}
 	}()
 	data, err = call(rt.crypto)
