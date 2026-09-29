@@ -390,7 +390,16 @@ func (m *Manager) DecryptMessageV2(msg *line.Message) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cipher, err := assembleCipher(msg.Chunks)
+	ver, err := cipherVersion(msg.Chunks)
+	if err != nil {
+		return "", err
+	}
+	var cipher []byte
+	if ver == 1 {
+		cipher, err = assembleCipherV1(msg.Chunks)
+	} else {
+		cipher, err = assembleCipher(msg.Chunks)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -398,18 +407,17 @@ func (m *Manager) DecryptMessageV2(msg *line.Message) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	ver := 2
-	if vStr, ok := msg.ContentMetadata["e2eeVersion"]; ok && vStr == "1" {
-		ver = 1
-	}
-
 	if ver == 1 {
-		cipher, err := assembleCipherV1(msg.Chunks)
-		if err != nil {
-			return "", err
-		}
 		pt, _, err := m.runner.ChannelDecryptV1(chanID, senderKeyID, receiverKeyID, base64.StdEncoding.EncodeToString(cipher))
+		if err != nil && !isFatalLTSMError(err) {
+			if cipherV2, errV2 := assembleCipher(msg.Chunks); errV2 == nil {
+				if ptV2, _, errV2 := m.runner.ChannelDecryptV2(chanID, msg.To, msg.From, senderKeyID, receiverKeyID, msg.ContentType, base64.StdEncoding.EncodeToString(cipherV2)); errV2 == nil {
+					return ptV2, nil
+				} else {
+					return "", fmt.Errorf("V1 decrypt failed: %w; V2 fallback also failed: %w", err, errV2)
+				}
+			}
+		}
 		if err != nil {
 			return "", err
 		}
@@ -417,22 +425,18 @@ func (m *Manager) DecryptMessageV2(msg *line.Message) (string, error) {
 	}
 
 	pt, _, err := m.runner.ChannelDecryptV2(chanID, msg.To, msg.From, senderKeyID, receiverKeyID, msg.ContentType, base64.StdEncoding.EncodeToString(cipher))
-	if err != nil {
-		if isFatalLTSMError(err) {
+	if err != nil && !isFatalLTSMError(err) {
+		cipherV1, errV1 := assembleCipherV1(msg.Chunks)
+		if errV1 != nil {
 			return "", err
 		}
-		// V2 decrypt failed, try V1 as fallback (some clients like iOS still use V1)
-		cipherV1, err2 := assembleCipherV1(msg.Chunks)
-		if err2 != nil {
-			return "", err // return original V2 error
-		}
-		ptV1, _, err2 := m.runner.ChannelDecryptV1(chanID, senderKeyID, receiverKeyID, base64.StdEncoding.EncodeToString(cipherV1))
-		if err2 != nil {
-			return "", fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %w", err, err2)
+		ptV1, _, errV1 := m.runner.ChannelDecryptV1(chanID, senderKeyID, receiverKeyID, base64.StdEncoding.EncodeToString(cipherV1))
+		if errV1 != nil {
+			return "", fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %w", err, errV1)
 		}
 		return ptV1, nil
 	}
-	return pt, nil
+	return pt, err
 }
 
 func assembleCipherV1(chunks []string) ([]byte, error) {
@@ -453,6 +457,17 @@ func assembleCipherV1(chunks []string) ([]byte, error) {
 		return nil, err
 	}
 	return append(append(b0, b1...), b2...), nil
+}
+
+func cipherVersion(chunks []string) (int, error) {
+	first, err := base64.StdEncoding.DecodeString(strings.TrimSpace(chunks[0]))
+	if err != nil {
+		return 0, err
+	}
+	if len(first) == 16 {
+		return 2, nil
+	}
+	return 1, nil
 }
 
 func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroupSharedKey) (int, error) {
@@ -563,34 +578,50 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 		return "", groupKeyID, fmt.Errorf("group key %d not found", groupKeyID)
 	}
 
+	ver, err := cipherVersion(msg.Chunks)
+	if err != nil {
+		return "", groupKeyID, err
+	}
+	var cipher []byte
+	if ver == 1 {
+		cipher, err = assembleCipherV1(msg.Chunks)
+	} else {
+		cipher, err = assembleCipher(msg.Chunks)
+	}
+	if err != nil {
+		return "", groupKeyID, err
+	}
 	chanID, err := m.ensureGroupChannel(chatMid, groupKeyID, unwrappedKeyID, senderKeyID)
 	if err != nil {
 		return "", groupKeyID, err
 	}
-
-	cipher, err := assembleCipher(msg.Chunks)
-	if err != nil {
-		return "", groupKeyID, err
+	if ver == 1 {
+		pt, _, err := m.runner.ChannelDecryptV1(chanID, senderKeyID, groupKeyID, base64.StdEncoding.EncodeToString(cipher))
+		if err != nil && !isFatalLTSMError(err) {
+			if cipherV2, errV2 := assembleCipher(msg.Chunks); errV2 == nil {
+				if ptV2, _, errV2 := m.runner.ChannelDecryptV2(chanID, msg.To, msg.From, senderKeyID, groupKeyID, msg.ContentType, base64.StdEncoding.EncodeToString(cipherV2)); errV2 == nil {
+					return ptV2, groupKeyID, nil
+				} else {
+					return "", groupKeyID, fmt.Errorf("V1 decrypt failed: %w; V2 fallback also failed: %w", err, errV2)
+				}
+			}
+		}
+		return pt, groupKeyID, err
 	}
 
 	pt, _, err := m.runner.ChannelDecryptV2(chanID, msg.To, msg.From, senderKeyID, groupKeyID, msg.ContentType, base64.StdEncoding.EncodeToString(cipher))
-	if err != nil {
-		if isFatalLTSMError(err) {
+	if err != nil && !isFatalLTSMError(err) {
+		cipherV1, errV1 := assembleCipherV1(msg.Chunks)
+		if errV1 != nil {
 			return "", groupKeyID, err
 		}
-		// V2 decrypt failed, try V1 as fallback (some clients like iOS still use V1)
-		cipherV1, err2 := assembleCipherV1(msg.Chunks)
-		if err2 != nil {
-			return "", groupKeyID, err // return original V2 error
-		}
-		ptV1, _, err2 := m.runner.ChannelDecryptV1(chanID, senderKeyID, groupKeyID, base64.StdEncoding.EncodeToString(cipherV1))
-		if err2 != nil {
-			return "", groupKeyID, fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %w", err, err2)
+		ptV1, _, errV1 := m.runner.ChannelDecryptV1(chanID, senderKeyID, groupKeyID, base64.StdEncoding.EncodeToString(cipherV1))
+		if errV1 != nil {
+			return "", groupKeyID, fmt.Errorf("V2 decrypt failed: %w; V1 fallback also failed: %w", err, errV1)
 		}
 		return ptV1, groupKeyID, nil
 	}
-
-	return pt, groupKeyID, nil
+	return pt, groupKeyID, err
 }
 
 func (m *Manager) ensureGroupChannel(chatMid string, groupKeyID, unwrappedKeyID, senderKeyID int) (int, error) {

@@ -1,9 +1,11 @@
 package ltsm
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -464,5 +466,85 @@ func TestCurve25519KeyGenerate(t *testing.T) {
 	t.Logf("Curve25519 public key: %d bytes", len(pubKey))
 	if len(pubKey) != 32 {
 		t.Errorf("expected 32-byte public key, got %d bytes", len(pubKey))
+	}
+}
+
+func TestV1FallbackAfterOrdinaryV2DecryptError(t *testing.T) {
+	rt, err := NewRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	senderKey, err := rt.Curve25519KeyGenerate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverKey, err := rt.Curve25519KeyGenerate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	senderPub, err := rt.Curve25519KeyGetPublicKey(senderKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverPub, err := rt.Curve25519KeyGetPublicKey(receiverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	senderChannel, err := rt.Curve25519KeyCreateChannel(senderKey, receiverPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverChannel, err := rt.Curve25519KeyCreateChannel(receiverKey, senderPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte("iOS V1 message")
+	ciphertext, err := rt.E2EEChannelEncryptV1(senderChannel, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := append([]byte(nil), rt.mod.mem...)
+	stackPointer := rt.mod.g0
+	assertChannelCryptoDidNotMutateRuntime := func() {
+		t.Helper()
+		if rt.mod.g0 != stackPointer || !bytes.Equal(rt.mod.mem, before) {
+			t.Fatal("channel crypto changed the native module state")
+		}
+	}
+	if _, err := rt.E2EEChannelDecryptV2(receiverChannel, "to", "from", 1, 2, 0, ciphertext); err == nil || !strings.Contains(err.Error(), "C++ exception thrown") {
+		t.Fatalf("V2 error = %v, want ordinary C++ exception", err)
+	}
+	assertChannelCryptoDidNotMutateRuntime()
+	tampered := append([]byte(nil), ciphertext...)
+	tampered[len(tampered)-1] ^= 1
+	if _, err := rt.E2EEChannelDecryptV1(receiverChannel, tampered); err == nil || !strings.Contains(err.Error(), "EM_JS error") {
+		t.Fatalf("tampered V1 error = %v, want ordinary EM_JS exception", err)
+	}
+	assertChannelCryptoDidNotMutateRuntime()
+	decrypted, err := rt.E2EEChannelDecryptV1(receiverChannel, ciphertext)
+	if err != nil {
+		t.Fatalf("V1 fallback failed: %v", err)
+	}
+	if string(decrypted) != string(plaintext) {
+		t.Fatalf("V1 fallback = %q, want %q", decrypted, plaintext)
+	}
+	assertChannelCryptoDidNotMutateRuntime()
+	func() {
+		defer func() {
+			fatal, ok := recover().(error)
+			if !ok || !errors.Is(fatal, ErrAbort) {
+				t.Fatalf("channel abort was swallowed: %v", fatal)
+			}
+		}()
+		_, _ = rt.channelCrypto(func(crypto *Runtime) ([]byte, error) {
+			crypto.mod.g0 -= 160
+			crypto.mod.mem[100] ^= 1
+			crypto.imp.Import_m()
+			return nil, nil
+		})
+	}()
+	assertChannelCryptoDidNotMutateRuntime()
+	if got, err := rt.E2EEChannelDecryptV1(receiverChannel, ciphertext); err != nil || string(got) != string(plaintext) {
+		t.Fatalf("V1 decrypt after channel abort = (%q, %v)", got, err)
 	}
 }
