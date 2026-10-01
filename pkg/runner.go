@@ -21,7 +21,6 @@ type Runner struct {
 	token         string
 	clientVersion string
 	skPtr         uint32         // SecureKey from loadToken
-	signingSKPtr  uint32         // Separate SecureKey used for request signing
 	storageKey    uint32         // AesKey ptr (after StorageInit)
 	loginCurveKey uint32         // Curve25519Key ptr (after GenerateE2EESecret)
 	keyStore      map[int]uint32 // internal ID -> E2EEKey ptr
@@ -29,6 +28,11 @@ type Runner struct {
 	nextID        int
 	mu            sync.Mutex
 
+	// Signing state can be recreated from configuration and the access token
+	// without invalidating the E2EE objects in rt. All access is under mu.
+	signingRT       *ltsm.Runtime
+	signingSKPtr    uint32
+	signingCalls    int
 	signingContexts map[[sha256.Size]byte]signingContext
 	signingLRU      [][sha256.Size]byte
 
@@ -41,6 +45,9 @@ type Runner struct {
 }
 
 const signingCacheCapacity = 4
+
+// Bound the lifetime of native allocations even when cached keys are reused.
+const signingRefreshCalls = 1024
 
 type signingContext struct {
 	derivedKeyPtr uint32
@@ -96,16 +103,15 @@ func GetRunner() (*Runner, error) {
 		}
 
 		globalRunner = &Runner{
-			rt:              rt,
-			token:           token,
-			clientVersion:   clientVersion,
-			skPtr:           skPtr,
-			keyStore:        make(map[int]uint32),
-			channelStore:    make(map[int]uint32),
-			signingContexts: make(map[[sha256.Size]byte]signingContext),
-			nextID:          1,
-			goKeys:          make(map[int]*goKeyEntry),
-			goChannels:      make(map[int]*ltsm.Channel),
+			rt:            rt,
+			token:         token,
+			clientVersion: clientVersion,
+			skPtr:         skPtr,
+			keyStore:      make(map[int]uint32),
+			channelStore:  make(map[int]uint32),
+			nextID:        1,
+			goKeys:        make(map[int]*goKeyEntry),
+			goChannels:    make(map[int]*ltsm.Channel),
 		}
 	})
 	return globalRunner, runnerErr
@@ -230,8 +236,8 @@ func (r *Runner) touchSigningContext(key [sha256.Size]byte) {
 }
 
 func (r *Runner) destroySigningContext(ctx signingContext) error {
-	hmacErr := r.rt.HmacDestroy(ctx.hmacPtr)
-	keyErr := r.rt.SecureKeyDestroy(ctx.derivedKeyPtr)
+	hmacErr := r.signingRT.HmacDestroy(ctx.hmacPtr)
+	keyErr := r.signingRT.SecureKeyDestroy(ctx.derivedKeyPtr)
 	return errors.Join(hmacErr, keyErr)
 }
 
@@ -244,20 +250,20 @@ func (r *Runner) signingHMAC(accessToken string) (uint32, error) {
 
 	if r.signingSKPtr == 0 {
 		var err error
-		r.signingSKPtr, err = r.rt.SecureKeyLoadToken(r.token)
+		r.signingSKPtr, err = r.signingRT.SecureKeyLoadToken(r.token)
 		if err != nil {
 			return 0, err
 		}
 	}
 
 	clientVersionHash := sha256.Sum256([]byte(r.clientVersion))
-	derivedKeyPtr, err := r.rt.SecureKeyDeriveKey(r.signingSKPtr, clientVersionHash[:], key[:])
+	derivedKeyPtr, err := r.signingRT.SecureKeyDeriveKey(r.signingSKPtr, clientVersionHash[:], key[:])
 	if err != nil {
 		return 0, err
 	}
-	hmacPtr, err := r.rt.HmacNew(derivedKeyPtr)
+	hmacPtr, err := r.signingRT.HmacNew(derivedKeyPtr)
 	if err != nil {
-		_ = r.rt.SecureKeyDestroy(derivedKeyPtr)
+		_ = r.signingRT.SecureKeyDestroy(derivedKeyPtr)
 		return 0, err
 	}
 	ctx := signingContext{derivedKeyPtr: derivedKeyPtr, hmacPtr: hmacPtr}
@@ -288,17 +294,67 @@ func (r *Runner) GetSignature(reqPath, body, accessToken string) (string, error)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	signature, err := r.getSignature(reqPath, body, accessToken)
+	if errors.Is(err, ltsm.ErrAbort) {
+		// getSignature discarded the aborted runtime. Retry once from a clean
+		// instance; a request that cannot fit must return an error, not loop.
+		return r.getSignature(reqPath, body, accessToken)
+	}
+	return signature, err
+}
+
+func (r *Runner) resetSigningRuntime() {
+	if r.signingRT != nil {
+		// Drop the whole module instead of invoking native destructors on a
+		// runtime whose allocator and stack may be damaged.
+		r.signingRT.Close()
+	}
+	r.signingRT = nil
+	r.signingSKPtr = 0
+	r.signingCalls = 0
+	r.signingContexts = nil
+	r.signingLRU = nil
+}
+
+// getSignature runs under mu and owns the entire signing attempt, including
+// initialization, key derivation, cache eviction and digest generation.
+func (r *Runner) getSignature(reqPath, body, accessToken string) (signature string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr, ok := recovered.(error)
+			if !ok || !errors.Is(panicErr, ltsm.ErrAbort) {
+				r.resetSigningRuntime()
+				panic(recovered)
+			}
+			signature = ""
+			err = ltsmPanicError("ltsm request signing", recovered)
+		}
+		if err != nil {
+			r.resetSigningRuntime()
+		}
+	}()
+
+	if r.signingRT == nil || r.signingCalls >= signingRefreshCalls {
+		r.resetSigningRuntime()
+		r.signingRT, err = ltsm.NewRuntime()
+		if err != nil {
+			return "", fmt.Errorf("failed to initialize signing runtime: %w", err)
+		}
+		r.signingContexts = make(map[[sha256.Size]byte]signingContext)
+	}
+
 	hmacPtr, err := r.signingHMAC(accessToken)
 	if err != nil {
 		return "", err
 	}
-	sig, err := r.rt.HmacDigest(hmacPtr, []byte(reqPath+body))
+	sig, err := r.signingRT.HmacDigest(hmacPtr, []byte(reqPath+body))
 	if err != nil {
 		return "", err
 	}
 	if len(sig) == 0 {
 		return "", fmt.Errorf("runner returned empty signature")
 	}
+	r.signingCalls++
 	return base64.StdEncoding.EncodeToString(sig), nil
 }
 
