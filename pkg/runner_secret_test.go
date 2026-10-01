@@ -1,8 +1,9 @@
 package line
 
 import (
-	"crypto/sha256"
+	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -139,11 +140,10 @@ func newSigningTestRunner(t *testing.T) *Runner {
 		t.Fatalf("SecureKeyLoadToken failed: %v", err)
 	}
 	return &Runner{
-		rt:              rt,
-		token:           token,
-		clientVersion:   "3.7.2",
-		skPtr:           skPtr,
-		signingContexts: make(map[[sha256.Size]byte]signingContext),
+		rt:            rt,
+		token:         token,
+		clientVersion: "3.7.2",
+		skPtr:         skPtr,
 	}
 }
 
@@ -152,7 +152,10 @@ func TestGetSignatureReusesSigningContext(t *testing.T) {
 		t.Skip("skipping runner integration test in short mode")
 	}
 	r := newSigningTestRunner(t)
+	e2eeRuntime := r.rt
+	e2eeMemory := bytes.Clone(r.rt.ModuleMem())
 	var want string
+	var firstSigningRuntime *ltsm.Runtime
 	for i := 0; i < 6000; i++ {
 		signature, err := r.GetSignature("/api/test", "{}", "token")
 		if err != nil {
@@ -160,12 +163,19 @@ func TestGetSignatureReusesSigningContext(t *testing.T) {
 		}
 		if i == 0 {
 			want = signature
+			firstSigningRuntime = r.signingRT
 		} else if signature != want {
 			t.Fatalf("signature %d changed: got %q want %q", i+1, signature, want)
 		}
 	}
 	if got := len(r.signingContexts); got != 1 {
 		t.Fatalf("unexpected signing cache size: got %d want 1", got)
+	}
+	if r.signingRT == firstSigningRuntime {
+		t.Fatal("signing runtime was never recycled")
+	}
+	if r.rt != e2eeRuntime || !bytes.Equal(r.rt.ModuleMem(), e2eeMemory) {
+		t.Fatal("signing changed the E2EE runtime")
 	}
 }
 
@@ -189,6 +199,71 @@ func TestGetSignatureEvictsSigningContexts(t *testing.T) {
 	}
 	if got := len(r.signingContexts); got != signingCacheCapacity {
 		t.Fatalf("unexpected signing cache size: got %d want %d", got, signingCacheCapacity)
+	}
+}
+
+func TestGetSignatureRecoversFromExhaustedRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping runner integration test in short mode")
+	}
+	r := newSigningTestRunner(t)
+	want, err := r.GetSignature("/api/test", "{}", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRuntime := r.signingRT
+	e2eeMemory := bytes.Clone(r.rt.ModuleMem())
+
+	// Retain native keys until the fixed WASM heap is exhausted, so the next
+	// cache miss exercises real allocator failure during key derivation.
+	func() {
+		defer func() {
+			panicErr, ok := recover().(error)
+			if !ok || !errors.Is(panicErr, ltsm.ErrAbort) {
+				t.Fatalf("expected heap exhaustion, got %v", panicErr)
+			}
+		}()
+		for i := 0; i < 20000; i++ {
+			if _, err := oldRuntime.SecureKeyLoadToken(r.token); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}()
+
+	if _, err := r.GetSignature("/api/test", "{}", "another-token"); err != nil {
+		t.Fatalf("signing after heap exhaustion failed: %v", err)
+	}
+	if r.signingRT == oldRuntime {
+		t.Fatal("aborted signing runtime was reused")
+	}
+	got, err := r.GetSignature("/api/test", "{}", "token")
+	if err != nil || got != want {
+		t.Fatalf("signature after recovery = %q, %v; want %q", got, err, want)
+	}
+	if !bytes.Equal(r.rt.ModuleMem(), e2eeMemory) {
+		t.Fatal("signing recovery changed the E2EE runtime")
+	}
+}
+
+func TestGetSignatureReturnsErrorWhenFreshRuntimeAlsoAborts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping runner integration test in short mode")
+	}
+	r := newSigningTestRunner(t)
+	// A digest input larger than the entire linear memory cannot fit even in
+	// a fresh runtime. It must fail without panicking or retrying forever.
+	body := strings.Repeat("x", len(r.rt.ModuleMem()))
+	got, err := r.GetSignature("/api/test", body, "token")
+	if got != "" || !errors.Is(err, ltsm.ErrAbort) {
+		t.Fatalf("oversized request signature = %q, %v; want an abort error", got, err)
+	}
+	if r.signingRT != nil || r.signingSKPtr != 0 || len(r.signingContexts) != 0 || len(r.signingLRU) != 0 {
+		t.Fatal("failed signing attempt retained aborted runtime state")
+	}
+	got, err = r.GetSignature("/api/test", "{}", "token")
+	const want = "e4Qtp1IpDvrJIOZMyj364UwWINt5qhNxx5p3a+XM7Co="
+	if err != nil || got != want {
+		t.Fatalf("signature after oversized request = %q, %v; want %q", got, err, want)
 	}
 }
 
