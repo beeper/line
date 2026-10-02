@@ -35,7 +35,7 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 		HTTPClient:    lc.HTTPClient,
 		RecoverClient: lc.recoverClientAfterAuthError,
 		NewClient:     func() *line.Client { return lc.newClient() },
-		DecryptMedia:  lc.decryptImageData,
+		DecryptMedia:  lc.decryptMediaData,
 	}
 	connector, ok := lc.UserLogin.Bridge.Network.(*LineConnector)
 	if ok && connector.directMedia.Load() {

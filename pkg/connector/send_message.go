@@ -7,8 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"image"
 	"image/jpeg"
+	"maps"
+	"net/http"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,6 +22,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
@@ -92,9 +97,48 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			WithErrorReason(event.MessageStatusGenericError)
 	}
 
+	localMessage := *msg
+	localContent := *msg.Content
+	localMessage.Content = &localContent
+	msg = &localMessage
+
+	var nativeSticker *lineSticker
+	if (msg.Content.MsgType == event.CapMsgSticker || msg.Content.MsgType == event.MsgImage) && msg.Content.File == nil {
+		sticker, err := lc.resolveSticker(ctx, msg.Content.URL)
+		if err != nil {
+			lc.UserLogin.Log.Warn().Err(err).Msg("Failed to resolve LINE sticker, sending as image")
+		}
+		if sticker != nil && sticker.Shop == line.StickerShop {
+			nativeSticker = sticker
+		} else if sticker != nil && sticker.Shop == line.SticonShop {
+			msg.Content.MsgType = event.MsgText
+			msg.Content.Body = sticker.Body
+			msg.Content.Format = event.FormatHTML
+			msg.Content.FormattedBody = `<img data-mx-emoticon src="` + html.EscapeString(string(msg.Content.URL)) +
+				`" alt="` + html.EscapeString(sticker.Body) + `">`
+		}
+	}
+	var sticonMetadata map[string]string
+	if msg.Content.MsgType == event.MsgText {
+		var err error
+		msg.Content.Body, sticonMetadata, err = convertOutgoingSticons(ctx, msg.Content, func(mxc id.ContentURIString) (*lineSticker, error) {
+			emote, err := lc.resolveSticker(ctx, mxc)
+			if err != nil {
+				lc.UserLogin.Log.Warn().Err(err).Str("mxc", string(mxc)).Msg("Failed to resolve LINE emoji, sending alt text")
+				return nil, nil
+			}
+			return emote, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Determine whether we need to send as plain text (peer/group has Letter Sealing off).
 	plainText := false
-	if lc.E2EE == nil {
+	if nativeSticker != nil {
+		plainText = true
+	} else if lc.E2EE == nil {
 		plainText = true
 		lc.UserLogin.Bridge.Log.Warn().Msg("E2EE not initialized, sending as plain text")
 	} else if isGroup {
@@ -115,6 +159,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var err error
 	contentType := int(ContentText)
 	contentMetadata := map[string]string{}
+	maps.Copy(contentMetadata, sticonMetadata)
 	if !plainText {
 		contentMetadata["e2eeVersion"] = "2"
 	}
@@ -123,6 +168,12 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
 	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
 	effectiveMsgType := msg.Content.MsgType
+	isSticker := effectiveMsgType == event.CapMsgSticker
+	if nativeSticker != nil {
+		effectiveMsgType = event.CapMsgSticker
+	} else if isSticker {
+		effectiveMsgType = event.MsgImage
+	}
 	if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
 		mime := msg.Content.Info.MimeType
 		if strings.HasPrefix(mime, "audio/") {
@@ -132,6 +183,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		} else if strings.HasPrefix(mime, "image/") {
 			effectiveMsgType = event.MsgImage
 		}
+	}
+
+	videoGIF := effectiveMsgType == event.MsgVideo && msg.Content.Info != nil && msg.Content.Info.MauGIF
+	if videoGIF {
+		effectiveMsgType = event.MsgImage
 	}
 
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
@@ -168,12 +224,16 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var rawFileName string
 
 	switch effectiveMsgType {
+	case event.CapMsgSticker:
+		contentType = int(ContentSticker)
+		contentMetadata = nativeSticker.metadata()
+
 	case event.MsgText:
 		contentType = int(ContentText)
 		if plainText {
 			plainTextBody = msg.Content.Body
 		} else {
-			payload, err = json.Marshal(map[string]string{"text": msg.Content.Body})
+			payload, err = lineTextPayload(msg.Content.Body, contentMetadata)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal text payload: %w", err)
 			}
@@ -185,73 +245,60 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			return nil, fmt.Errorf("failed to download media from matrix: %w", err)
 		}
 
-		mimeType := msg.Content.Info.MimeType
+		mimeType := ""
+		if msg.Content.Info != nil {
+			mimeType = msg.Content.Info.MimeType
+		}
 		fileName := msg.Content.GetFileName()
-		if isHEICImage(mimeType, fileName) {
+		if videoGIF {
+			data, err = convertVideoToGIF(ctx, data)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert GIF video: %w", err)
+			}
+			mimeType = "image/gif"
+		}
+		data, err = preparePNGSticker(ctx, data, isSticker)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare PNG sticker: %w", err)
+		}
+		detectedMimeType := http.DetectContentType(data)
+		if strings.HasPrefix(detectedMimeType, "image/") {
+			mimeType = detectedMimeType
+		} else if isHEICImage(mimeType, fileName) {
 			data, err = convertHEICToJPEG(ctx, data)
 			if err != nil {
 				return nil, fmt.Errorf("failed to convert HEIC image to JPEG: %w", err)
 			}
 			mimeType = "image/jpeg"
-			fileName = jpegFileName(fileName)
 		}
-		isGif := mimeType == "image/gif"
-		isAnimated := isGif && isAnimatedGif(data)
-
-		extension := "jpg"
-		if isGif {
-			extension = "gif"
-		} else if mimeType == "image/png" {
-			extension = "png"
+		extension := imageExtension(mimeType)
+		if extension == "" {
+			return nil, fmt.Errorf("unsupported image MIME type %q", mimeType)
 		}
+		if fileName == "" {
+			fileName = "image"
+		}
+		fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + "." + extension
 
 		contentType = int(ContentImage)
+
+		mediaContentInfo := originalImageInfo(data, extension)
+		if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
+			contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
+		}
 
 		if plainText {
 			// Plain media: save data for post-send upload to r/talk/m/{msgId}
 			plainMediaData = data
-
-			thumbnailData, thumbWidth, thumbHeight, err := generateThumbnail(data)
-			if err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to generate thumbnail, continuing without it")
-			} else {
-				plainThumbData = thumbnailData
-				mediaThumbInfo := map[string]interface{}{
-					"width":  thumbWidth,
-					"height": thumbHeight,
-				}
-				if thumbInfoJSON, err := json.Marshal(mediaThumbInfo); err == nil {
-					contentMetadata["MEDIA_THUMB_INFO"] = string(thumbInfoJSON)
-				}
-			}
-
 			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 
-			if fileName == "" {
-				fileName = "image." + extension
-			}
 			contentMetadata["FILE_NAME"] = fileName
-
-			mediaContentInfo := map[string]interface{}{
-				"category":  "original",
-				"fileSize":  len(data),
-				"extension": extension,
-			}
-			if isAnimated {
-				mediaContentInfo["animated"] = true
-			}
-			if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
-				contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
-			}
 		} else {
 			// E2EE: encrypt, upload to OBS first, send with OID
 			// Save original data for potential group E2EE fallback
 			if isGroup {
 				originalMediaData = data
-				if thumbData, _, _, tErr := generateThumbnail(data); tErr == nil {
-					originalThumbData = thumbData
-				}
 			}
 
 			uploadData, keyMaterialB64, err := lc.encryptFileData(data)
@@ -297,26 +344,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			contentMetadata["OID"] = oid
 			contentMetadata["SID"] = "emi"
-			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(uploadData))
+			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 			contentMetadata["ENC_KM"] = keyMaterialB64
 
-			if fileName == "" {
-				fileName = "image." + extension
-			}
 			contentMetadata["FILE_NAME"] = fileName
-
-			mediaContentInfo := map[string]interface{}{
-				"category":  "original",
-				"fileSize":  len(uploadData),
-				"extension": extension,
-			}
-			if isAnimated {
-				mediaContentInfo["animated"] = true
-			}
-			if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
-				contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
-			}
 
 			imgPayload := map[string]string{"keyMaterial": keyMaterialB64}
 			payload, _ = json.Marshal(imgPayload)
@@ -597,21 +629,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					return nil, errFetch
 				}
 			}
-			if contentType != int(ContentText) {
-				chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
-			} else {
-				chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
-			}
+			chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 			if err != nil {
 				if errors.Is(err, ltsm.ErrAbort) {
 					return nil, err
 				}
 				if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch == nil {
-					if contentType != int(ContentText) {
-						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
-					} else {
-						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
-					}
+					chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 				} else if errors.Is(errFetch, ltsm.ErrAbort) {
 					return nil, errFetch
 				} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
@@ -637,6 +661,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 						delete(contentMetadata, "ENC_KM")
 						plainMediaData = originalMediaData
 						plainThumbData = originalThumbData
+						if contentType == int(ContentImage) {
+							delete(contentMetadata, "MEDIA_THUMB_INFO")
+						}
 					}
 				}
 			}
@@ -663,6 +690,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		lc.UserLogin.Bridge.Log.Info().Str("portal", portalMid).Int("content_type", contentType).Msg("Sending plain text message (no E2EE)")
 	}
 
+	if !plainText {
+		delete(contentMetadata, "REPLACE")
+	}
 	now := time.Now().UnixMilli()
 	lineMsg := &line.Message{
 		ID:              fmt.Sprintf("local-%d", now),
@@ -780,11 +810,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Msg("autoRegisterGroupKey succeeded, retrying send")
 			if !plainText && lc.E2EE != nil {
 				if fetchErr := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); fetchErr == nil {
-					if contentType != int(ContentText) {
-						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
-					} else {
-						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
-					}
+					chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 					if err == nil {
 						lineMsg.Chunks = chunks
 						lineMsg.Text = ""
@@ -833,6 +859,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		if err := callLineErr(func(client *line.Client) error {
+			if contentType == int(ContentImage) {
+				return client.UploadOBSPlainOriginalImage(plainMediaData, sentMsg.ID, contentMetadata["FILE_NAME"])
+			}
 			return client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType)
 		}); err != nil {
 			return nil, fmt.Errorf("failed to upload plain media to OBS: %w", err)

@@ -20,8 +20,8 @@ import (
 
 func TestCapabilitiesAdvertiseSupportedReactions(t *testing.T) {
 	infoVersion, capabilityVersion := (&LineConnector{}).GetBridgeInfoVersion()
-	if infoVersion != 1 || capabilityVersion != 3 {
-		t.Fatalf("bridge info/capability versions = %d/%d, want 1/3", infoVersion, capabilityVersion)
+	if infoVersion != 1 || capabilityVersion != 4 {
+		t.Fatalf("bridge info/capability versions = %d/%d, want 1/4", infoVersion, capabilityVersion)
 	}
 
 	caps := (&LineClient{}).GetCapabilities(context.Background(), nil)
@@ -31,8 +31,8 @@ func TestCapabilitiesAdvertiseSupportedReactions(t *testing.T) {
 	if caps.ReactionCount != 1 {
 		t.Fatalf("ReactionCount = %d, want 1", caps.ReactionCount)
 	}
-	if caps.CustomEmojiReactions {
-		t.Fatal("CustomEmojiReactions must stay disabled because arbitrary Matrix custom emojis are unsupported")
+	if !caps.CustomEmojiReactions {
+		t.Fatal("CustomEmojiReactions must be enabled for imported LINE emoji")
 	}
 	if len(caps.AllowedReactions) != len(lineEmojiReactionURLs) {
 		t.Fatalf("AllowedReactions has %d entries, want %d", len(caps.AllowedReactions), len(lineEmojiReactionURLs))

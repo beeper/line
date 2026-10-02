@@ -39,7 +39,7 @@ type Handler struct {
 	DownloadAlbumPreview func(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error)
 
 	// DecryptMedia decrypts E2EE encrypted media data using the given key material.
-	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
+	DecryptMedia func(data []byte, keyMaterial, kind string) ([]byte, error)
 }
 
 func (h *Handler) decryptDownloadedMedia(data []byte, decryptedBody string, metadata map[string]string, kind string) ([]byte, error) {
@@ -96,7 +96,7 @@ func (h *Handler) decryptMediaWithKeys(data []byte, keys []string, encrypted boo
 
 	decryptErrors := make([]error, 0, len(keys))
 	for _, key := range keys {
-		decrypted, err := h.DecryptMedia(data, key)
+		decrypted, err := h.DecryptMedia(data, key, kind)
 		if err == nil {
 			return decrypted, nil
 		}

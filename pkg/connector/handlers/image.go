@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"net/http"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -113,7 +116,13 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 
 	// Upload to Matrix
 	uploadStart := time.Now()
-	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, "image.jpg", "image/jpeg")
+	mimeType := http.DetectContentType(imgData)
+	fileName := "image" + imageSuffix(mimeType)
+	info := &event.FileInfo{MimeType: mimeType, Size: len(imgData)}
+	if config, _, decodeErr := image.DecodeConfig(bytes.NewReader(imgData)); decodeErr == nil {
+		info.Width, info.Height = config.Width, config.Height
+	}
+	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, fileName, mimeType)
 	uploadDuration := time.Since(uploadStart)
 	if err != nil {
 		h.Log.Error().
@@ -145,7 +154,8 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 				Type: event.EventMessage,
 				Content: &event.MessageEventContent{
 					MsgType:   event.MsgImage,
-					Body:      "image.jpg",
+					Body:      fileName,
+					Info:      info,
 					URL:       mxc,
 					File:      file,
 					RelatesTo: relatesTo,
@@ -198,4 +208,23 @@ func lineOBSDownloadOptions(metadata map[string]string, isPlainMedia bool) line.
 		opts.TID = "original"
 	}
 	return opts
+}
+
+func imageSuffix(mimeType string) string {
+	switch mimeType {
+	case "image/gif":
+		return ".gif"
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	case "image/bmp":
+		return ".bmp"
+	case "image/tiff":
+		return ".tiff"
+	default:
+		return ""
+	}
 }

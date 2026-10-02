@@ -13,7 +13,7 @@ import (
 	"image"
 	_ "image/gif"
 	"image/jpeg"
-	_ "image/png"
+	"image/png"
 	"io"
 	"os"
 	"os/exec"
@@ -33,13 +33,6 @@ func isHEICImage(mimeType, fileName string) bool {
 	}
 	extension := strings.ToLower(filepath.Ext(fileName))
 	return extension == ".heic" || extension == ".heif"
-}
-
-func jpegFileName(fileName string) string {
-	if fileName == "" {
-		return "image.jpg"
-	}
-	return strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
 }
 
 func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
@@ -92,6 +85,15 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 // LINE's E2EE file format: [encrypted_data][32-byte HMAC]
 // The keyMaterial is derived using HKDF to get encKey (32), macKey (32), and nonce (12 bytes)
 func (lc *LineClient) decryptImageData(encryptedData []byte, keyMaterialB64 string) ([]byte, error) {
+	return lc.decryptMediaData(encryptedData, keyMaterialB64, "image")
+}
+
+func (lc *LineClient) decryptMediaData(encryptedData []byte, keyMaterialB64, kind string) ([]byte, error) {
+	switch kind {
+	case "image", "file", "audio", "video":
+	default:
+		return nil, fmt.Errorf("unsupported encrypted media kind %q", kind)
+	}
 	keyMaterial, err := base64.StdEncoding.DecodeString(keyMaterialB64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode key material: %w", err)
@@ -106,7 +108,7 @@ func (lc *LineClient) decryptImageData(encryptedData []byte, keyMaterialB64 stri
 	}
 
 	encKey := derived[0:32]
-	// macKey := derived[32:64] // for HMAC verification
+	macKey := derived[32:64]
 	nonce := derived[64:76]
 
 	// Create 16-byte counter: nonce(12 bytes) + zero counter(4 bytes)
@@ -117,7 +119,18 @@ func (lc *LineClient) decryptImageData(encryptedData []byte, keyMaterialB64 stri
 	if len(encryptedData) < 32 {
 		return nil, fmt.Errorf("encrypted data too short (< 32 bytes for HMAC)")
 	}
-	encryptedData = encryptedData[:len(encryptedData)-32]
+	tag := encryptedData[len(encryptedData)-sha256.Size:]
+	encryptedData = encryptedData[:len(encryptedData)-sha256.Size]
+
+	mac := hmac.New(sha256.New, macKey)
+	if kind == "video" {
+		mac.Write(generateChunkHashes(encryptedData))
+	} else {
+		mac.Write(encryptedData)
+	}
+	if !hmac.Equal(tag, mac.Sum(nil)) {
+		return nil, fmt.Errorf("LINE media HMAC verification failed")
+	}
 
 	block, err := aes.NewCipher(encKey)
 	if err != nil {
@@ -236,10 +249,10 @@ func generateThumbnail(imageData []byte) ([]byte, int, int, error) {
 	if width > maxDim || height > maxDim {
 		if width > height {
 			newWidth = maxDim
-			newHeight = (height * maxDim) / width
+			newHeight = max(1, (height*maxDim)/width)
 		} else {
 			newHeight = maxDim
-			newWidth = (width * maxDim) / height
+			newWidth = max(1, (width*maxDim)/height)
 		}
 	}
 
@@ -252,8 +265,14 @@ func generateThumbnail(imageData []byte) ([]byte, int, int, error) {
 	}
 
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, thumbnail, &jpeg.Options{Quality: 60}); err != nil {
-		return nil, 0, 0, fmt.Errorf("failed to encode thumbnail: %w", err)
+	var encodeErr error
+	if opaque, ok := thumbnail.(interface{ Opaque() bool }); !ok || !opaque.Opaque() {
+		encodeErr = png.Encode(&buf, thumbnail)
+	} else {
+		encodeErr = jpeg.Encode(&buf, thumbnail, &jpeg.Options{Quality: 60})
+	}
+	if encodeErr != nil {
+		return nil, 0, 0, fmt.Errorf("failed to encode thumbnail: %w", encodeErr)
 	}
 
 	return buf.Bytes(), newWidth, newHeight, nil
@@ -292,30 +311,6 @@ func encryptThumbnail(thumbnailData []byte, keyMaterialB64 string) ([]byte, erro
 	h := hmac.New(sha256.New, macKey)
 	h.Write(encrypted)
 	return append(encrypted, h.Sum(nil)...), nil
-}
-
-func isAnimatedGif(data []byte) bool {
-	// GIF header: "GIF89a" or "GIF87a"
-	if len(data) < 6 {
-		return false
-	}
-
-	if string(data[0:3]) != "GIF" {
-		return false
-	}
-
-	// Count image descriptors (0x2C) which indicate frames
-	frameCount := 0
-	for i := 0; i < len(data)-1; i++ {
-		if data[i] == 0x2C { // Image descriptor separator
-			frameCount++
-			if frameCount > 1 {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // generates the first frame of a video and resizes it to fit within 384x384
@@ -384,4 +379,22 @@ func generateChunkHashes(encryptedData []byte) []byte {
 	}
 
 	return allHashes
+}
+
+func imageExtension(mimeType string) string {
+	mimeType, _, _ = strings.Cut(strings.ToLower(mimeType), ";")
+	switch strings.TrimSpace(mimeType) {
+	case "image/jpeg", "image/jpg":
+		return "jpg"
+	case "image/png", "image/apng":
+		return "png"
+	case "image/gif":
+		return "gif"
+	case "image/webp":
+		return "webp"
+	case "image/bmp", "image/x-ms-bmp":
+		return "bmp"
+	default:
+		return ""
+	}
 }
