@@ -423,7 +423,7 @@ func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
 }
 
 func (lc *LineClient) markMissingE2EEKey(ctx context.Context, err error) {
-	if !errors.Is(err, e2ee.ErrMissingOwnPrivateKey) || lc.UserLogin == nil {
+	if isTerminalCryptoError(err) || !errors.Is(err, e2ee.ErrMissingOwnPrivateKey) || lc.UserLogin == nil {
 		return
 	}
 	lc.missingE2EEKeyMu.Lock()
