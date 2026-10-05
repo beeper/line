@@ -335,6 +335,14 @@ func (rt *Runtime) E2EEKeyGetKeyId(keyPtr uint32) (int, error) {
 	return int(int32(result)), nil
 }
 
+func (rt *Runtime) E2EEKeyDestroy(ptr uint32) error {
+	return rt.imp.Destroy("E2EEKey", ptr)
+}
+
+func (rt *Runtime) E2EEChannelDestroy(ptr uint32) error {
+	return rt.imp.Destroy("E2EEChannel", ptr)
+}
+
 func (rt *Runtime) E2EEKeyGetPublicKey(keyPtr uint32) ([]byte, error) {
 	return rt.Curve25519KeyGetPublicKey(keyPtr)
 }

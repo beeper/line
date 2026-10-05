@@ -190,6 +190,15 @@ func (r *Runner) unwrapGroupSharedKeyPanicSafe(chanPtr uint32, encKey []byte) (k
 	return r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, encKey)
 }
 
+func (r *Runner) destroyPanicSafe(class string, destroy func(uint32) error, ptr uint32) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = ltsmPanicError("ltsm "+class+" destroy", recovered)
+		}
+	}()
+	return destroy(ptr)
+}
+
 func (r *Runner) encryptV1PanicSafe(chanPtr uint32, plaintext []byte) (ciphertext []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -662,6 +671,32 @@ func (r *Runner) ChannelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB6
 	}
 
 	return r.putKey(keyPtr), nil
+}
+
+// KeyDestroy releases an unwrapped group key and every channel created from it.
+func (r *Runner) KeyDestroy(keyID int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	keyPtr, err := r.getKey(keyID)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for cacheKey, channelID := range r.channelsByKey {
+		if cacheKey.keyID != keyID {
+			continue
+		}
+		chanPtr := r.channelStore[channelID]
+		delete(r.channelsByKey, cacheKey)
+		delete(r.channelStore, channelID)
+		delete(r.goChannels, channelID)
+		errs = append(errs, r.destroyPanicSafe("E2EEChannel", r.rt.E2EEChannelDestroy, chanPtr))
+	}
+	delete(r.keyStore, keyID)
+	delete(r.goKeys, keyID)
+	errs = append(errs, r.destroyPanicSafe("E2EEKey", r.rt.E2EEKeyDestroy, keyPtr))
+	return errors.Join(errs...)
 }
 
 // ChannelEncryptV1 encrypts plaintext with channel V1 (AES-256-CBC + MAC).

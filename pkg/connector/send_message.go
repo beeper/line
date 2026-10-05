@@ -747,6 +747,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			if isGroup {
 				chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, zipPayload)
+				if err != nil && !errors.Is(err, ltsm.ErrAbort) {
+					if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch == nil {
+						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, zipPayload)
+					} else if errors.Is(errFetch, ltsm.ErrAbort) {
+						return nil, errFetch
+					} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
+						return nil, errFetch
+					}
+				}
 			} else {
 				myRaw, myKeyID, errKey := lc.E2EE.MyKeyIDs()
 				if errKey != nil {
