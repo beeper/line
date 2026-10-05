@@ -357,7 +357,7 @@ func (rt *Runtime) E2EEChannelUnwrapKeyChain(chanPtr uint32, encKeyChain []byte)
 }
 
 func (rt *Runtime) E2EEChannelUnwrapGroupSharedKey(chanPtr uint32, encKey []byte) (uint32, error) {
-	ptr, err := rt.imp.CallMethod("E2EEChannel", "unwrapGroupSharedKey", chanPtr, rt.imp.WriteEmvalBytes(encKey))
+	ptr, err := rt.unwrapGroupKey(chanPtr, encKey)
 	if err != nil {
 		return 0, fmt.Errorf("ltsm: E2EEChannel.unwrapGroupSharedKey failed: %w", err)
 	}
