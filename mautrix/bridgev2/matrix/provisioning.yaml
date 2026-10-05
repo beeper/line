@@ -1,0 +1,1281 @@
+openapi: 3.1.0
+info:
+  title: Megabridge provisioning
+  description: |-
+    This is the provisioning API implemented in mautrix-go's bridgev2 package.
+    It can be used with any bridge built on that package.
+  license:
+    name: Mozilla Public License Version 2.0
+    url: https://github.com/mautrix/go/blob/main/LICENSE
+  version: v0.20.0
+externalDocs:
+  description: mautrix-go godocs
+  url: https://pkg.go.dev/maunium.net/go/mautrix/bridgev2
+servers:
+- url: http://localhost:8080/_matrix/provision
+tags:
+- name: auth
+  description: Manage your logins and log into new remote accounts
+- name: snc
+  description: Starting new chats
+- name: misc
+  description: Miscellaneous bridge operations
+paths:
+  /v3/whoami:
+    get:
+      tags: [ auth ]
+      summary: Get info about the bridge and your logins.
+      description: |
+        Get all info that is useful for presenting this bridge in a manager interface.
+        * Server details: remote network details, available login flows, homeserver name, bridge bot user ID, command prefix
+        * User details: management room ID, list of logins with current state and info
+      operationId: whoami
+      responses:
+        200:
+          description: Successfully fetched info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Whoami'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/flows:
+    get:
+      tags: [ auth ]
+      summary: Get the available login flows.
+      operationId: getLoginFlows
+      responses:
+        200:
+          description: Successfully fetched flows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  flows:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LoginFlow'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/logins:
+    get:
+      tags: [ auth ]
+      summary: Get the login IDs of the current user.
+      operationId: getLoginIDs
+      responses:
+        200:
+          description: Successfully fetched list of logins
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  login_ids:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UserLoginID'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/start/{flowID}:
+    post:
+      tags: [ auth ]
+      summary: Start a new login process.
+      description: |
+        This endpoint starts a new login process, which is used to log into the bridge.
+
+        The basic flow of the entire login, including calling this endpoint, is:
+        1. Call `GET /v3/login/flows` to get the list of available flows.
+           If there's more than one flow, ask the user to pick which one they want to use.
+        2. Call this endpoint with the chosen flow ID to start the login.
+           The first login step will be returned.
+        3. Render the information provided in the step.
+        4. Call the `/login/step/...` endpoint corresponding to the step type:
+           * For `user_input` and `cookies`, acquire the requested fields before calling the endpoint.
+           * For `client_http`, execute the provided HTTP request and submit the response with the separate endpoint.
+           * For `webauthn`, use `navigator.credentials.get()` or equivalent before calling the endpoint.
+           * For `display_and_wait`, call the endpoint immediately
+             (as there's nothing to acquire on the client side).
+        5. Handle the data returned by the login step endpoint:
+           * If an error is returned, the login has failed and must be restarted
+             (from either step 1 or step 2) if the user wants to try again.
+           * If step type `complete` is returned, the login finished successfully.
+           * Otherwise, go to step 3 with the new data.
+      operationId: startLogin
+      parameters:
+      - name: login_id
+        in: query
+        description: An existing login ID to re-login as. If this is specified and the user logs into a different account, the provided ID will be logged out.
+        required: false
+        schema:
+          $ref: '#/components/schemas/UserLoginID'
+      - name: client_http
+        in: query
+        description: Whether the client supports client HTTP proxying.
+        required: false
+        schema:
+          type: number
+      - name: flowID
+        in: path
+        description: The login flow ID to use.
+        required: true
+        schema:
+          type: string
+          examples: [ qr ]
+      responses:
+        200:
+          description: Login successfully started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginStep'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/step/{loginProcessID}/{stepID}/user_input:
+    post:
+      tags: [ auth ]
+      summary: Submit user input in a login process.
+      operationId: submitLoginStepUserInput
+      parameters:
+      - $ref: '#/components/parameters/loginProcessID'
+      - $ref: '#/components/parameters/stepID'
+      - $ref: '#/components/parameters/txnID'
+      requestBody:
+        description: The data entered by the user
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties:
+                type: string
+      responses:
+        200:
+          $ref: '#/components/responses/LoginStepSubmitted'
+        400:
+          $ref: '#/components/responses/BadRequest'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginProcessNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/step/{loginProcessID}/{stepID}/cookies:
+    post:
+      tags: [ auth ]
+      summary: Submit extracted cookies in a login process.
+      operationId: submitLoginStepCookies
+      parameters:
+      - $ref: '#/components/parameters/loginProcessID'
+      - $ref: '#/components/parameters/stepID'
+      - $ref: '#/components/parameters/txnID'
+      requestBody:
+        description: The cookies extracted from the website
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties:
+                type: string
+      responses:
+        200:
+          $ref: '#/components/responses/LoginStepSubmitted'
+        400:
+          $ref: '#/components/responses/BadRequest'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginProcessNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/client_http/{loginProcessID}/{txnID}/{reqID}:
+    post:
+      tags: [ auth ]
+      summary: Submit an HTTP response executed by the client in a login process.
+      operationId: submitLoginStepClientHTTP
+      parameters:
+      - $ref: '#/components/parameters/loginProcessID'
+      - $ref: '#/components/parameters/requestID'
+      - $ref: '#/components/parameters/txnIDInPath'
+      requestBody:
+        required: true
+        description: The response to the HTTP request in the current login step.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginClientHTTPResponse'
+      responses:
+        200:
+          $ref: '#/components/responses/LoginStepSubmitted'
+        400:
+          $ref: '#/components/responses/BadRequest'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginProcessNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/step/{loginProcessID}/{stepID}/webauthn:
+    post:
+      tags: [ auth ]
+      summary: Submit a WebAuthn response in a login process.
+      operationId: submitLoginStepWebAuthn
+      parameters:
+      - $ref: '#/components/parameters/loginProcessID'
+      - $ref: '#/components/parameters/stepID'
+      - $ref: '#/components/parameters/txnID'
+      requestBody:
+        description: The raw WebAuthn response as JSON
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        200:
+          $ref: '#/components/responses/LoginStepSubmitted'
+        400:
+          $ref: '#/components/responses/BadRequest'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginProcessNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/step/{loginProcessID}/{stepID}/display_and_wait:
+    post:
+      tags: [ auth ]
+      summary: Wait for the next step after displaying data to the user.
+      operationId: submitLoginStepDisplayAndWait
+      parameters:
+      - $ref: '#/components/parameters/loginProcessID'
+      - $ref: '#/components/parameters/stepID'
+      - $ref: '#/components/parameters/txnID'
+      responses:
+        200:
+          $ref: '#/components/responses/LoginStepSubmitted'
+        400:
+          $ref: '#/components/responses/BadRequest'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginProcessNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/step/{loginProcessID}/{stepID}/cancel:
+    post:
+      tags: [ auth ]
+      summary: Go back from a cancellable login step without cancelling the login process.
+      operationId: cancelLoginStep
+      parameters:
+      - $ref: '#/components/parameters/loginProcessID'
+      - $ref: '#/components/parameters/stepID'
+      - $ref: '#/components/parameters/txnID'
+      responses:
+        200:
+          $ref: '#/components/responses/LoginStepSubmitted'
+        400:
+          $ref: '#/components/responses/BadRequest'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginProcessNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+      security:
+      - matrix_auth: [ ]
+  /v3/login/cancel/{loginProcessID}:
+    post:
+      tags: [ auth ]
+      summary: Cancel an ongoing login process.
+      operationId: cancelLogin
+      parameters:
+      - $ref: '#/components/parameters/loginProcessID'
+      responses:
+        200:
+          description: Login successfully cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Empty object
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginProcessNotFound'
+      security:
+      - matrix_auth: [ ]
+  /v3/logout/{loginID}:
+    post:
+      tags: [ auth ]
+      summary: Log out of an existing login.
+      operationId: logout
+      parameters:
+      - name: loginID
+        in: path
+        description: The ID of the login to log out. Use `all` to log out of all logins.
+        required: true
+        schema:
+          oneOf:
+          - $ref: '#/components/schemas/UserLoginID'
+          - type: string
+            const: all
+            description: Log out of all logins
+      responses:
+        200:
+          description: Login was successfully deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Empty object
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+  /v3/contacts:
+    get:
+      tags: [ snc ]
+      summary: Get a list of contacts.
+      operationId: getContacts
+      parameters:
+      - $ref: "#/components/parameters/loginID"
+      responses:
+        200:
+          description: Contact list fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contacts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ResolvedIdentifier'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+        501:
+          $ref: '#/components/responses/NotSupported'
+  /v3/search_users:
+    post:
+      tags: [ snc ]
+      summary: Search for users on the remote network
+      operationId: searchUsers
+      parameters:
+      - $ref: "#/components/parameters/loginID"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: The search query to send to the remote network
+      responses:
+        200:
+          description: Search completed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ResolvedIdentifier'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+        501:
+          $ref: '#/components/responses/NotSupported'
+  /v3/resolve_identifier/{identifier}:
+    get:
+      tags: [ snc ]
+      summary: Resolve an identifier to a user on the remote network.
+      operationId: resolveIdentifier
+      parameters:
+      - $ref: "#/components/parameters/loginID"
+      - $ref: "#/components/parameters/sncIdentifier"
+      responses:
+        200:
+          description: Identifier resolved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolvedIdentifier'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          # TODO identifier not found also returns 404
+          $ref: '#/components/responses/LoginNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+        501:
+          $ref: '#/components/responses/NotSupported'
+  /v3/create_dm/{identifier}:
+    post:
+      tags: [ snc ]
+      summary: Create a direct chat with a user on the remote network.
+      operationId: createDM
+      parameters:
+      - $ref: "#/components/parameters/loginID"
+      - $ref: "#/components/parameters/sncIdentifier"
+      responses:
+        200:
+          description: Identifier resolved successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/ResolvedIdentifier'
+                - required: [id, mxid, dm_room_mxid]
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          # TODO identifier not found also returns 404
+          $ref: '#/components/responses/LoginNotFound'
+        500:
+          $ref: '#/components/responses/InternalError'
+        501:
+          $ref: '#/components/responses/NotSupported'
+  /v3/create_group/{type}:
+    post:
+      tags: [ snc ]
+      summary: Create a group chat on the remote network.
+      operationId: createGroup
+      parameters:
+      - $ref: "#/components/parameters/loginID"
+      - name: type
+        in: path
+        description: The remote network group type to create.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupCreateParams'
+      responses:
+        200:
+          description: Identifier resolved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedGroup'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        404:
+          $ref: '#/components/responses/LoginNotFound'
+        501:
+          $ref: '#/components/responses/NotSupported'
+  /v3/view_limited_media/{eventID}:
+    post:
+      tags: [ misc ]
+      summary: Consume one view of view-limited media.
+      description: Pass only com.beeper.view_limited from the current message. A remaining count sends a com.beeper.view_limited event with remaining_count and an m.reference to the original message. The final view redacts immediately or queues redaction after the viewing timer.
+      operationId: viewLimitedMedia
+      parameters:
+      - $ref: '#/components/parameters/loginID'
+      - {name: eventID, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+              schema: {type: object, required: [com.beeper.view_limited], properties: {com.beeper.view_limited: {type: object}}}
+      responses:
+        200: {description: View consumed.}
+        400: {description: Invalid view limit.}
+        401: {$ref: '#/components/responses/Unauthorized'}
+        404: {description: Message or login not found for this user.}
+        500: {$ref: '#/components/responses/InternalError'}
+components:
+  parameters:
+    sncIdentifier:
+      name: identifier
+      in: path
+      description: The identifier to resolve or start a chat with.
+      required: true
+      schema:
+        type: string
+        examples:
+        - +12345678
+        - username
+        - meow@example.com
+    loginID:
+      name: login_id
+      in: query
+      description: An optional explicit login ID to do the action through.
+      required: false
+      schema:
+        $ref: '#/components/schemas/UserLoginID'
+    loginProcessID:
+      name: loginProcessID
+      in: path
+      description: The ID of the login process, as returned in the `login_id` field of the start call.
+      required: true
+      schema:
+        type: string
+    stepID:
+      name: stepID
+      in: path
+      description: The ID of the step being submitted, as returned in the `step_id` field of the start call or the previous submit call.
+      required: true
+      schema:
+        type: string
+    txnID:
+      name: txn_id
+      in: query
+      description: The transaction ID of the step being submitted, as returned in the `txn_id` field of the start call or the previous submit call.
+      required: false
+      schema:
+        type: string
+    txnIDInPath:
+      name: txnID
+      in: path
+      description: The transaction ID of the step being submitted, as returned in the `txn_id` field of the start call or the previous submit call.
+      required: true
+      schema:
+        type: string
+    requestID:
+      name: reqID
+      in: path
+      description: The request ID of the client_http step being submitted, as returned in the `request_id` field of the client HTTP params.
+      required: true
+      schema:
+        type: string
+    stepType:
+      name: stepType
+      in: path
+      description: The type of step being submitted, as returned in the `type` field of the start call or the previous submit call.
+      required: true
+      schema:
+        type: string
+        enum: [ display_and_wait, user_input, cookies, webauthn ]
+  responses:
+    BadRequest:
+      description: Something in the request was invalid
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ M_NOT_JSON, M_BAD_STATE ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - Failed to decode request body
+                - Step type does not match
+    Unauthorized:
+      description: The request contained an invalid token
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ M_UNKNOWN_TOKEN, M_MISSING_TOKEN ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - Invalid auth token
+                - Missing auth token
+    InternalError:
+      description: An unexpected error that doesn't have special handling yet
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ M_UNKNOWN ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - Failed to get user
+                - Failed to start login
+    LoginProcessNotFound:
+      description: The specified login process ID is unknown
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ M_NOT_FOUND ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - Login not found
+    LoginNotFound:
+      description: When explicitly specifying an existing user login, the specified login ID is unknown
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ M_NOT_FOUND ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - Login not found
+    NotSupported:
+      description: The given endpoint is not supported by this network connector.
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ M_UNRECOGNIZED ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - This bridge does not support listing contacts
+    LoginStepSubmitted:
+      description: Step submission successful
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LoginStep'
+  schemas:
+    ResolvedIdentifier:
+      type: object
+      description: A successfully resolved identifier.
+      required: [id]
+      properties:
+        id:
+          type: string
+          description: The internal user ID of the resolved user.
+          examples:
+          - c443c1a2-e9f7-48aa-890c-80336c300ba9
+        name:
+          type: string
+          description: The name of the user on the remote network.
+        avatar_url:
+          type: string
+          format: mxc
+          description: The avatar of the user on the remote network.
+          pattern: mxc://[a-zA-Z0-9.:-]+/[a-zA-Z0-9_-]+
+          examples:
+          - mxc://t2bot.io/JYDTofsS6V9aYfUiX7JueA36
+        identifiers:
+          type: array
+          description: A list of identifiers for the user on the remote network.
+          items:
+            type: string
+            format: uri
+            examples:
+            - "tel:+123456789"
+            - "mailto:foo@example.com"
+            - "signal:username.123"
+        mxid:
+          type: string
+          format: matrix_user_id
+          description: The Matrix user ID of the ghost representing the user.
+          examples:
+          - '@signal_c443c1a2-e9f7-48aa-890c-80336c300ba9:t2bot.io'
+        dm_room_mxid:
+          type: string
+          format: matrix_room_id
+          description: The Matrix room ID of the direct chat with the user.
+          examples:
+          - '!OKhS0I5q2fCzdnl2qgeozDQw:t2bot.io'
+    GroupCreateParams:
+      type: object
+      description: |
+        Parameters for creating a group chat.
+        The /capabilities endpoint response must be checked to see which fields are actually allowed.
+      properties:
+        type:
+          type: string
+          description: The type of group to create.
+          examples:
+          - channel
+        username:
+          type: string
+          description: The public username for the created group.
+        participants:
+          type: array
+          description: The users to add to the group initially.
+          items:
+            type: string
+        parent:
+          type: object
+        name:
+          type: object
+          description: The `m.room.name` event content for the room.
+          properties:
+            name:
+              type: string
+        avatar:
+          type: object
+          description: The `m.room.avatar` event content for the room.
+          properties:
+            url:
+              type: string
+              format: mxc
+        topic:
+          type: object
+          description: The `m.room.topic` event content for the room.
+          properties:
+            topic:
+              type: string
+        disappear:
+          type: object
+          description: The `com.beeper.disappearing_timer` event content for the room.
+          properties:
+            type:
+              type: string
+            timer:
+              type: number
+        room_id:
+          type: string
+          format: matrix_room_id
+          description: |
+            An existing Matrix room ID to bridge to.
+            The other parameters must be already in sync with the room state when using this parameter.
+    CreatedGroup:
+      type: object
+      description: A successfully created group chat.
+      required: [id, mxid]
+      properties:
+        id:
+          type: string
+          description: The internal chat ID of the created group.
+        mxid:
+          type: string
+          format: matrix_room_id
+          description: The Matrix room ID of the portal.
+          examples:
+          - '!OKhS0I5q2fCzdnl2qgeozDQw:t2bot.io'
+    LoginStep:
+      type: object
+      description: A step in a login process.
+      properties:
+        login_id:
+          type: string
+          description: An identifier for the current login process. Must be passed to execute more steps of the login.
+        type:
+          type: string
+          description: The type of login step
+          enum: [ display_and_wait, user_input, cookies, client_http, webauthn, complete ]
+        step_id:
+          type: string
+          description: An unique ID identifying this step. This can be used to implement special behavior in clients.
+          examples: [ fi.mau.signal.qr ]
+        txn_id:
+          type: string
+          description: An opaque transaction ID for this step. This can be used for safely retrying steps.
+          examples: [ bls_d9odvo93kqebp739hrmg ]
+        instructions:
+          type: string
+          description: Human-readable instructions for completing this login step.
+          examples: [ Scan the QR code ]
+      oneOf:
+      - description: Display and wait login step
+        required: [ type, display_and_wait ]
+        properties:
+          type:
+            type: string
+            const: display_and_wait
+          display_and_wait:
+            type: object
+            description: Parameters for the display and wait login step
+            required: [ type ]
+            properties:
+              type:
+                type: string
+                description: The type of thing to display
+                enum: [ qr, emoji, code, nothing ]
+              data:
+                type: string
+                description: The thing to display (raw data for QR, unicode emoji for emoji, plain string for code)
+              image_url:
+                type: string
+                description: An image containing the thing to display. If present, this is recommended over using data directly. For emojis, the URL to the canonical image representation of the emoji
+              can_cancel:
+                type: boolean
+                description: Whether the client may allow the user to go back from this step.
+      - description: User input login step
+        required: [ type, user_input ]
+        properties:
+          type:
+            type: string
+            const: user_input
+          user_input:
+            type: object
+            description: Parameters for the user input login step
+            required: [ fields ]
+            properties:
+              can_cancel:
+                type: boolean
+                description: Whether the client may allow the user to go back from this step.
+              fields:
+                type: array
+                description: The list of fields that the user is requested to fill.
+                items:
+                  type: object
+                  description: A field that the user can fill.
+                  required: [ type, id, name ]
+                  properties:
+                    type:
+                      type: string
+                      description: The type of field.
+                      enum: [ username, phone_number, email, password, 2fa_code, token, url, domain, select ]
+                    id:
+                      type: string
+                      description: The internal ID of the field. This must be used as the key in the object when submitting the data back to the bridge.
+                      examples: [ uid, email, 2fa_password, meow ]
+                    name:
+                      type: string
+                      description: The name of the field shown to the user.
+                      examples: [ Username, Password, Phone number, 2FA code, Meow ]
+                    description:
+                      type: string
+                      description: A more detailed description of the field shown to the user.
+                      examples:
+                      - Include the country code with a +
+                    default_value:
+                      type: string
+                      description: A default value that the client can pre-fill the field with.
+                    pattern:
+                      type: string
+                      format: regex
+                      description: A regular expression that the field value must match.
+                    min_length:
+                      type: integer
+                      description: Minimum input length as a hint for the client.
+                    max_length:
+                      type: integer
+                      description: Maximum input length as a hint for the client.
+                    options:
+                      type: array
+                      description: For fields of type select, the valid options.
+                      items:
+                        type: string
+              attachments:
+                type: array
+                description: A list of media attachments to show the user alongside the form fields.
+                items:
+                  type: object
+                  description: A media attachment to show the user.
+                  required: [ type, filename, content ]
+                  properties:
+                    type:
+                      type: string
+                      description: The type of media attachment, using the same media type identifiers as Matrix attachments. Only some are supported.
+                      enum: [ m.image, m.audio ]
+                    filename:
+                      type: string
+                      description: The filename for the media attachment.
+                    content:
+                      type: string
+                      description: The raw file content for the attachment encoded in base64.
+                    info:
+                      type: object
+                      description: Optional but recommended metadata for the attachment. Can generally be derived from the raw content if omitted.
+                      properties:
+                        mimetype:
+                          type: string
+                          description: The MIME type for the media content.
+                          examples: [ image/png, audio/mpeg ]
+                        w:
+                          type: number
+                          description: The width of the media in pixels. Only applicable for images and videos.
+                        h:
+                          type: number
+                          description: The height of the media in pixels. Only applicable for images and videos.
+                        size:
+                          type: number
+                          description: The size of the media content in number of bytes. Strongly recommended to include.
+      - description: Cookie login step
+        required: [ type, cookies ]
+        properties:
+          type:
+            type: string
+            const: cookies
+          cookies:
+            type: object
+            description: Parameters for the cookie login step
+            required: [ url, fields ]
+            properties:
+              url:
+                type: string
+                format: uri
+                description: The URL to open when using a webview to extract cookies.
+              user_agent:
+                type: string
+                description: An optional user agent that the webview should use.
+              wait_for_url_pattern:
+                type: string
+                description: |
+                  A regex pattern that the URL should match before the client closes the webview.
+
+                  The client may submit the login if the user closes the webview after all cookies are collected
+                  even if this URL is not reached, but it should only automatically close the webview after
+                  both cookies and the URL match.
+              extract_js:
+                type: string
+                description: |
+                  A JavaScript snippet that can extract some or all of the fields.
+                  The snippet will evaluate to a promise that resolves when the relevant fields are found.
+                  Fields that are not present in the promise result must be extracted another way.
+              hidden:
+                type: boolean
+                description: If set, the client should load the URL and run `extract_js` in a webview that is not shown to the user.
+              fields:
+                type: array
+                description: The list of cookies or other stored data that must be extracted.
+                items:
+                  type: object
+                  description: An individual cookie or other stored data item that must be extracted.
+                  required: [ type, name ]
+                  properties:
+                    type:
+                      type: string
+                      description: The type of data to extract.
+                      enum: [ cookie, local_storage, request_header, request_body, special ]
+                    name:
+                      type: string
+                      description: The name of the item to extract.
+                    request_url_regex:
+                      type: string
+                      description: For the `request_header` and `request_body` types, a regex that matches the URLs from which the values can be extracted.
+                    cookie_domain:
+                      type: string
+                      description: For the `cookie` type, the domain of the cookie.
+      - description: Client HTTP login step
+        required: [ type, client_http ]
+        properties:
+          type:
+            type: string
+            const: client_http
+          client_http:
+            $ref: '#/components/schemas/LoginClientHTTPParams'
+      - description: WebAuthn login step
+        required: [ type, webauthn ]
+        properties:
+          type:
+            type: string
+            const: webauthn
+          webauthn:
+            type: object
+            description: Parameters for the WebAuthn login step
+            properties:
+              url:
+                type: string
+                format: uri
+                description: The root URL where the credentials should be available.
+              publicKey:
+                type: object
+      - description: Login complete
+        required: [ type, complete ]
+        properties:
+          type:
+            type: string
+            const: complete
+          complete:
+            type: object
+            description: Information about the completed login
+            properties:
+              user_login_id:
+                $ref: '#/components/schemas/UserLoginID'
+    LoginClientHTTPParams:
+      type: object
+      description: An HTTP request that the client must execute for the login process.
+      required: [ request_id, method, url ]
+      properties:
+        request_id:
+          type: string
+          description: An opaque identifier that must be copied into the response.
+        method:
+          type: string
+          description: The HTTP method to use.
+        url:
+          type: string
+          format: uri
+          description: The URL to request.
+        headers:
+          $ref: '#/components/schemas/HTTPHeaders'
+        body:
+          type: string
+          format: byte
+          description: The request body encoded as base64.
+    LoginClientHTTPResponse:
+      type: object
+      description: The result of an HTTP request executed by the client.
+      properties:
+        status_code:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: The final HTTP response status code.
+        final_url:
+          type: string
+          format: uri
+          description: The final URL after following redirects.
+        headers:
+          $ref: '#/components/schemas/HTTPHeaders'
+        body:
+          type: string
+          format: byte
+          description: The response body encoded as base64.
+        error:
+          type: string
+          description: A safe error message when the request could not be completed.
+      oneOf:
+      - required: [ status_code ]
+      - required: [ error ]
+    HTTPHeaders:
+      type: object
+      description: HTTP headers with all values preserved.
+      additionalProperties:
+        type: array
+        items:
+          type: string
+    LoginFlow:
+      type: object
+      description: An individual login flow which can be used to sign into the remote network.
+      required: [ name, description, id ]
+      properties:
+        name:
+          type: string
+          description: A human-readable name for the login flow.
+          examples:
+          - QR code
+        description:
+          type: string
+          description: A human-readable description of the login flow.
+          examples:
+          - Log in by scanning a QR code on the Signal app
+        id:
+          type: string
+          description: An internal ID that is passed to the /login/start call to start a login with this flow.
+          examples:
+          - qr
+    BridgeName:
+      type: object
+      description: Info about the network that the bridge is bridging to.
+      required: [ displayname, network_url, network_icon, network_id, beeper_bridge_type ]
+      properties:
+        displayname:
+          type: string
+          description: The displayname of the network.
+          examples:
+          - Signal
+        network_url:
+          type: string
+          description: The URL to the website of the network.
+          examples:
+          - https://signal.org
+        network_icon:
+          type: string
+          description: The icon of the network as a `mxc://` URI.
+          format: mxc
+          pattern: mxc://[a-zA-Z0-9.:-]+/[a-zA-Z0-9_-]+
+          examples:
+          - mxc://maunium.net/wPJgTQbZOtpBFmDNkiNEMDUp
+        network_id:
+          type: string
+          description: An identifier uniquely identifying the network.
+          examples:
+          - signal
+        beeper_bridge_type:
+          type: string
+          description: An identifier uniquely identifying the bridge software.
+          examples:
+          - com.example.fancysignalbridge
+    BridgeState:
+      type: object
+      description: The connection status of an individual login
+      required: [ state_event, timestamp ]
+      properties:
+        state_event:
+          type: string
+          description: The current state of this login.
+          enum: [ "CONNECTING", "CONNECTED", "TRANSIENT_DISCONNECT", "BAD_CREDENTIALS", "UNKNOWN_ERROR" ]
+        timestamp:
+          type: number
+          description: The time when the state was last updated.
+          format: unix milliseconds
+          examples:
+          - 1723294560531
+        error:
+          type: string
+          description: An error code defined by the network connector.
+        message:
+          type: string
+          description: A human-readable error message defined by the network connector.
+        reason:
+          type: string
+          description: A reason code for non-error states that aren't exactly successes either.
+        info:
+          type: object
+          description: Additional arbitrary info provided by the network connector.
+    UserLoginID:
+      type: string
+      description: The unique ID of a login. Defined by the network connector.
+      examples:
+      - bcc68892-b180-414f-9516-b4aadf7d0496
+    RemoteProfile:
+      type: object
+      description: The profile info of the logged-in user on the remote network.
+      properties:
+        phone:
+          type: string
+          format: phone
+          description: The user's phone number
+          examples:
+          - +123456789
+        email:
+          type: string
+          format: email
+          description: The user's email address
+          examples:
+          - foo@example.com
+        username:
+          type: string
+          description: The user's username
+          examples:
+          - foo.123
+        name:
+          type: string
+          description: The user's displayname
+          examples:
+          - Foo Bar
+        avatar:
+          type: string
+          format: mxc
+          description: The user's avatar
+          pattern: mxc://[a-zA-Z0-9.:-]+/[a-zA-Z0-9_-]+
+          examples:
+          - mxc://t2bot.io/JYDTofsS6V9aYfUiX7JueA36
+    WhoamiLogin:
+      type: object
+      description: The info of an individual login
+      required: [ state, id, name, profile ]
+      properties:
+        state:
+          $ref: '#/components/schemas/BridgeState'
+        id:
+          $ref: '#/components/schemas/UserLoginID'
+        name:
+          type: string
+          description: A human-readable name for the login. Defined by the network connector.
+          examples:
+          - +123456789
+        profile:
+          $ref: '#/components/schemas/RemoteProfile'
+        space_room:
+          type: string
+          format: matrix_room_id
+          description: The personal filtering space room ID for this login.
+          examples:
+          - "!X9l5njn4Mx1BpdoV8MOkyWU1:t2bot.io"
+    Whoami:
+      type: object
+      description: Info about the bridge and user
+      required: [ network, login_flows, homeserver, bridge_bot, command_prefix, logins ]
+      properties:
+        network:
+          $ref: '#/components/schemas/BridgeName'
+        login_flows:
+          type: array
+          description: The login flows that the bridge supports.
+          items:
+            $ref: '#/components/schemas/LoginFlow'
+        homeserver:
+          type: string
+          description: The server name the bridge is running on.
+          examples:
+          - t2bot.io
+        bridge_bot:
+          type: string
+          format: matrix_user_id
+          description: The Matrix user ID of the bridge bot.
+          examples:
+          - "@signalbot:t2bot.io"
+        command_prefix:
+          type: string
+          description: The command prefix used by this bridge.
+          examples:
+          - "!signal"
+        management_room:
+          type: string
+          format: matrix_room_id
+          description: The Matrix management room ID of the user who made the /whoami call.
+          examples:
+          - '!OKhS0I5q2fCzdnl2qgeozDQw:t2bot.io'
+        logins:
+          type: array
+          description: The logins of the user who made the /whoami call
+          items:
+            $ref: '#/components/schemas/WhoamiLogin'
+  securitySchemes:
+    matrix_auth:
+      type: http
+      scheme: bearer
+      description: Either a Matrix access token for users on the local server, or a [Matrix OpenID token](https://spec.matrix.org/v1.11/client-server-api/#openid) for users on other servers.
