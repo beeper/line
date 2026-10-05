@@ -650,6 +650,33 @@ func (m *Manager) GenerateGroupKey() (int, error) {
 	return m.runner.RegistrationKeyGenerate()
 }
 
+func (m *Manager) WrapRegistrationGroupKey(memberPubKeys []string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.errLocked(); err != nil {
+		return nil, err
+	}
+	if m.myKeyID == 0 {
+		return nil, fmt.Errorf("my E2EE key not loaded")
+	}
+	channelIDs := make([]int, len(memberPubKeys))
+	for i, memberPubKey := range memberPubKeys {
+		normalized, err := gen.NormalizePeerPublicKeyB64(memberPubKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid member public key: %w", err)
+		}
+		channelIDs[i], err = m.runner.ChannelCreate(m.myKeyID, normalized)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create ECDH channel: %w", err)
+		}
+	}
+	wrapped, err := m.runner.WrapRegistrationGroupKey(channelIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to wrap group key: %w", err)
+	}
+	return wrapped, nil
+}
+
 func (m *Manager) ReleaseGroupKey(keyID int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
