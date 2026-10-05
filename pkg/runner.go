@@ -1225,8 +1225,33 @@ func (r *Runner) ChannelWrapGroupSharedKey(channelID int, keyID int) (out0 strin
 	if r.failure != nil {
 		return "", r.failure
 	}
-	defer r.finishOperation("ChannelWrapGroupSharedKey", &err, true, func() { out0 = "" })
+	defer r.finishOperation("ChannelWrapGroupSharedKey", &err, false, func() { out0 = "" })
 	return r.channelWrapGroupSharedKey(channelID, keyID)
+}
+
+func (r *Runner) WrapRegistrationGroupKey(channelIDs []int) (out0 []string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return nil, r.failure
+	}
+	defer r.finishOperation("WrapRegistrationGroupKey", &err, false, func() { out0 = nil })
+	chanPtrs := make([]uint32, len(channelIDs))
+	for i, channelID := range channelIDs {
+		chanPtrs[i], err = r.getChannel(channelID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	wrapped, err := r.rt.WrapRegistrationGroupKey(chanPtrs)
+	if err != nil {
+		return nil, err
+	}
+	out0 = make([]string, len(wrapped))
+	for i, data := range wrapped {
+		out0[i] = base64.StdEncoding.EncodeToString(data)
+	}
+	return out0, nil
 }
 
 func (r *Runner) channelWrapGroupSharedKey(channelID int, keyID int) (string, error) {
