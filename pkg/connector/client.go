@@ -836,7 +836,9 @@ func (lc *LineClient) GetUserID() networkid.UserID {
 	return makeUserID(lc.Mid)
 }
 
-func (lc *LineClient) LogoutRemote(ctx context.Context) {}
+func (lc *LineClient) LogoutRemote(ctx context.Context) {
+	lc.Disconnect()
+}
 
 func (lc *LineClient) midOrFallback() string {
 	if lc.Mid != "" {
