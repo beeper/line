@@ -798,24 +798,34 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	if res.Certificate != "" {
 		staged.Certificate = res.Certificate
 	}
-	mgr, exported, err := exportLoginE2EEKeys(res, newLineAPIClient(accessToken))
-	if err != nil {
-		return fmt.Errorf("refresh re-login E2EE keys: %w", err)
-	}
+	mgr, exported, keyErr := exportLoginE2EEKeys(res, newLineAPIClient(accessToken))
 	if mgr != nil {
 		defer mgr.Close()
 		if res.Mid != "" && res.Mid == string(lc.UserLogin.ID) {
 			exported = mergeLoginKeyMaps(meta.ExportedKeyMap, exported)
 		}
 		if err := mgr.LoadMyKeyFromExportedMap(exported); err != nil {
-			return fmt.Errorf("validate recovered E2EE keys: %w", err)
+			keyErr = fmt.Errorf("validate recovered E2EE keys: %w", err)
+		} else {
+			applyExportedLoginE2EEKeys(&staged, res, exported)
 		}
-		applyExportedLoginE2EEKeys(&staged, res, exported)
+	}
+	if keyErr != nil {
+		if isTerminalCryptoError(keyErr) || errors.Is(keyErr, context.Canceled) || errors.Is(keyErr, context.DeadlineExceeded) || res.Mid != string(lc.UserLogin.ID) || res.Mid != meta.Mid || !shouldPreserveExistingE2EEKeys(false, meta) || lc.E2EE == nil {
+			return fmt.Errorf("refresh re-login E2EE keys: %w", keyErr)
+		}
+		mgr = nil
+		lc.UserLogin.Bridge.Log.Warn().Err(keyErr).Msg("Re-login: failed to refresh E2EE keys; using existing keys")
 	}
 	lc.runMu.Lock()
 	defer lc.runMu.Unlock()
 	if err := lc.admitRecoveredLogin(ctx, res); err != nil {
 		return err
+	}
+	if keyErr != nil {
+		if _, _, err := lc.E2EE.MyKeyIDs(); err != nil {
+			return fmt.Errorf("preserve active E2EE keys: %w", err)
+		}
 	}
 	if mgr != nil && lc.E2EE != nil {
 		if err := lc.E2EE.LoadMyKeyFromExportedMap(exported); err != nil {
