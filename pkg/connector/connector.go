@@ -703,20 +703,27 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}
 
 	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
+	sameAccount := ll.ExistingMetadata != nil && ll.ExistingLogin != nil && ll.ExistingLogin.UserLogin != nil && mid == string(ll.ExistingLogin.ID) && mid == ll.ExistingMetadata.Mid
 
 	loginManager, err := ll.fetchLoginKeys(res, meta, client)
 	if err != nil {
-		return nil, err
+		if isTerminalCryptoError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || !sameAccount || !shouldPreserveExistingE2EEKeys(false, ll.ExistingMetadata) {
+			return nil, err
+		}
+		if err := ll.admitLogin(ctx, res); err != nil {
+			return nil, err
+		}
+		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to export E2EE keys; using existing keys")
 	}
 	exportedKeys := loginManager != nil
 	if loginManager != nil {
 		defer loginManager.Close()
 	}
-	if ll.ExistingMetadata != nil && ll.ExistingLogin != nil && mid == string(ll.ExistingLogin.ID) && mid == ll.ExistingMetadata.Mid && shouldPreserveExistingE2EEKeys(exportedKeys, ll.ExistingMetadata) {
+	if sameAccount && shouldPreserveExistingE2EEKeys(exportedKeys, ll.ExistingMetadata) {
 		copyLoginE2EEKeyMetadata(meta, ll.ExistingMetadata)
 		ll.User.Bridge.Log.Info().Int("keys", len(meta.ExportedKeyMap)).Msg("Preserved existing E2EE keys after re-login")
 	}
-	if exportedKeys && ll.ExistingMetadata != nil && ll.ExistingLogin != nil && mid == string(ll.ExistingLogin.ID) && mid == ll.ExistingMetadata.Mid {
+	if exportedKeys && sameAccount {
 		meta.ExportedKeyMap = mergeLoginKeyMaps(ll.ExistingMetadata.ExportedKeyMap, meta.ExportedKeyMap)
 	}
 	if !res.NoE2EE && len(meta.ExportedKeyMap) == 0 {
