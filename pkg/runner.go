@@ -25,6 +25,7 @@ type Runner struct {
 	loginCurveKey uint32         // Curve25519Key ptr (after GenerateE2EESecret)
 	keyStore      map[int]uint32 // internal ID -> E2EEKey ptr
 	channelStore  map[int]uint32 // internal ID -> E2EEChannel ptr
+	channelsByKey map[channelKey]int
 	nextID        int
 	mu            sync.Mutex
 
@@ -52,6 +53,11 @@ const signingRefreshCalls = 1024
 type signingContext struct {
 	derivedKeyPtr uint32
 	hmacPtr       uint32
+}
+
+type channelKey struct {
+	keyID         int
+	peerPublicKey string
 }
 
 type SecretResult struct {
@@ -606,6 +612,10 @@ func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid peer public key: %w", err)
 	}
+	cacheKey := channelKey{keyID: keyID, peerPublicKey: normalized}
+	if id, ok := r.channelsByKey[cacheKey]; ok {
+		return id, nil
+	}
 	peerPubBytes, _ := base64.StdEncoding.DecodeString(normalized)
 
 	chanPtr, err := r.rt.E2EEKeyCreateChannel(keyPtr, peerPubBytes)
@@ -614,6 +624,10 @@ func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (int, error) {
 	}
 
 	id := r.putChannel(chanPtr)
+	if r.channelsByKey == nil {
+		r.channelsByKey = make(map[channelKey]int)
+	}
+	r.channelsByKey[cacheKey] = id
 
 	// If we have raw key material, also create a pure Go channel. This cache is
 	// best-effort; the WASM channel above is the authoritative channel.
