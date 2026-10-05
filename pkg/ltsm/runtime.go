@@ -293,6 +293,10 @@ func (rt *Runtime) Curve25519KeyGenerate() (uint32, error) {
 	return ptr, nil
 }
 
+func (rt *Runtime) Curve25519KeyDestroy(ptr uint32) error {
+	return rt.imp.Destroy("Curve25519Key", ptr)
+}
+
 // --- E2EEKey ---
 
 func (rt *Runtime) E2EEKeyLoadKey(keyBytes []byte) (uint32, error) {

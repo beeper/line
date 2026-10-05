@@ -131,6 +131,7 @@ type RSAKeyInfo struct {
 }
 
 type LoginResult struct {
+	Attempt             *LoginAttempt       `json:"-"`
 	AuthToken           string              `json:"authToken"`
 	Certificate         string              `json:"certificate"`
 	Verifier            string              `json:"verifier"`

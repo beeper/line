@@ -24,7 +24,7 @@ var (
 )
 
 func isFatalLTSMError(err error) bool {
-	return errors.Is(err, ltsm.ErrAbort)
+	return errors.Is(err, ltsm.ErrAbort) || errors.Is(err, gen.ErrRunnerClosed)
 }
 
 /*
@@ -33,15 +33,17 @@ This wraps the JS runner to perform storage init, key/channel handling, and e2ee
 type Manager struct {
 	runner *gen.Runner
 
-	mu            sync.Mutex
-	myKeyID       int
-	myRawKeyID    int
-	myKeyB64      string
-	myPublicB64   string
-	peerPublic    map[int]string // raw key id -> public key b64
-	keyByRawID    map[int]int    // raw key id -> runner key id
-	channelByPair map[string]int // privRaw/peerRaw -> channelId
-	sequence      map[string]int // portal/chat id -> seq
+	mu             sync.Mutex
+	closed         bool
+	myKeyID        int
+	myRawKeyID     int
+	myKeyB64       string
+	myPublicB64    string
+	ownKeyByExport map[string]int
+	peerPublic     map[int]string // raw key id -> public key b64
+	keyByRawID     map[int]int    // raw key id -> runner key id
+	channelByPair  map[string]int // privRaw/peerRaw -> channelId
+	sequence       map[string]int // portal/chat id -> seq
 
 	// groupKeys maps chatMid -> groupKeyId -> e2eeKeyId (unwrapped group private key, runner ID)
 	groupKeys map[string]map[int]int
@@ -52,12 +54,17 @@ type Manager struct {
 }
 
 func NewManager() (*Manager, error) {
-	r, err := gen.GetRunner()
+	r, err := gen.NewRunner()
 	if err != nil {
 		return nil, err
 	}
+	return NewManagerWithRunner(r), nil
+}
+
+func NewManagerWithRunner(r *gen.Runner) *Manager {
 	return &Manager{
 		runner:               r,
+		ownKeyByExport:       make(map[string]int),
 		peerPublic:           make(map[int]string),
 		keyByRawID:           make(map[int]int),
 		channelByPair:        make(map[string]int),
@@ -65,12 +72,48 @@ func NewManager() (*Manager, error) {
 		groupKeys:            make(map[string]map[int]int),
 		groupSessionChannels: make(map[string]map[int]map[int]int),
 		latestGroupKey:       make(map[string]int),
-	}, nil
+	}
+}
+
+func (m *Manager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	m.closed = true
+	m.runner.Close()
+	m.myKeyID, m.myRawKeyID = 0, 0
+	m.myKeyB64, m.myPublicB64 = "", ""
+	m.ownKeyByExport = nil
+	m.peerPublic = nil
+	m.keyByRawID = nil
+	m.channelByPair = nil
+	m.sequence = nil
+	m.groupKeys = nil
+	m.groupSessionChannels = nil
+	m.latestGroupKey = nil
+}
+
+func (m *Manager) errLocked() error {
+	if m.runner != nil {
+		if err := m.runner.Err(); err != nil {
+			return err
+		}
+	}
+	if m.closed {
+		return gen.ErrRunnerClosed
+	}
+	return nil
 }
 
 // returns both the raw key id and the runner key ids
 func (m *Manager) MyKeyIDs() (rawID int, keyID int, err error) {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return 0, 0, err
+	}
 	defer m.mu.Unlock()
 	if m.myKeyID == 0 || m.myRawKeyID == 0 {
 		return 0, 0, fmt.Errorf("my key not loaded")
@@ -82,6 +125,10 @@ func (m *Manager) MyKeyIDs() (rawID int, keyID int, err error) {
 // Used to include the caller's own entry when registering a group key.
 func (m *Manager) MyPublicKey() (rawID int, pubB64 string, err error) {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return 0, "", err
+	}
 	defer m.mu.Unlock()
 	if m.myRawKeyID == 0 || m.myPublicB64 == "" {
 		return 0, "", fmt.Errorf("my key not loaded")
@@ -95,10 +142,23 @@ func (m *Manager) InitStorage(wrappedNonce, kdf1, kdf2 string) error {
 
 func (m *Manager) LoadMyKey(b64Key string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	keyID, err := m.runner.KeyLoad(b64Key)
-	if err != nil {
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
 		return err
+	}
+	defer m.mu.Unlock()
+	keyBytes, err := base64.StdEncoding.DecodeString(b64Key)
+	if err != nil {
+		return fmt.Errorf("invalid key: %w", err)
+	}
+	b64Key = base64.StdEncoding.EncodeToString(keyBytes)
+	keyID := m.ownKeyByExport[b64Key]
+	if keyID == 0 {
+		keyID, err = m.runner.KeyLoad(b64Key)
+		if err != nil {
+			return err
+		}
+		m.ownKeyByExport[b64Key] = keyID
 	}
 	rawID, err := m.runner.KeyGetID(keyID)
 	if err != nil {
@@ -145,6 +205,9 @@ func (m *Manager) LoadMyKeyFromSecureData(data map[string]any) error {
 		if err := m.LoadMyKey(b64); err == nil {
 			loadedAny = true
 		} else {
+			if isFatalLTSMError(err) {
+				return err
+			}
 			lastErr = err
 		}
 	}
@@ -154,7 +217,9 @@ func (m *Manager) LoadMyKeyFromSecureData(data map[string]any) error {
 		}
 		return fmt.Errorf("failed to load any exported key")
 	}
-	return nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.errLocked()
 }
 
 func (m *Manager) LoadMyKeyFromExportedMap(exported map[string]string) error {
@@ -313,6 +378,10 @@ func (m *Manager) encryptV1Chunks(chanID, senderKeyID, receiverKeyID int, payloa
 
 func (m *Manager) ensureChannelForEncrypt(chatID string, myKeyID, senderKeyID, receiverKeyID int, peerPubKeyB64 string) (int, int, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.errLocked(); err != nil {
+		return 0, 0, err
+	}
 	myRaw := m.myRawKeyID
 	myRunnerKey := myKeyID
 	if myRunnerKey == 0 {
@@ -321,7 +390,6 @@ func (m *Manager) ensureChannelForEncrypt(chatID string, myKeyID, senderKeyID, r
 	peerPub := m.peerPublic
 	keyByRaw := m.keyByRawID
 	seqMap := m.sequence
-	m.mu.Unlock()
 
 	var privRaw, pubRaw, privKeyID int
 	if senderKeyID == myRaw {
@@ -338,35 +406,31 @@ func (m *Manager) ensureChannelForEncrypt(chatID string, myKeyID, senderKeyID, r
 
 	pubKey := peerPubKeyB64
 	if pubKey == "" {
-		m.mu.Lock()
 		pubKey = peerPub[pubRaw]
-		m.mu.Unlock()
 	}
 	if pubKey == "" {
 		return 0, 0, fmt.Errorf("missing peer public key for raw id %d", pubRaw)
 	}
 
-	m.RegisterPeerPublicKey(pubRaw, pubKey)
+	normalized, err := gen.NormalizePeerPublicKeyB64(pubKey)
+	if err != nil {
+		return 0, 0, err
+	}
+	m.peerPublic[pubRaw] = normalized
 
 	pairKey := fmt.Sprintf("%d|%d", privRaw, pubRaw)
-	m.mu.Lock()
 	chanID, ok := m.channelByPair[pairKey]
-	m.mu.Unlock()
 	if !ok {
 		created, err := m.runner.ChannelCreate(privKeyID, pubKey)
 		if err != nil {
 			return 0, 0, err
 		}
 		chanID = created
-		m.mu.Lock()
 		m.channelByPair[pairKey] = chanID
-		m.mu.Unlock()
 	}
 
-	m.mu.Lock()
 	seq := seqMap[chatID] + 1 // start at 1 like extension?
 	seqMap[chatID] = seq
-	m.mu.Unlock()
 
 	return chanID, seq, nil
 }
@@ -376,6 +440,10 @@ func (m *Manager) DecryptMessageV2(msg *line.Message) (string, error) {
 		return "", fmt.Errorf("not enough chunks")
 	}
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return "", err
+	}
 	myRaw := m.myRawKeyID
 	m.mu.Unlock()
 	if myRaw == 0 {
@@ -472,6 +540,10 @@ func cipherVersion(chunks []string) (int, error) {
 
 func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroupSharedKey) (int, error) {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return 0, err
+	}
 	defer m.mu.Unlock()
 	if id := m.groupKeys[chatMid][sharedKey.GroupKeyID]; id != 0 {
 		m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
@@ -519,7 +591,21 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 // GenerateGroupKey generates a new Curve25519 key in the WASM module for use as a group key.
 // Returns the key ID for use with WrapGroupKeyForMember.
 func (m *Manager) GenerateGroupKey() (int, error) {
-	return m.runner.KeyGenerate()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.errLocked(); err != nil {
+		return 0, err
+	}
+	return m.runner.RegistrationKeyGenerate()
+}
+
+func (m *Manager) ReleaseGroupKey(keyID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.errLocked(); err != nil {
+		return err
+	}
+	return m.runner.RegistrationKeyRelease(keyID)
 }
 
 // WrapGroupKeyForMember wraps a WASM-generated group key for a specific group member.
@@ -527,6 +613,10 @@ func (m *Manager) GenerateGroupKey() (int, error) {
 // Returns the base64-encoded wrapped key, ready for registerE2EEGroupKey.
 func (m *Manager) WrapGroupKeyForMember(memberPubKeyB64 string, keyID int) (string, error) {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return "", err
+	}
 	myKeyID := m.myKeyID
 	m.mu.Unlock()
 
@@ -571,6 +661,10 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 	}
 
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return "", 0, err
+	}
 	keyMap, ok := m.groupKeys[chatMid]
 	var unwrappedKeyID int
 	if ok {
@@ -630,6 +724,10 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 
 func (m *Manager) ensureGroupChannel(chatMid string, groupKeyID, unwrappedKeyID, senderKeyID int) (int, error) {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return 0, err
+	}
 	defer m.mu.Unlock()
 
 	if m.groupSessionChannels[chatMid] == nil {
@@ -668,6 +766,10 @@ func (m *Manager) EncryptGroupMessage(chatMid, fromMid string, plaintext string)
 // Falls back to V1 if V2 fails (some clients like iOS still use V1).
 func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType int, payload []byte) ([]string, error) {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	groupKeyID, ok := m.latestGroupKey[chatMid]
 	var unwrappedKeyID int
 	if ok {
@@ -721,6 +823,10 @@ func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType in
 
 func (m *Manager) HasPeerPublicKey(rawKeyID int) bool {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return false
+	}
 	defer m.mu.Unlock()
 	_, ok := m.peerPublic[rawKeyID]
 	return ok
@@ -732,6 +838,10 @@ func (m *Manager) HasPeerPublicKey(rawKeyID int) bool {
 // since myRawKeyID only points to the latest one.
 func (m *Manager) IsMyKey(rawKeyID int) bool {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return false
+	}
 	defer m.mu.Unlock()
 	_, ok := m.keyByRawID[rawKeyID]
 	return ok
@@ -743,23 +853,34 @@ func (m *Manager) RegisterPeerPublicKey(rawKeyID int, pubB64 string) {
 		return
 	}
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return
+	}
 	defer m.mu.Unlock()
 	m.peerPublic[rawKeyID] = normalized
 }
 
 func (m *Manager) RegisterUnwrappedKey(rawKeyID, runnerKeyID int) {
 	m.mu.Lock()
+	if err := m.errLocked(); err != nil {
+		m.mu.Unlock()
+		return
+	}
 	defer m.mu.Unlock()
 	m.keyByRawID[rawKeyID] = runnerKeyID
 }
 
 func (m *Manager) channelFromKeyIDs(senderKeyID, receiverKeyID int) (int, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.errLocked(); err != nil {
+		return 0, err
+	}
 	myRaw := m.myRawKeyID
 	myKeyID := m.myKeyID
 	peerPub := m.peerPublic
 	keyByRaw := m.keyByRawID
-	m.mu.Unlock()
 
 	// Determine which side is the users's
 	var privRaw, pubRaw, privKeyID int
@@ -791,20 +912,15 @@ func (m *Manager) channelFromKeyIDs(senderKeyID, receiverKeyID int) (int, error)
 	}
 
 	pairKey := fmt.Sprintf("%d|%d", privRaw, pubRaw)
-	m.mu.Lock()
 	if id, ok := m.channelByPair[pairKey]; ok {
-		m.mu.Unlock()
 		return id, nil
 	}
-	m.mu.Unlock()
 
 	chanID, err := m.runner.ChannelCreate(privKeyID, pubB64)
 	if err != nil {
 		return 0, err
 	}
-	m.mu.Lock()
 	m.channelByPair[pairKey] = chanID
-	m.mu.Unlock()
 	return chanID, nil
 }
 

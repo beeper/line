@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,8 +30,21 @@ const lineMissingE2EEKeyMessage = "LINE encryption keys are unavailable. Reconne
 var newLineAPIClient = line.NewClient
 var newE2EEManager = e2ee.NewManager
 
-var loginWithCredentials = func(email, password, certificate string) (*line.LoginResult, error) {
+func defaultLoginWithCredentials(email, password, certificate string) (*line.LoginResult, error) {
 	return newLineAPIClient("").Login(email, password, certificate)
+}
+
+var loginWithCredentials = defaultLoginWithCredentials
+
+func validLoginProducer(res *line.LoginResult) bool {
+	return res != nil && (res.Attempt != nil || reflect.ValueOf(loginWithCredentials).Pointer() != reflect.ValueOf(defaultLoginWithCredentials).Pointer())
+}
+
+func loginWithCredentialsContext(ctx context.Context, email, password, certificate string) (*line.LoginResult, error) {
+	if reflect.ValueOf(loginWithCredentials).Pointer() != reflect.ValueOf(defaultLoginWithCredentials).Pointer() {
+		return loginWithCredentials(email, password, certificate)
+	}
+	return newLineAPIClient("").LoginContext(ctx, email, password, certificate)
 }
 
 var getProfileWithToken = func(ctx context.Context, token string) (*line.Profile, error) {
@@ -163,7 +177,7 @@ func (lc *LineClient) beginRun(parent context.Context) (context.Context, *lineCl
 	ctx, cancel := context.WithCancel(parent)
 	run := &lineClientRun{cancel: cancel}
 	lc.runMu.Lock()
-	if lc.stopped {
+	if lc.stopped || lc.activeRun != nil {
 		lc.runMu.Unlock()
 		cancel()
 		return ctx, run, false
@@ -471,7 +485,7 @@ func (lc *LineClient) recoverTokenWith(
 			return nil
 		} else if ctx.Err() != nil {
 			return ctx.Err()
-		} else if lc.isLoggedOut(err) || errors.Is(err, errLineSessionInvalidated) {
+		} else if lc.isLoggedOut(err) || errors.Is(err, errLineSessionInvalidated) || errors.Is(err, errLineClientSuperseded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
 		lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
@@ -526,6 +540,9 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	workersStarted := false
 	defer func() {
 		if !workersStarted {
+			if lc.E2EE != nil {
+				lc.E2EE.Close()
+			}
 			run.cancel()
 		}
 	}()
@@ -689,9 +706,15 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		Str("email", email).
 		Bool("has_certificate", certificate != "").
 		Msg("Attempting to login with email/password...")
-	res, err := loginWithCredentials(email, password, certificate)
+	res, err := loginWithCredentialsContext(ctx, email, password, certificate)
+	if res != nil {
+		defer res.Attempt.Close()
+	}
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)
+	}
+	if !validLoginProducer(res) {
+		return errors.New("missing LINE login producer")
 	}
 	if res.AuthToken == "" {
 		// No usable verifier means LINE didn't engage the PIN-based flow.
@@ -718,6 +741,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 
 		lc.UserLogin.Bridge.Log.Info().Msg("Waiting for PIN verification on mobile device...")
 		waitClient := newLineAPIClient("")
+		waitClient.LoginAttempt = res.Attempt
 		waitRes, err := waitClient.WaitForLogin(res.Verifier, res.NoE2EE)
 		if err != nil {
 			return fmt.Errorf("PIN verification failed: %w", err)
@@ -738,36 +762,103 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 			refreshToken = res.TokenV3IssueResult.RefreshToken
 		}
 	}
-	accessToken, refreshToken = lc.setTokens(accessToken, refreshToken)
-
-	// Re-login replaces the main access token, which invalidates any cached
-	// OBS token derived from the previous one.
-	line.InvalidateOBSTokenCache()
-
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if lc.superseded.Load() {
+		return errLineClientSuperseded
+	}
+	if res.Attempt != nil {
+		profile, err := newLineAPIClient(accessToken).GetProfileContext(ctx)
+		if err != nil {
+			return fmt.Errorf("verify re-login account: %w", err)
+		}
+		if profile.Mid == "" || profile.Mid != string(lc.UserLogin.ID) ||
+			(lc.Mid != "" && profile.Mid != lc.Mid) || (res.Mid != "" && profile.Mid != res.Mid) {
+			return errors.New("re-login account does not match active LINE account")
+		}
+		res.Mid = profile.Mid
+	}
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return errors.New("missing LINE login metadata")
+	}
+	if res.Attempt != nil && meta.Mid != "" && res.Mid != meta.Mid {
+		return errors.New("re-login account does not match stored LINE account")
+	}
+	staged := *meta
+	staged.AccessToken = accessToken
+	if refreshToken != "" {
+		staged.RefreshToken = refreshToken
+	}
+	staged.SessionInvalidated = false
 	if res.Mid != "" {
-		lc.Mid = res.Mid
-		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
-			meta.Mid = res.Mid
+		staged.Mid = res.Mid
+	}
+	if res.Certificate != "" {
+		staged.Certificate = res.Certificate
+	}
+	mgr, exported, err := exportLoginE2EEKeys(res, newLineAPIClient(accessToken))
+	if err != nil {
+		return fmt.Errorf("refresh re-login E2EE keys: %w", err)
+	}
+	if mgr != nil {
+		defer mgr.Close()
+		if res.Mid != "" && res.Mid == string(lc.UserLogin.ID) {
+			exported = mergeLoginKeyMaps(meta.ExportedKeyMap, exported)
+		}
+		if err := mgr.LoadMyKeyFromExportedMap(exported); err != nil {
+			return fmt.Errorf("validate recovered E2EE keys: %w", err)
+		}
+		applyExportedLoginE2EEKeys(&staged, res, exported)
+	}
+	lc.runMu.Lock()
+	defer lc.runMu.Unlock()
+	if err := lc.admitRecoveredLogin(ctx, res); err != nil {
+		return err
+	}
+	if mgr != nil && lc.E2EE != nil {
+		if err := lc.E2EE.LoadMyKeyFromExportedMap(exported); err != nil {
+			return fmt.Errorf("load recovered E2EE keys: %w", err)
+		}
+		if err := lc.admitRecoveredLogin(ctx, res); err != nil {
+			return err
 		}
 	}
-
-	// Save the new tokens and updated certificate to metadata
-	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
-		meta.AccessToken = accessToken
-		meta.RefreshToken = refreshToken
-		meta.SessionInvalidated = false
-		if res.Certificate != "" {
-			meta.Certificate = res.Certificate
-		}
-		if err := lc.refreshLoginE2EEKeys(res, meta, newLineAPIClient(accessToken)); err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to refresh E2EE keys after re-login")
-		}
-		if err := lc.UserLogin.Save(ctx); err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save new tokens to DB")
+	previous := *meta
+	*meta = staged
+	if err := lc.UserLogin.Save(ctx); err != nil {
+		*meta = previous
+		return fmt.Errorf("save recovered LINE login: %w", err)
+	}
+	lc.setTokens(accessToken, refreshToken)
+	lc.Mid = staged.Mid
+	line.InvalidateOBSTokenCache()
+	if mgr != nil {
+		if err := mgr.SaveSecureDataToFile(loginSecureDataID(&staged, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
+			return fmt.Errorf("save recovered E2EE secure data: %w", err)
 		}
 	}
 
 	lc.UserLogin.Bridge.Log.Info().Msg("Login successful!")
+	return nil
+}
+
+func (lc *LineClient) admitRecoveredLogin(ctx context.Context, res *line.LoginResult) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if res.Attempt != nil {
+		if err := res.Attempt.Context.Err(); err != nil {
+			return err
+		}
+	}
+	if lc.superseded.Load() || lc.stopped || lc.recoveryStopped {
+		return errLineClientSuperseded
+	}
+	if lc.isSessionInvalidated() {
+		return errLineSessionInvalidated
+	}
 	return nil
 }
 
@@ -779,14 +870,31 @@ func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLogi
 	if err != nil {
 		return err
 	}
+	defer mgr.Close()
+	if res.Attempt != nil && res.Attempt.Context.Err() != nil {
+		return res.Attempt.Context.Err()
+	}
+	if lc.superseded.Load() {
+		return errLineClientSuperseded
+	}
+	if res.Mid != "" && res.Mid == meta.Mid && lc.UserLogin != nil && res.Mid == string(lc.UserLogin.ID) {
+		exported = mergeLoginKeyMaps(meta.ExportedKeyMap, exported)
+	}
+
 	if lc.E2EE != nil {
 		if err := lc.E2EE.LoadMyKeyFromExportedMap(exported); err != nil {
 			return fmt.Errorf("load exported keys into active E2EE manager: %w", err)
 		}
 	}
+	if res.Attempt != nil && res.Attempt.Context.Err() != nil {
+		return res.Attempt.Context.Err()
+	}
+	if lc.superseded.Load() {
+		return errLineClientSuperseded
+	}
 	lc.applyRefreshedLoginE2EEKeys(meta, res, exported)
 	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")
+		return fmt.Errorf("save E2EE secure data after re-login: %w", err)
 	}
 	lc.UserLogin.Bridge.Log.Info().Int("keys", len(exported)).Msg("Refreshed E2EE keys after re-login")
 	return nil
@@ -827,6 +935,9 @@ func (lc *LineClient) Disconnect() {
 	// superseded flag was visible before a replacement installs new metadata.
 	lc.recoverMu.Lock()
 	lc.recoveryStopped = true
+	if lc.E2EE != nil {
+		lc.E2EE.Close()
+	}
 	lc.recoverMu.Unlock()
 }
 
