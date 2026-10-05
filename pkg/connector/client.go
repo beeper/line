@@ -485,7 +485,7 @@ func (lc *LineClient) recoverTokenWith(
 			return nil
 		} else if ctx.Err() != nil {
 			return ctx.Err()
-		} else if lc.isLoggedOut(err) || errors.Is(err, errLineSessionInvalidated) || errors.Is(err, errLineClientSuperseded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		} else if lc.isLoggedOut(err) || errors.Is(err, errLineSessionInvalidated) || errors.Is(err, errLineClientSuperseded) || errors.Is(err, context.Canceled) {
 			return err
 		}
 		lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
@@ -811,7 +811,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		}
 	}
 	if keyErr != nil {
-		if isTerminalCryptoError(keyErr) || errors.Is(keyErr, context.Canceled) || errors.Is(keyErr, context.DeadlineExceeded) || res.Mid != string(lc.UserLogin.ID) || res.Mid != meta.Mid || !shouldPreserveExistingE2EEKeys(false, meta) || lc.E2EE == nil {
+		if isTerminalCryptoError(keyErr) || errors.Is(keyErr, context.Canceled) || res.Mid != string(lc.UserLogin.ID) || res.Mid != meta.Mid || !shouldPreserveExistingE2EEKeys(false, meta) {
 			return fmt.Errorf("refresh re-login E2EE keys: %w", keyErr)
 		}
 		mgr = nil
@@ -822,7 +822,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	if err := lc.admitRecoveredLogin(ctx, res); err != nil {
 		return err
 	}
-	if keyErr != nil {
+	if keyErr != nil && lc.E2EE != nil {
 		if _, _, err := lc.E2EE.MyKeyIDs(); err != nil {
 			return fmt.Errorf("preserve active E2EE keys: %w", err)
 		}
@@ -835,6 +835,8 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 			return err
 		}
 	}
+	lc.missingE2EEKeyMu.Lock()
+	defer lc.missingE2EEKeyMu.Unlock()
 	previous := *meta
 	*meta = staged
 	if err := lc.UserLogin.Save(ctx); err != nil {
@@ -845,8 +847,11 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	lc.Mid = staged.Mid
 	line.InvalidateOBSTokenCache()
 	if mgr != nil {
+		lc.missingE2EEKeyMarked = false
+	}
+	if mgr != nil {
 		if err := mgr.SaveSecureDataToFile(loginSecureDataID(&staged, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-			return fmt.Errorf("save recovered E2EE secure data: %w", err)
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")
 		}
 	}
 

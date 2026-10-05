@@ -707,7 +707,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 
 	loginManager, err := ll.fetchLoginKeys(res, meta, client)
 	if err != nil {
-		if isTerminalCryptoError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || !sameAccount || !shouldPreserveExistingE2EEKeys(false, ll.ExistingMetadata) {
+		if isTerminalCryptoError(err) || errors.Is(err, context.Canceled) || !sameAccount || !shouldPreserveExistingE2EEKeys(false, ll.ExistingMetadata) {
 			return nil, err
 		}
 		if err := ll.admitLogin(ctx, res); err != nil {
