@@ -11,6 +11,7 @@ type lineCallDeps[T any] struct {
 	newClient   func() *line.Client
 	recover     func(context.Context, *line.Client, error) (*line.Client, error)
 	isAuthError func(error) bool
+	beforeCall  func() error
 	call        func(*line.Client) (T, error)
 }
 
@@ -19,6 +20,19 @@ var recoverLineToken = func(lc *LineClient, ctx context.Context) error {
 }
 
 func callLineWithRecovery[T any](ctx context.Context, client *line.Client, deps lineCallDeps[T]) (*line.Client, T, error) {
+	check := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if deps.beforeCall != nil {
+			return deps.beforeCall()
+		}
+		return nil
+	}
+	if err := check(); err != nil {
+		var zero T
+		return client, zero, err
+	}
 	if client == nil {
 		client = deps.newClient()
 	}
@@ -37,6 +51,10 @@ func callLineWithRecovery[T any](ctx context.Context, client *line.Client, deps 
 	}
 
 	client = recoveredClient
+	if err := check(); err != nil {
+		var zero T
+		return client, zero, err
+	}
 	res, err = deps.call(client)
 	if line.IsLoggedOut(err) {
 		// The retry is the final attempt, but a current-token logout still needs
@@ -139,11 +157,27 @@ func (lc *LineClient) callLine(ctx context.Context, call func(*line.Client) erro
 	return lc.callLineUsing(ctx, nil, call)
 }
 
+func (lc *LineClient) checkLineCall(ctx context.Context) error {
+	lc.runMu.Lock()
+	defer lc.runMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lc.stopped || lc.superseded.Load() {
+		return errLineClientSuperseded
+	}
+	if lc.isSessionInvalidated() {
+		return errLineSessionInvalidated
+	}
+	return nil
+}
+
 func (lc *LineClient) callLineUsing(ctx context.Context, client *line.Client, call func(*line.Client) error) (*line.Client, error) {
 	client, _, err := callLineWithRecovery(ctx, client, lineCallDeps[struct{}]{
 		newClient:   func() *line.Client { return lc.newClient() },
 		recover:     lc.recoverClientAfterAuthError,
 		isAuthError: lc.isTokenError,
+		beforeCall:  func() error { return lc.checkLineCall(ctx) },
 		call: func(client *line.Client) (struct{}, error) {
 			return struct{}{}, call(client)
 		},
@@ -160,6 +194,7 @@ func callLineResultUsing[T any](lc *LineClient, ctx context.Context, client *lin
 		newClient:   func() *line.Client { return lc.newClient() },
 		recover:     lc.recoverClientAfterAuthError,
 		isAuthError: lc.isTokenError,
+		beforeCall:  func() error { return lc.checkLineCall(ctx) },
 		call:        call,
 	})
 	return client, res, err
