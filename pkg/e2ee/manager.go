@@ -473,6 +473,10 @@ func cipherVersion(chunks []string) (int, error) {
 func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroupSharedKey) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if id := m.groupKeys[chatMid][sharedKey.GroupKeyID]; id != 0 {
+		m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
+		return id, nil
+	}
 
 	creatorRawKeyID := sharedKey.CreatorKeyID
 	creatorPubKeyB64, ok := m.peerPublic[creatorRawKeyID]
