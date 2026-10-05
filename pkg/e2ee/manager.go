@@ -49,7 +49,18 @@ type Manager struct {
 	groupSessionChannels map[string]map[int]map[int]int
 
 	latestGroupKey map[string]int // chatMid -> latest groupKeyId
+
+	groupKeyLRU        []groupKeyRef
+	groupNativeObjects int
 }
+
+type groupKeyRef struct {
+	chatMid    string
+	groupKeyID int
+}
+
+// LTSM's heap is a fixed 16 MiB, so the native objects kept for group chats are bounded.
+const maxGroupNativeObjects = 4096
 
 func NewManager() (*Manager, error) {
 	r, err := gen.GetRunner()
@@ -473,8 +484,10 @@ func cipherVersion(chunks []string) (int, error) {
 func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroupSharedKey) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	ref := groupKeyRef{chatMid, sharedKey.GroupKeyID}
 	if id := m.groupKeys[chatMid][sharedKey.GroupKeyID]; id != 0 {
 		m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
+		m.touchGroupKeyLocked(ref)
 		return id, nil
 	}
 
@@ -512,8 +525,44 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 	m.groupKeys[chatMid][sharedKey.GroupKeyID] = unwrappedKeyID
 
 	m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
+	m.groupNativeObjects++
+	m.touchGroupKeyLocked(ref)
 
-	return unwrappedKeyID, nil
+	return unwrappedKeyID, m.evictGroupKeysLocked()
+}
+
+func (m *Manager) touchGroupKeyLocked(ref groupKeyRef) {
+	for i := len(m.groupKeyLRU) - 1; i >= 0; i-- {
+		if m.groupKeyLRU[i] == ref {
+			m.groupKeyLRU = append(m.groupKeyLRU[:i], m.groupKeyLRU[i+1:]...)
+			break
+		}
+	}
+	m.groupKeyLRU = append(m.groupKeyLRU, ref)
+}
+
+func (m *Manager) evictGroupKeysLocked() error {
+	for m.groupNativeObjects > maxGroupNativeObjects && len(m.groupKeyLRU) > 1 {
+		ref := m.groupKeyLRU[0]
+		m.groupKeyLRU = m.groupKeyLRU[1:]
+		keyID := m.groupKeys[ref.chatMid][ref.groupKeyID]
+		m.groupNativeObjects -= 1 + len(m.groupSessionChannels[ref.chatMid][ref.groupKeyID])
+		delete(m.groupKeys[ref.chatMid], ref.groupKeyID)
+		if len(m.groupKeys[ref.chatMid]) == 0 {
+			delete(m.groupKeys, ref.chatMid)
+		}
+		delete(m.groupSessionChannels[ref.chatMid], ref.groupKeyID)
+		if len(m.groupSessionChannels[ref.chatMid]) == 0 {
+			delete(m.groupSessionChannels, ref.chatMid)
+		}
+		if m.latestGroupKey[ref.chatMid] == ref.groupKeyID {
+			delete(m.latestGroupKey, ref.chatMid)
+		}
+		if err := m.runner.KeyDestroy(keyID); err != nil && isFatalLTSMError(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // GenerateGroupKey generates a new Curve25519 key in the WASM module for use as a group key.
@@ -571,16 +620,12 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 	}
 
 	m.mu.Lock()
-	keyMap, ok := m.groupKeys[chatMid]
-	var unwrappedKeyID int
-	if ok {
-		unwrappedKeyID = keyMap[groupKeyID]
-	}
-	m.mu.Unlock()
-
+	defer m.mu.Unlock()
+	unwrappedKeyID := m.groupKeys[chatMid][groupKeyID]
 	if unwrappedKeyID == 0 {
 		return "", groupKeyID, fmt.Errorf("group key %d not found", groupKeyID)
 	}
+	m.touchGroupKeyLocked(groupKeyRef{chatMid, groupKeyID})
 
 	ver, err := cipherVersion(msg.Chunks)
 	if err != nil {
@@ -595,7 +640,7 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 	if err != nil {
 		return "", groupKeyID, err
 	}
-	chanID, err := m.ensureGroupChannel(chatMid, groupKeyID, unwrappedKeyID, senderKeyID)
+	chanID, err := m.ensureGroupChannelLocked(chatMid, groupKeyID, unwrappedKeyID, senderKeyID)
 	if err != nil {
 		return "", groupKeyID, err
 	}
@@ -628,10 +673,8 @@ func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string
 	return pt, groupKeyID, err
 }
 
-func (m *Manager) ensureGroupChannel(chatMid string, groupKeyID, unwrappedKeyID, senderKeyID int) (int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+// Callers keep m.mu held while using the channel so an eviction cannot destroy it.
+func (m *Manager) ensureGroupChannelLocked(chatMid string, groupKeyID, unwrappedKeyID, senderKeyID int) (int, error) {
 	if m.groupSessionChannels[chatMid] == nil {
 		m.groupSessionChannels[chatMid] = make(map[int]map[int]int)
 	}
@@ -653,7 +696,8 @@ func (m *Manager) ensureGroupChannel(chatMid string, groupKeyID, unwrappedKeyID,
 	}
 
 	m.groupSessionChannels[chatMid][groupKeyID][senderKeyID] = chanID
-	return chanID, nil
+	m.groupNativeObjects++
+	return chanID, m.evictGroupKeysLocked()
 }
 
 func (m *Manager) EncryptGroupMessage(chatMid, fromMid string, plaintext string) ([]string, error) {
@@ -668,6 +712,7 @@ func (m *Manager) EncryptGroupMessage(chatMid, fromMid string, plaintext string)
 // Falls back to V1 if V2 fails (some clients like iOS still use V1).
 func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType int, payload []byte) ([]string, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	groupKeyID, ok := m.latestGroupKey[chatMid]
 	var unwrappedKeyID int
 	if ok {
@@ -676,13 +721,13 @@ func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType in
 	myKeyID := m.myRawKeyID
 	seq := m.sequence[chatMid] + 1
 	m.sequence[chatMid] = seq
-	m.mu.Unlock()
 
 	if !ok || unwrappedKeyID == 0 {
 		return nil, fmt.Errorf("%w for group %s", ErrGroupKeyNotLoaded, chatMid)
 	}
+	m.touchGroupKeyLocked(groupKeyRef{chatMid, groupKeyID})
 
-	chanID, err := m.ensureGroupChannel(chatMid, groupKeyID, unwrappedKeyID, myKeyID)
+	chanID, err := m.ensureGroupChannelLocked(chatMid, groupKeyID, unwrappedKeyID, myKeyID)
 	if err != nil {
 		return nil, err
 	}
