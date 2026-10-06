@@ -46,16 +46,16 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	return &event.RoomFeatures{
-		MaxTextLength:         5000,
-		Reply:                 event.CapLevelFullySupported,
-		Reaction:              event.CapLevelPartialSupport,
-		ReactionCount:         1,
-		AllowedReactions:      getLineAllowedReactions(),
-		ReadReceipts:          true,
-		Delete:                event.CapLevelFullySupported,
-		DeleteMaxAge:          &jsontime.Seconds{Duration: 24 * time.Hour},
-		DeleteChatForEveryone: true,
-		LocationMessage:       event.CapLevelPartialSupport,
+		MaxTextLength:    5000,
+		Reply:            event.CapLevelFullySupported,
+		Reaction:         event.CapLevelPartialSupport,
+		ReactionCount:    1,
+		AllowedReactions: getLineAllowedReactions(),
+		ReadReceipts:     true,
+		Delete:           event.CapLevelFullySupported,
+		DeleteMaxAge:     &jsontime.Seconds{Duration: 24 * time.Hour},
+		DeleteChat:       true,
+		LocationMessage:  event.CapLevelPartialSupport,
 		// Pending LINE group invitations surface as Beeper message requests. AcceptWithMessage
 		// is intentionally left unset so that sending a message implicitly accepts the invite
 		// (bridgev2 autoAcceptMessageRequest) — LINE rejects messages to un-joined groups.

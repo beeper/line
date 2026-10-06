@@ -50,6 +50,9 @@ type LineClient struct {
 	sentReqSeqs map[int]time.Time
 	lastReqSeq  int
 
+	deletedChatsMu sync.Mutex
+	deletedChats   map[string]string
+
 	tokenMu              sync.RWMutex
 	recoverMu            sync.Mutex
 	recoverTime          time.Time

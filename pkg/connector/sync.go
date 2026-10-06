@@ -604,6 +604,9 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	backfillMsgs := make([]*bridgev2.BackfillMessage, 0, len(msgs))
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
+		if lc.shouldSkipDeletedChat(chatMID, msg.ID) {
+			continue
+		}
 		lc.cacheGroupMembersFromMessage(chatMID, msg)
 		if !isBridgeableContentType(msg) {
 			continue
@@ -671,7 +674,15 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to prefetch message boxes")
 		return
 	}
-	chatMIDs := collectStartupBackfillChatMIDs(messageBoxes, lc.getKnownMemberChatMIDs(), lc.isUserBlocked)
+	latestMessageIDs := make(map[string]string, len(messageBoxes))
+	for _, box := range messageBoxes {
+		if box.LastDeliveredMessageID != nil {
+			latestMessageIDs[box.ID] = box.LastDeliveredMessageID.MessageID
+		}
+	}
+	chatMIDs := collectStartupBackfillChatMIDs(messageBoxes, lc.getKnownMemberChatMIDs(), func(mid string) bool {
+		return lc.isUserBlocked(mid) || lc.shouldSkipDeletedChat(mid, latestMessageIDs[mid])
+	})
 
 	workerCount := prefetchMessagesConcurrency
 	if len(chatMIDs) < workerCount {
@@ -770,6 +781,9 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 	// Reverse messages to process oldest first
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
+		if lc.shouldSkipDeletedChat(chatMID, msg.ID) {
+			continue
+		}
 		lc.cacheGroupMembersFromMessage(chatMID, msg)
 
 		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(msg.ID), "")
@@ -867,6 +881,9 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 			existingPortal, err := lc.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
 			if err != nil {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chat.ChatMid).Msg("Failed to find existing group portal before sync")
+			}
+			if (existingPortal == nil || existingPortal.MXID == "") && lc.shouldSkipDeletedChat(chat.ChatMid, "") {
+				continue
 			}
 
 			info := lc.chatToChatInfo(ctx, &chat, true)
@@ -2043,6 +2060,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 
 	case OpSendMessage, OpReceiveMessage:
 		if op.Message != nil {
+			if lc.shouldSkipDeletedChat(portalMIDForMessage(op.Message, op.Type), op.Message.ID) {
+				return
+			}
 			if ContentType(op.Message.ContentType) == ContentSystem {
 				lc.handleSystemMessage(op)
 			} else {
@@ -2602,6 +2622,9 @@ func (lc *LineClient) handleSystemMessage(op line.Operation) bool {
 // while its converter applies the historical state event synchronously before
 // the marker is inserted.
 func (lc *LineClient) queueHistoricalSystemMessage(msg *line.Message, opType int) bool {
+	if lc.shouldSkipDeletedChat(msg.To, msg.ID) {
+		return false
+	}
 	if !isHandledSystemMessage(msg) {
 		lc.UserLogin.Bridge.Log.Debug().
 			Str("msg_id", msg.ID).

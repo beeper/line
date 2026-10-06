@@ -140,6 +140,9 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 	}
 
 	portalIDStr := portalMIDForMessage(msg, opType)
+	if lc.shouldSkipDeletedChat(portalIDStr, msg.ID) {
+		return false
+	}
 	portalKey := networkid.PortalKey{ID: makePortalID(portalIDStr), Receiver: lc.UserLogin.ID}
 	ts := lc.parseMessageTimestamp(msg)
 

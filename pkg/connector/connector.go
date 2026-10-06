@@ -52,7 +52,7 @@ func (lc *LineConnector) Start(ctx context.Context) error {
 }
 
 func (lc *LineConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 3
+	return 1, 4
 }
 
 func (lc *LineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
@@ -138,7 +138,7 @@ func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.User
 	if meta.SessionInvalidated {
 		accessToken = ""
 	}
-	login.Client = &LineClient{
+	client := &LineClient{
 		UserLogin:          login,
 		AccessToken:        accessToken,
 		RefreshToken:       meta.RefreshToken,
@@ -146,6 +146,10 @@ func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.User
 		HTTPClient:         &http.Client{Timeout: 10 * time.Second},
 		sessionInvalidated: meta.SessionInvalidated,
 	}
+	if err := client.loadChatDeletions(ctx); err != nil {
+		return fmt.Errorf("failed to load chat deletions: %w", err)
+	}
+	login.Client = client
 	return nil
 }
 

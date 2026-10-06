@@ -823,6 +823,34 @@ func (c *Client) GetMessageBoxes(options MessageBoxesOptions) (*MessageBoxesResp
 	return &wrapper.Data, nil
 }
 
+func (c *Client) GetMessageBoxesByIDsContext(ctx context.Context, chatMids []string) (map[string]MessageBox, error) {
+	req := struct {
+		MessageBoxIDs     []string `json:"messageBoxIds"`
+		WithUnreadCount   bool     `json:"withUnreadCount"`
+		LastMessagesCount int      `json:"lastMessagesCount"`
+	}{chatMids, true, 1}
+	resp, err := c.callRPCContext(ctx, "TalkService", "getMessageBoxesByIds", req)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+		Data struct {
+			MessageBoxesByIDs map[string]MessageBox `json:"messageBoxesByIds"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, err
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getMessageBoxesByIds failed: %s", resp)
+	}
+	if wrapper.Data.MessageBoxesByIDs == nil {
+		return nil, fmt.Errorf("getMessageBoxesByIds returned no message boxes")
+	}
+	return wrapper.Data.MessageBoxesByIDs, nil
+}
+
 func (c *Client) GetRecentMessagesV2(chatMid string, limit int) ([]*Message, error) {
 	resp, err := c.callRPC("TalkService", "getRecentMessagesV2", chatMid, limit)
 	if err != nil {
@@ -848,8 +876,24 @@ func (c *Client) UnsendMessage(reqSeq int64, messageID string) error {
 }
 
 func (c *Client) SendChatRemoved(reqSeq int64, chatMid, lastReadMessageId string, lastReadMessageTime int64) error {
-	_, err := c.callRPC("TalkService", "sendChatRemoved", reqSeq, chatMid, lastReadMessageId, lastReadMessageTime)
-	return err
+	return c.SendChatRemovedContext(context.Background(), reqSeq, chatMid, lastReadMessageId, lastReadMessageTime)
+}
+
+func (c *Client) SendChatRemovedContext(ctx context.Context, reqSeq int64, chatMid, lastReadMessageID string, lastReadMessageTime int64) error {
+	resp, err := c.callRPCContext(ctx, "TalkService", "sendChatRemoved", reqSeq, chatMid, lastReadMessageID, lastReadMessageTime)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return err
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("sendChatRemoved failed: %s", resp)
+	}
+	return nil
 }
 
 // CreateChat creates a new LINE group chat with the given members and name.
