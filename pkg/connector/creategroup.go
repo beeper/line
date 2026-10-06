@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -135,6 +136,77 @@ type groupKeyCrypto interface {
 	WrapGroupKeyForMember(string, int) (string, error)
 }
 
+type groupKeyReleaser interface {
+	ReleaseGroupKey(int) error
+}
+
+type groupKeyBatchCrypto interface {
+	WrapRegistrationGroupKey([]string) ([]string, error)
+}
+
+func wrapRegistrationGroupKey(ctx context.Context, crypto groupKeyCrypto, pubKeys map[string]line.E2EEPeerPublicKey) (apiMembers []string, keyIDs []int, encryptedKeys []string, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	if batch, ok := crypto.(groupKeyBatchCrypto); ok {
+		apiMembers = make([]string, 0, len(pubKeys))
+		keyIDs = make([]int, 0, len(pubKeys))
+		memberPubKeys := make([]string, 0, len(pubKeys))
+		for mid, pk := range pubKeys {
+			apiMembers = append(apiMembers, mid)
+			keyIDs = append(keyIDs, pk.KeyID)
+			memberPubKeys = append(memberPubKeys, pk.KeyData)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		encryptedKeys, err = batch.WrapRegistrationGroupKey(memberPubKeys)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("wrap group key for members: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		if len(encryptedKeys) != len(apiMembers) {
+			return nil, nil, nil, fmt.Errorf("wrapped group key count does not match members")
+		}
+		return apiMembers, keyIDs, encryptedKeys, nil
+	}
+	groupKeyID, err := crypto.GenerateGroupKey()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to generate group key: %w", err)
+	}
+	if releaser, ok := crypto.(groupKeyReleaser); ok {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				panic(recovered)
+			}
+			if releaseErr := releaser.ReleaseGroupKey(groupKeyID); releaseErr != nil {
+				err = errors.Join(err, fmt.Errorf("release generated group key: %w", releaseErr))
+			}
+		}()
+	}
+	apiMembers = make([]string, 0, len(pubKeys))
+	keyIDs = make([]int, 0, len(pubKeys))
+	encryptedKeys = make([]string, 0, len(pubKeys))
+	for mid, pk := range pubKeys {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		encryptedKey, err := crypto.WrapGroupKeyForMember(pk.KeyData, groupKeyID)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("wrap group key for member: %w", err)
+		}
+		apiMembers = append(apiMembers, mid)
+		keyIDs = append(keyIDs, pk.KeyID)
+		encryptedKeys = append(encryptedKeys, encryptedKey)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return apiMembers, keyIDs, encryptedKeys, nil
+}
+
 func (lc *LineClient) registerGroupKey(ctx context.Context, chatMid string) error {
 	if lc.E2EE == nil {
 		return fmt.Errorf("%w: E2EE manager not initialized", line.ErrNoUsableE2EEGroupKey)
@@ -173,21 +245,9 @@ func (lc *LineClient) registerGroupKeyWithCrypto(ctx context.Context, chatMid st
 			}
 		}
 
-		groupKeyID, err := crypto.GenerateGroupKey()
+		apiMembers, keyIDs, encryptedKeys, err := wrapRegistrationGroupKey(ctx, crypto, pubKeys)
 		if err != nil {
-			return fmt.Errorf("failed to generate group key: %w", err)
-		}
-		apiMembers := make([]string, 0, len(pubKeys))
-		keyIDs := make([]int, 0, len(pubKeys))
-		encryptedKeys := make([]string, 0, len(pubKeys))
-		for mid, pk := range pubKeys {
-			encryptedKey, err := crypto.WrapGroupKeyForMember(pk.KeyData, groupKeyID)
-			if err != nil {
-				return fmt.Errorf("wrap group key for member: %w", err)
-			}
-			apiMembers = append(apiMembers, mid)
-			keyIDs = append(keyIDs, pk.KeyID)
-			encryptedKeys = append(encryptedKeys, encryptedKey)
+			return err
 		}
 		if err := ctx.Err(); err != nil {
 			return err

@@ -178,11 +178,15 @@ type LineEmailLogin struct {
 	ExistingMetadata *UserLoginMetadata
 	ExistingLogin    *bridgev2.UserLogin
 
-	pollResult chan *line.LoginResult
-	pollErr    chan error
-	polling    bool
-	mu         sync.Mutex
-	finalizeMu *sync.Mutex
+	pollResult    chan *line.LoginResult
+	pollErr       chan error
+	polling       bool
+	attempt       *line.LoginAttempt
+	attemptCtx    context.Context
+	attemptCancel context.CancelFunc
+	canceled      bool
+	mu            sync.Mutex
+	finalizeMu    *sync.Mutex
 }
 
 var _ bridgev2.LoginProcessUserInput = (*LineEmailLogin)(nil)
@@ -237,7 +241,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 
 	override.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 
-	res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)
+	res, err := ll.loginCredentials(ctx, ll.Certificate)
 	if err != nil {
 		ll.logLoginFailure(err, "reconnect")
 		reason := loginErrorReason(err)
@@ -264,7 +268,7 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 		return ll.loginErrorStep("Email and password are required"), nil
 	}
 
-	res, err := loginWithCredentials(ll.Email, ll.Password, "")
+	res, err := ll.loginCredentials(ctx, "")
 	if err != nil {
 		ll.logLoginFailure(err, "credentials")
 		reason := loginErrorReason(err)
@@ -458,24 +462,76 @@ func isBlockedUserLoginError(message string) bool {
 	return strings.EqualFold(strings.TrimSpace(message), "blocked user")
 }
 
+func (ll *LineEmailLogin) loginCredentials(ctx context.Context, certificate string) (*line.LoginResult, error) {
+	ll.mu.Lock()
+	if ll.canceled {
+		ll.mu.Unlock()
+		return nil, context.Canceled
+	}
+	if ll.attemptCancel != nil {
+		ll.attemptCancel()
+	}
+	if ll.attempt != nil {
+		ll.attempt.Close()
+	}
+	ll.attemptCtx, ll.attemptCancel = context.WithCancel(context.WithoutCancel(ctx))
+	attemptCtx := ll.attemptCtx
+	attemptCancel := ll.attemptCancel
+	ll.mu.Unlock()
+	stop := context.AfterFunc(ctx, attemptCancel)
+	defer stop()
+	res, err := loginWithCredentialsContext(attemptCtx, ll.Email, ll.Password, certificate)
+	ll.mu.Lock()
+	defer ll.mu.Unlock()
+	if ll.canceled || ctx.Err() != nil || attemptCtx.Err() != nil || ll.attemptCtx != attemptCtx {
+		if res != nil {
+			res.Attempt.Close()
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, context.Canceled
+	}
+	if res != nil {
+		ll.attempt = res.Attempt
+	}
+	return res, err
+}
+
 func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
-	if ll.Verifier != "" {
+	ll.mu.Lock()
+	verifier, awaitingPIN := ll.Verifier, ll.AwaitingPIN
+	resultCh, errCh := ll.pollResult, ll.pollErr
+	var done <-chan struct{}
+	if ll.attemptCtx != nil {
+		done = ll.attemptCtx.Done()
+	}
+	canceled := ll.canceled
+	ll.mu.Unlock()
+	if canceled {
+		return nil, context.Canceled
+	}
+	if verifier != "" {
 		select {
-		case res := <-ll.pollResult:
+		case res := <-resultCh:
 			if res.AuthToken != "" {
 				return ll.finishLogin(ctx, res)
 			}
+			res.Attempt.Close()
 			return nil, ErrLoginVerificationFailed
-		case err := <-ll.pollErr:
+		case err := <-errCh:
 			ll.logLoginFailure(err, "verification_poll")
 			return nil, wrapLineLoginError(err)
+		case <-done:
+			return nil, context.Canceled
 		case <-ctx.Done():
+			ll.Cancel()
 			return nil, ctx.Err()
 		}
 	}
 
-	if ll.AwaitingPIN {
-		res, err := loginWithCredentials(ll.Email, ll.Password, ll.Certificate)
+	if awaitingPIN {
+		res, err := ll.loginCredentials(ctx, ll.Certificate)
 		if err != nil {
 			ll.logLoginFailure(err, "pin_continuation")
 			return nil, wrapLineLoginError(err)
@@ -487,14 +543,19 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 }
 
 func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.LoginResult) (*bridgev2.LoginStep, error) {
+	ll.mu.Lock()
+	canceled := ll.canceled || res.Attempt != ll.attempt || !validLoginProducer(res)
+	ll.mu.Unlock()
+	if canceled || ctx.Err() != nil || (res.Attempt != nil && res.Attempt.Context.Err() != nil) {
+		res.Attempt.Close()
+		return nil, context.Canceled
+	}
+
 	if res.AuthToken != "" {
 		return ll.finishLogin(ctx, res)
 	}
 
 	if (res.Type == 3 || res.Type == 0) && res.Verifier != "" {
-		ll.Verifier = res.Verifier
-		ll.NoE2EE = res.NoE2EE
-		ll.AwaitingPIN = false
 		instructions := "Please open the LINE app on your mobile device to complete the login."
 		pin := res.Pin
 		if res.PinCode != "" {
@@ -506,16 +567,48 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 
 		// Start polling in background immediately so it's running while the user enters the PIN
 		ll.mu.Lock()
+		if ll.canceled {
+			ll.mu.Unlock()
+			res.Attempt.Close()
+			return nil, context.Canceled
+		}
+		ll.Verifier, ll.NoE2EE, ll.AwaitingPIN = res.Verifier, res.NoE2EE, false
 		ll.polling = true
 		ll.pollResult = make(chan *line.LoginResult, 1)
 		ll.pollErr = make(chan error, 1)
+		attempt := res.Attempt
+		verifier, noE2EE := ll.Verifier, ll.NoE2EE
+		resultCh, errCh := ll.pollResult, ll.pollErr
+		pollCtx := ll.attemptCtx
+		if pollCtx == nil {
+			pollCtx = ctx
+		}
 		go func() {
 			client := newLineAPIClient("")
-			res, err := client.WaitForLogin(ll.Verifier, ll.NoE2EE)
+			client.LoginAttempt = attempt
+			result, err := client.WaitForLogin(verifier, noE2EE)
+			if pollCtx.Err() != nil {
+				if attempt != nil {
+					attempt.Close()
+				}
+				return
+			}
 			if err != nil {
-				ll.pollErr <- err
+				if attempt != nil {
+					attempt.Close()
+				}
+				select {
+				case errCh <- err:
+				case <-pollCtx.Done():
+				}
 			} else {
-				ll.pollResult <- res
+				select {
+				case resultCh <- result:
+				case <-pollCtx.Done():
+					if attempt != nil {
+						attempt.Close()
+					}
+				}
 			}
 		}()
 		ll.mu.Unlock()
@@ -531,7 +624,10 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 	}
 
 	if res.Certificate != "" {
+		ll.mu.Lock()
 		ll.AwaitingPIN = true
+		ll.mu.Unlock()
+		res.Attempt.Close()
 		return &bridgev2.LoginStep{
 			Type:         bridgev2.LoginStepTypeDisplayAndWait,
 			StepID:       "dev.highest.matrix.line.enter_pin",
@@ -542,13 +638,36 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 		}, nil
 	}
 
+	res.Attempt.Close()
 	return nil, fmt.Errorf("login incomplete but no PIN found in response (Type: %d, Msg: %s)", res.Type, res.Message)
 }
 
 func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult) (*bridgev2.LoginStep, error) {
+	if res != nil {
+		defer res.Attempt.Close()
+	}
+
 	if res == nil {
 		return nil, fmt.Errorf("login result missing")
 	}
+
+	ll.mu.Lock()
+	processCtx := ll.attemptCtx
+	canceled := ll.canceled || res.Attempt != ll.attempt || !validLoginProducer(res)
+	if res.Attempt != nil {
+		processCtx = res.Attempt.Context
+	}
+	ll.mu.Unlock()
+	if canceled || ctx.Err() != nil || (processCtx != nil && processCtx.Err() != nil) {
+		return nil, context.Canceled
+	}
+	finishCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if processCtx != nil {
+		stop := context.AfterFunc(processCtx, cancel)
+		defer stop()
+	}
+	ctx = finishCtx
 
 	token := res.AuthToken
 	refreshToken := ""
@@ -563,7 +682,8 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}
 
 	client := newLineAPIClient(token)
-	profile, err := client.GetProfile()
+	client.LoginAttempt = res.Attempt
+	profile, err := client.GetProfileContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify token: %w", err)
 	}
@@ -577,17 +697,34 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	if certificate == "" {
 		certificate = ll.Certificate
 	}
-	mid := res.Mid
-	if mid == "" {
-		mid = profile.Mid
+	mid := profile.Mid
+	if mid == "" || (res.Mid != "" && res.Mid != mid) {
+		return nil, errors.New("login result does not match verified LINE account")
 	}
 
 	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
+	sameAccount := ll.ExistingMetadata != nil && ll.ExistingLogin != nil && ll.ExistingLogin.UserLogin != nil && mid == string(ll.ExistingLogin.ID) && mid == ll.ExistingMetadata.Mid
 
-	exportedKeys := ll.fetchLoginKeys(res, meta, client)
-	if shouldPreserveExistingE2EEKeys(exportedKeys, ll.ExistingMetadata) {
+	loginManager, err := ll.fetchLoginKeys(res, meta, client)
+	if err != nil {
+		if isTerminalCryptoError(err) || errors.Is(err, context.Canceled) || !sameAccount || !shouldPreserveExistingE2EEKeys(false, ll.ExistingMetadata) {
+			return nil, err
+		}
+		if err := ll.admitLogin(ctx, res); err != nil {
+			return nil, err
+		}
+		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to export E2EE keys; using existing keys")
+	}
+	exportedKeys := loginManager != nil
+	if loginManager != nil {
+		defer loginManager.Close()
+	}
+	if sameAccount && shouldPreserveExistingE2EEKeys(exportedKeys, ll.ExistingMetadata) {
 		copyLoginE2EEKeyMetadata(meta, ll.ExistingMetadata)
 		ll.User.Bridge.Log.Info().Int("keys", len(meta.ExportedKeyMap)).Msg("Preserved existing E2EE keys after re-login")
+	}
+	if exportedKeys && sameAccount {
+		meta.ExportedKeyMap = mergeLoginKeyMaps(ll.ExistingMetadata.ExportedKeyMap, meta.ExportedKeyMap)
 	}
 	if !res.NoE2EE && len(meta.ExportedKeyMap) == 0 {
 		return nil, ErrLoginNoKeychain
@@ -601,7 +738,13 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		ll.finalizeMu.Lock()
 		defer ll.finalizeMu.Unlock()
 	}
+	if err := ll.admitLogin(ctx, res); err != nil {
+		return nil, err
+	}
 	targetLogin := findReusedLineLogin(ll.ExistingLogin, ll.User.GetUserLogins(), detectedLineID)
+	if err := ll.admitLogin(ctx, res); err != nil {
+		return nil, err
+	}
 	retireLineLogin(targetLogin)
 
 	var newClient *LineClient
@@ -610,7 +753,10 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		RemoteName: displayName,
 		Metadata:   meta,
 	}, &bridgev2.NewLoginParams{
-		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {
+		LoadUserLogin: func(_ context.Context, login *bridgev2.UserLogin) error {
+			if err := ll.admitLogin(ctx, res); err != nil {
+				return err
+			}
 			newClient = &LineClient{
 				UserLogin:    login,
 				AccessToken:  token,
@@ -631,10 +777,20 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	if newClient == nil {
 		return nil, fmt.Errorf("failed to create LINE client")
 	}
+	if err := ll.admitLogin(ctx, res); err != nil {
+		newClient.Disconnect()
+		return nil, err
+	}
 	if ll.ExistingLogin != nil && ll.ExistingLogin.UserLogin != nil && ll.ExistingLogin.ID != ul.ID {
 		// A different-ID override remains valid until the new login is safely
 		// installed. Retire it only after NewLogin succeeds.
 		retireLineLogin(ll.ExistingLogin)
+	}
+
+	if loginManager != nil {
+		if err := loginManager.SaveSecureDataToFile(loginSecureDataID(meta, string(ll.User.MXID)), map[string]any{"exportedKeyMap": meta.ExportedKeyMap}); err != nil {
+			ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
+		}
 	}
 
 	go newClient.Connect(context.Background())
@@ -676,10 +832,23 @@ func exportLoginE2EEKeys(res *line.LoginResult, client *line.Client) (*e2ee.Mana
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
 		return nil, nil, nil
 	}
-	mgr, err := newE2EEManager()
-	if err != nil {
-		return nil, nil, fmt.Errorf("create E2EE manager: %w", err)
+	var mgr *e2ee.Manager
+	if res.Attempt == nil {
+		unused, err := newE2EEManager()
+		if err != nil {
+			return nil, nil, fmt.Errorf("create E2EE manager: %w", err)
+		}
+		unused.Close()
+		return nil, nil, errors.New("missing E2EE login attempt")
 	}
+	mgr = e2ee.NewManagerWithRunner(res.Attempt.Runner)
+	success := false
+	defer func() {
+		if !success {
+			mgr.Close()
+		}
+	}()
+	client.LoginAttempt = res.Attempt
 	ei3, err := client.GetEncryptedIdentityV3()
 	if err != nil {
 		return nil, nil, fmt.Errorf("get EncryptedIdentityV3: %w", err)
@@ -691,6 +860,7 @@ func exportLoginE2EEKeys(res *line.LoginResult, client *line.Client) (*e2ee.Mana
 	if err != nil {
 		return nil, nil, fmt.Errorf("init from login keychain: %w", err)
 	}
+	success = true
 	return mgr, exported, nil
 }
 
@@ -705,6 +875,17 @@ func applyExportedLoginE2EEKeys(meta *UserLoginMetadata, res *line.LoginResult, 
 	saveLoginE2EEKeyMetadata(meta, res)
 	meta.ExportedKeyMap = exported
 	meta.ForceFullE2EELogin = false
+}
+
+func mergeLoginKeyMaps(previous, current map[string]string) map[string]string {
+	merged := make(map[string]string, len(previous)+len(current))
+	for id, key := range previous {
+		merged[id] = key
+	}
+	for id, key := range current {
+		merged[id] = key
+	}
+	return merged
 }
 
 func copyLoginE2EEKeyMetadata(dst, src *UserLoginMetadata) {
@@ -731,21 +912,47 @@ func loginSecureDataID(meta *UserLoginMetadata, fallback string) string {
 	return fallback
 }
 
-func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) bool {
+func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) (*e2ee.Manager, error) {
 	if res.EncryptedKeyChain == "" || res.E2EEPublicKey == "" {
-		return false
+		return nil, nil
 	}
 	mgr, exported, err := exportLoginE2EEKeys(res, client)
 	if err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to export E2EE keys")
-		return false
+		return nil, fmt.Errorf("export login E2EE keys: %w", err)
 	}
 	applyExportedLoginE2EEKeys(meta, res, exported)
-	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(ll.User.MXID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
-	}
+
 	ll.User.Bridge.Log.Info().Int("keys", len(exported)).Msg("Login: E2EE keys exported successfully")
-	return true
+	return mgr, nil
 }
 
-func (ll *LineEmailLogin) Cancel() {}
+func (ll *LineEmailLogin) admitLogin(ctx context.Context, res *line.LoginResult) error {
+	ll.mu.Lock()
+	defer ll.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ll.canceled || res.Attempt != ll.attempt || !validLoginProducer(res) {
+		return context.Canceled
+	}
+	if res.Attempt != nil {
+		return res.Attempt.Context.Err()
+	}
+	if ll.attemptCtx != nil {
+		return ll.attemptCtx.Err()
+	}
+	return nil
+}
+
+func (ll *LineEmailLogin) Cancel() {
+	ll.mu.Lock()
+	ll.canceled = true
+	if ll.attemptCancel != nil {
+		ll.attemptCancel()
+	}
+	attempt := ll.attempt
+	ll.mu.Unlock()
+	if attempt != nil {
+		attempt.Close()
+	}
+}

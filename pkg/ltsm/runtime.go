@@ -293,6 +293,10 @@ func (rt *Runtime) Curve25519KeyGenerate() (uint32, error) {
 	return ptr, nil
 }
 
+func (rt *Runtime) Curve25519KeyDestroy(ptr uint32) error {
+	return rt.imp.Destroy("Curve25519Key", ptr)
+}
+
 // --- E2EEKey ---
 
 func (rt *Runtime) E2EEKeyLoadKey(keyBytes []byte) (uint32, error) {
@@ -375,17 +379,43 @@ func (rt *Runtime) E2EEChannelUnwrapGroupSharedKey(chanPtr uint32, encKey []byte
 	return ptr, nil
 }
 
-func (rt *Runtime) E2EEChannelWrapGroupSharedKey(chanPtr uint32, keyHandle uint32) ([]byte, error) {
-	handle, err := rt.imp.CallMethod("E2EEChannel", "wrapGroupSharedKey", chanPtr, keyHandle)
+func (rt *Runtime) WrapRegistrationGroupKey(chanPtrs []uint32) ([][]byte, error) {
+	var wrapped [][]byte
+	defer func() { rt.cryptoDirty = true }()
+	_, err := rt.channelCrypto(func(crypto *Runtime) ([]byte, error) {
+		keyPtr, err := crypto.Curve25519KeyGenerate()
+		if err != nil {
+			return nil, err
+		}
+		wrapped = make([][]byte, len(chanPtrs))
+		for i, chanPtr := range chanPtrs {
+			data, err := crypto.E2EEChannelWrapGroupSharedKey(chanPtr, keyPtr)
+			if err != nil {
+				return nil, err
+			}
+			wrapped[i] = append([]byte(nil), data...)
+		}
+		return nil, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("ltsm: E2EEChannel.wrapGroupSharedKey failed: %w", err)
+		return nil, err
 	}
-	data, err := rt.imp.ReadEmvalBytes(handle)
-	if err != nil {
-		return nil, fmt.Errorf("ltsm: failed to read wrapGroupSharedKey result: %w", err)
-	}
-	rt.imp.emval.DecRef(handle)
-	return data, nil
+	return wrapped, nil
+}
+
+func (rt *Runtime) E2EEChannelWrapGroupSharedKey(chanPtr uint32, keyPtr uint32) ([]byte, error) {
+	return rt.channelCrypto(func(crypto *Runtime) ([]byte, error) {
+		handle, err := crypto.imp.CallMethod("E2EEChannel", "wrapGroupSharedKey", chanPtr, keyPtr)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: E2EEChannel.wrapGroupSharedKey failed: %w", err)
+		}
+		data, err := crypto.imp.ReadEmvalBytes(handle)
+		if err != nil {
+			return nil, fmt.Errorf("ltsm: failed to read wrapGroupSharedKey result: %w", err)
+		}
+		crypto.imp.emval.DecRef(handle)
+		return data, nil
+	})
 }
 
 func (rt *Runtime) E2EEChannelGenerateConfirmHash(chanPtr uint32, encKeyChain []byte) ([]byte, error) {

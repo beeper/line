@@ -19,6 +19,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	gen "github.com/highesttt/matrix-line-messenger/pkg"
 	"github.com/highesttt/matrix-line-messenger/pkg/e2ee"
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 	"github.com/highesttt/matrix-line-messenger/pkg/ltsm"
@@ -34,6 +35,10 @@ type mentionEntry struct {
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
 const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
+
+func isTerminalCryptoError(err error) bool {
+	return errors.Is(err, ltsm.ErrAbort) || errors.Is(err, gen.ErrRunnerClosed)
+}
 
 func lineGroupE2EEReconnectRequiredError(err error) error {
 	if !errors.Is(err, e2ee.ErrMissingOwnPrivateKey) {
@@ -58,6 +63,9 @@ func lineGroupE2EEFetchFailureError(err error) error {
 }
 
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
+	if err := lc.checkLineCall(ctx); err != nil {
+		return nil, err
+	}
 	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
 		var err error
@@ -590,7 +598,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if isGroup {
 			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
-				if errors.Is(errFetch, ltsm.ErrAbort) {
+				if isTerminalCryptoError(errFetch) {
 					return nil, errFetch
 				}
 				if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
@@ -603,7 +611,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 			}
 			if err != nil {
-				if errors.Is(err, ltsm.ErrAbort) {
+				if isTerminalCryptoError(err) {
 					return nil, err
 				}
 				if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch == nil {
@@ -612,12 +620,12 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					} else {
 						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
 					}
-				} else if errors.Is(errFetch, ltsm.ErrAbort) {
+				} else if isTerminalCryptoError(errFetch) {
 					return nil, errFetch
 				} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
 					return nil, errFetch
 				}
-				if errors.Is(err, ltsm.ErrAbort) {
+				if isTerminalCryptoError(err) {
 					return nil, err
 				}
 				if err != nil {

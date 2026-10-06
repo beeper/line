@@ -17,17 +17,19 @@ import (
 )
 
 type Runner struct {
-	rt            *ltsm.Runtime
-	token         string
-	clientVersion string
-	skPtr         uint32         // SecureKey from loadToken
-	storageKey    uint32         // AesKey ptr (after StorageInit)
-	loginCurveKey uint32         // Curve25519Key ptr (after GenerateE2EESecret)
-	keyStore      map[int]uint32 // internal ID -> E2EEKey ptr
-	channelStore  map[int]uint32 // internal ID -> E2EEChannel ptr
-	channelsByKey map[channelKey]int
-	nextID        int
-	mu            sync.Mutex
+	failure          error
+	rt               *ltsm.Runtime
+	token            string
+	clientVersion    string
+	skPtr            uint32 // SecureKey from loadToken
+	storageKey       uint32 // AesKey ptr (after StorageInit)
+	loginCurveKey    uint32 // Curve25519Key ptr (after GenerateE2EESecret)
+	registrationKeys map[int]struct{}
+	keyStore         map[int]uint32 // internal ID -> E2EEKey ptr
+	channelStore     map[int]uint32 // internal ID -> E2EEChannel ptr
+	channelsByKey    map[channelKey]int
+	nextID           int
+	mu               sync.Mutex
 
 	// Signing state can be recreated from configuration and the access token
 	// without invalidating the E2EE objects in rt. All access is under mu.
@@ -84,43 +86,99 @@ var (
 	runnerErr    error
 )
 
+var ErrRunnerClosed = errors.New("crypto runner closed")
+
 func GetRunner() (*Runner, error) {
-	runnerOnce.Do(func() {
-		token := os.Getenv("SECURE_KEY")
-		if token == "" {
-			token = "wODdrvWqmdP4Zliay-iF3cz3KZcK0ekrial868apg06TXeCo7A1hIQO0ESElHg6D"
-		}
-		clientVersion := os.Getenv("CLIENT_VERSION")
-		if clientVersion == "" {
-			clientVersion = "3.7.2"
-		}
-
-		rt, err := ltsm.NewRuntime()
-		if err != nil {
-			runnerErr = fmt.Errorf("failed to initialize LTSM runtime: %w", err)
-			return
-		}
-
-		skPtr, err := rt.SecureKeyLoadToken(token)
-		if err != nil {
-			rt.Close()
-			runnerErr = fmt.Errorf("failed to load secure key: %w", err)
-			return
-		}
-
-		globalRunner = &Runner{
-			rt:            rt,
-			token:         token,
-			clientVersion: clientVersion,
-			skPtr:         skPtr,
-			keyStore:      make(map[int]uint32),
-			channelStore:  make(map[int]uint32),
-			nextID:        1,
-			goKeys:        make(map[int]*goKeyEntry),
-			goChannels:    make(map[int]*ltsm.Channel),
-		}
-	})
+	runnerOnce.Do(func() { globalRunner, runnerErr = NewRunner() })
 	return globalRunner, runnerErr
+}
+func NewRunner() (r *Runner, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
+			r = nil
+			err = ltsmPanicError("ltsm initialization", recovered)
+		}
+	}()
+	token := os.Getenv("SECURE_KEY")
+	if token == "" {
+		token = "wODdrvWqmdP4Zliay-iF3cz3KZcK0ekrial868apg06TXeCo7A1hIQO0ESElHg6D"
+	}
+	clientVersion := os.Getenv("CLIENT_VERSION")
+	if clientVersion == "" {
+		clientVersion = "3.7.2"
+	}
+
+	rt, err := ltsm.NewRuntime()
+	if err != nil {
+		err = fmt.Errorf("failed to initialize LTSM runtime: %w", err)
+		return nil, err
+	}
+
+	skPtr, err := rt.SecureKeyLoadToken(token)
+	if err != nil {
+		rt.Close()
+		err = fmt.Errorf("failed to load secure key: %w", err)
+		return nil, err
+	}
+
+	r = &Runner{
+		rt:            rt,
+		token:         token,
+		clientVersion: clientVersion,
+		skPtr:         skPtr,
+		keyStore:      make(map[int]uint32),
+		channelStore:  make(map[int]uint32),
+		nextID:        1,
+		goKeys:        make(map[int]*goKeyEntry),
+		goChannels:    make(map[int]*ltsm.Channel),
+	}
+	return r, nil
+}
+func (r *Runner) discard(err error) {
+	r.failure = err
+	r.rt = nil
+	r.skPtr = 0
+	r.storageKey = 0
+	r.loginCurveKey = 0
+	r.registrationKeys = nil
+	r.keyStore = nil
+	r.channelStore = nil
+	r.channelsByKey = nil
+	r.goKeys = nil
+	r.goChannels = nil
+	r.resetSigningRuntime()
+}
+func (r *Runner) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure == nil {
+		r.discard(ErrRunnerClosed)
+	}
+}
+func (r *Runner) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failure
+}
+
+func (r *Runner) finishOperation(operation string, err *error, authoritative bool, zero func()) {
+	if recovered := recover(); recovered != nil {
+		abort, ok := recovered.(error)
+		if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+			panic(recovered)
+		}
+		*err = ltsmPanicError("ltsm "+operation, recovered)
+	}
+	if authoritative && errors.Is(*err, ltsm.ErrAbort) {
+		r.discard(*err)
+	}
+	if *err != nil {
+		zero()
+	}
 }
 
 func (r *Runner) putKey(ptr uint32) int {
@@ -138,14 +196,83 @@ func (r *Runner) getKey(id int) (uint32, error) {
 	return ptr, nil
 }
 
-func (r *Runner) KeyGenerate() (int, error) {
+func (r *Runner) KeyGenerate() (out0 int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return 0, r.failure
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
+			err = ltsmPanicError("ltsm KeyGenerate", recovered)
+		}
+		if errors.Is(err, ltsm.ErrAbort) {
+			r.discard(err)
+		}
+		if err != nil {
+			out0 = 0
+		}
+	}()
+	return r.keyGenerate()
+}
+
+func (r *Runner) keyGenerate() (int, error) {
 	ptr, err := r.rt.Curve25519KeyGenerate()
 	if err != nil {
 		return 0, err
 	}
 	return r.putKey(ptr), nil
+}
+
+func (r *Runner) RegistrationKeyGenerate() (out0 int, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return 0, r.failure
+	}
+	defer r.finishOperation("RegistrationKeyGenerate", &err, true, func() { out0 = 0 })
+	id, err := r.keyGenerate()
+	if err != nil {
+		return 0, err
+	}
+	if r.registrationKeys == nil {
+		r.registrationKeys = make(map[int]struct{})
+	}
+	r.registrationKeys[id] = struct{}{}
+	return id, nil
+}
+
+func (r *Runner) RegistrationKeyRelease(keyID int) (err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return r.failure
+	}
+	defer r.finishOperation("RegistrationKeyRelease", &err, true, func() {})
+	if _, ok := r.registrationKeys[keyID]; !ok {
+		return fmt.Errorf("key %d is not an ephemeral registration key", keyID)
+	}
+	for dependency := range r.channelsByKey {
+		if dependency.keyID == keyID {
+			return fmt.Errorf("registration key %d has a channel dependency", keyID)
+		}
+	}
+	ptr, err := r.getKey(keyID)
+	if err != nil {
+		return err
+	}
+	if err = r.rt.Curve25519KeyDestroy(ptr); err != nil {
+		err = errors.Join(ErrRunnerClosed, fmt.Errorf("destroy registration key: %w", err))
+		r.discard(err)
+		return err
+	}
+	delete(r.registrationKeys, keyID)
+	delete(r.keyStore, keyID)
+	return nil
 }
 
 func (r *Runner) putChannel(ptr uint32) int {
@@ -173,6 +300,10 @@ func ltsmPanicError(operation string, recovered any) error {
 func (r *Runner) exportE2EEKeyPanicSafe(keyPtr uint32) (exported []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
 			exported = nil
 			err = ltsmPanicError("ltsm E2EEKey.exportKey", recovered)
 		}
@@ -183,6 +314,10 @@ func (r *Runner) exportE2EEKeyPanicSafe(keyPtr uint32) (exported []byte, err err
 func (r *Runner) unwrapGroupSharedKeyPanicSafe(chanPtr uint32, encKey []byte) (keyPtr uint32, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
 			keyPtr = 0
 			err = ltsmPanicError("ltsm E2EEChannel.unwrapGroupSharedKey", recovered)
 		}
@@ -190,18 +325,13 @@ func (r *Runner) unwrapGroupSharedKeyPanicSafe(chanPtr uint32, encKey []byte) (k
 	return r.rt.E2EEChannelUnwrapGroupSharedKey(chanPtr, encKey)
 }
 
-func (r *Runner) destroyPanicSafe(class string, destroy func(uint32) error, ptr uint32) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = ltsmPanicError("ltsm "+class+" destroy", recovered)
-		}
-	}()
-	return destroy(ptr)
-}
-
 func (r *Runner) encryptV1PanicSafe(chanPtr uint32, plaintext []byte) (ciphertext []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
 			ciphertext = nil
 			err = ltsmPanicError("ltsm E2EEChannel.encryptV1", recovered)
 		}
@@ -212,6 +342,10 @@ func (r *Runner) encryptV1PanicSafe(chanPtr uint32, plaintext []byte) (ciphertex
 func (r *Runner) encryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID, receiverKeyID, contentType int, seq int64, plaintext []byte) (ciphertext []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
 			ciphertext = nil
 			err = ltsmPanicError("ltsm E2EEChannel.encryptV2", recovered)
 		}
@@ -222,6 +356,10 @@ func (r *Runner) encryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID
 func (r *Runner) decryptV1PanicSafe(chanPtr uint32, ciphertext []byte) (plaintext []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
 			plaintext = nil
 			err = ltsmPanicError("ltsm E2EEChannel.decryptV1", recovered)
 		}
@@ -232,6 +370,10 @@ func (r *Runner) decryptV1PanicSafe(chanPtr uint32, ciphertext []byte) (plaintex
 func (r *Runner) decryptV2PanicSafe(chanPtr uint32, to, from string, senderKeyID, receiverKeyID, contentType int, ciphertext []byte) (plaintext []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
 			plaintext = nil
 			err = ltsmPanicError("ltsm E2EEChannel.decryptV2", recovered)
 		}
@@ -299,15 +441,33 @@ func (r *Runner) signingHMAC(accessToken string) (uint32, error) {
 	return hmacPtr, nil
 }
 
-func (r *Runner) GetSignature(reqPath, body, accessToken string) (string, error) {
+func (r *Runner) GetSignature(reqPath, body, accessToken string) (out0 string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
+			err = ltsmPanicError("ltsm GetSignature", recovered)
+		}
+		if err != nil {
+			out0 = ""
+		}
+	}()
+	return r.signatureLocked(reqPath, body, accessToken)
+}
+
+func (r *Runner) signatureLocked(reqPath, body, accessToken string) (string, error) {
 	if reqPath == "" {
 		reqPath = "/"
 	} else if reqPath[0] != '/' {
 		reqPath = "/" + reqPath
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	signature, err := r.getSignature(reqPath, body, accessToken)
 	if errors.Is(err, ltsm.ErrAbort) {
@@ -375,13 +535,34 @@ func (r *Runner) getSignature(reqPath, body, accessToken string) (signature stri
 
 // DebugExportDerivedSigningKey returns the derived SecureKey export blob used for
 // signing. Disabled unless LTSM_ENABLE_DEBUG_EXPORT=1 is set.
-func (r *Runner) DebugExportDerivedSigningKey(accessToken string) (string, error) {
+func (r *Runner) DebugExportDerivedSigningKey(accessToken string) (out0 string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			abort, ok := recovered.(error)
+			if !ok || !errors.Is(abort, ltsm.ErrAbort) {
+				panic(recovered)
+			}
+			err = ltsmPanicError("ltsm DebugExportDerivedSigningKey", recovered)
+		}
+		if errors.Is(err, ltsm.ErrAbort) {
+			r.discard(err)
+		}
+		if err != nil {
+			out0 = ""
+		}
+	}()
+	return r.debugExportDerivedSigningKey(accessToken)
+}
+
+func (r *Runner) debugExportDerivedSigningKey(accessToken string) (string, error) {
 	if os.Getenv("LTSM_ENABLE_DEBUG_EXPORT") != "1" {
 		return "", fmt.Errorf("runner error: debug export disabled")
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	cvHash := sha256.Sum256([]byte(r.clientVersion))
 	atHash := sha256.Sum256([]byte(accessToken))
@@ -390,7 +571,6 @@ func (r *Runner) DebugExportDerivedSigningKey(accessToken string) (string, error
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = r.rt.SecureKeyDestroy(dkPtr) }()
 
 	// Mark the derived key as exportable by setting the C++ flag at ptr+16
 	r.rt.MarkSecureKeyExportable(dkPtr)
@@ -399,13 +579,24 @@ func (r *Runner) DebugExportDerivedSigningKey(accessToken string) (string, error
 	if err != nil {
 		return "", err
 	}
+	if err := r.rt.SecureKeyDestroy(dkPtr); err != nil {
+		return "", err
+	}
 	return base64.StdEncoding.EncodeToString(exported), nil
 }
 
 // StorageInit initializes the storage key using getEncryptedIdentityV3 response fields.
-func (r *Runner) StorageInit(wrappedNonce, kdf1, kdf2 string) error {
+func (r *Runner) StorageInit(wrappedNonce, kdf1, kdf2 string) (err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return r.failure
+	}
+	defer r.finishOperation("StorageInit", &err, true, func() {})
+	return r.storageInit(wrappedNonce, kdf1, kdf2)
+}
+
+func (r *Runner) storageInit(wrappedNonce, kdf1, kdf2 string) error {
 
 	nonceBytes, err := base64.StdEncoding.DecodeString(wrappedNonce)
 	if err != nil {
@@ -435,9 +626,17 @@ func (r *Runner) StorageInit(wrappedNonce, kdf1, kdf2 string) error {
 }
 
 // StorageDecrypt decrypts lcs_secure blobs with the initialized storage key.
-func (r *Runner) StorageDecrypt(ciphertext string) (string, error) {
+func (r *Runner) StorageDecrypt(ciphertext string) (out0 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer r.finishOperation("StorageDecrypt", &err, true, func() { out0 = "" })
+	return r.storageDecrypt(ciphertext)
+}
+
+func (r *Runner) storageDecrypt(ciphertext string) (string, error) {
 
 	if r.storageKey == 0 {
 		return "", fmt.Errorf("storage key not initialized")
@@ -457,9 +656,17 @@ func (r *Runner) StorageDecrypt(ciphertext string) (string, error) {
 }
 
 // StorageEncrypt encrypts plaintext with the initialized storage key.
-func (r *Runner) StorageEncrypt(plaintext string) (string, error) {
+func (r *Runner) StorageEncrypt(plaintext string) (out0 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer r.finishOperation("StorageEncrypt", &err, true, func() { out0 = "" })
+	return r.storageEncrypt(plaintext)
+}
+
+func (r *Runner) storageEncrypt(plaintext string) (string, error) {
 
 	if r.storageKey == 0 {
 		return "", fmt.Errorf("storage key not initialized")
@@ -474,14 +681,21 @@ func (r *Runner) StorageEncrypt(plaintext string) (string, error) {
 }
 
 // LoginUnwrapKeyChain unwraps the encrypted key chain from LF1 using the login curve key.
-func (r *Runner) LoginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64 string) ([]UnwrappedKey, error) {
+func (r *Runner) LoginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64 string) (out0 []UnwrappedKey, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return nil, r.failure
+	}
+	defer r.finishOperation("LoginUnwrapKeyChain", &err, true, func() { out0 = nil })
+	return r.loginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64)
+}
+
+func (r *Runner) loginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64 string) ([]UnwrappedKey, error) {
 	normalizedServerPub, err := normalizeServerPublicKeyB64(serverPubB64)
 	if err != nil {
 		return nil, err
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.loginCurveKey == 0 {
 		return nil, fmt.Errorf("login key not initialized")
@@ -550,9 +764,17 @@ func (r *Runner) LoginUnwrapKeyChain(serverPubB64, encryptedKeyChainB64 string) 
 // KeyLoad loads a base64 E2EE key and returns an internal key ID.
 // Also stores the decoded key bytes as a Go key entry so ChannelCreate can
 // create a pure Go Channel (required for group shared key wrapping).
-func (r *Runner) KeyLoad(b64Key string) (int, error) {
+func (r *Runner) KeyLoad(b64Key string) (out0 int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return 0, r.failure
+	}
+	defer r.finishOperation("KeyLoad", &err, true, func() { out0 = 0 })
+	return r.keyLoad(b64Key)
+}
+
+func (r *Runner) keyLoad(b64Key string) (int, error) {
 
 	keyBytes, err := base64.StdEncoding.DecodeString(b64Key)
 	if err != nil {
@@ -575,9 +797,17 @@ func (r *Runner) KeyLoad(b64Key string) (int, error) {
 }
 
 // KeyGetID returns the raw key ID for a loaded key.
-func (r *Runner) KeyGetID(keyID int) (int, error) {
+func (r *Runner) KeyGetID(keyID int) (out0 int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return 0, r.failure
+	}
+	defer r.finishOperation("KeyGetID", &err, true, func() { out0 = 0 })
+	return r.keyGetID(keyID)
+}
+
+func (r *Runner) keyGetID(keyID int) (int, error) {
 
 	keyPtr, err := r.getKey(keyID)
 	if err != nil {
@@ -588,9 +818,17 @@ func (r *Runner) KeyGetID(keyID int) (int, error) {
 }
 
 // KeyGetPublic returns the base64 public key for a loaded key.
-func (r *Runner) KeyGetPublic(keyID int) (string, error) {
+func (r *Runner) KeyGetPublic(keyID int) (out0 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer r.finishOperation("KeyGetPublic", &err, true, func() { out0 = "" })
+	return r.keyGetPublic(keyID)
+}
+
+func (r *Runner) keyGetPublic(keyID int) (string, error) {
 
 	keyPtr, err := r.getKey(keyID)
 	if err != nil {
@@ -608,9 +846,20 @@ func (r *Runner) KeyGetPublic(keyID int) (string, error) {
 // ChannelCreate creates a channel with our key and peer public key.
 // If a raw Go private key is available for the key, also creates a pure Go
 // channel for V1/V2 encrypt/decrypt without WASM overhead.
-func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (int, error) {
+func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (out0 int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return 0, r.failure
+	}
+	defer r.finishOperation("ChannelCreate", &err, true, func() { out0 = 0 })
+	return r.channelCreate(keyID, peerPublicB64)
+}
+
+func (r *Runner) channelCreate(keyID int, peerPublicB64 string) (int, error) {
+	if _, ok := r.registrationKeys[keyID]; ok {
+		return 0, fmt.Errorf("registration key %d cannot own a channel", keyID)
+	}
 
 	keyPtr, err := r.getKey(keyID)
 	if err != nil {
@@ -651,9 +900,17 @@ func (r *Runner) ChannelCreate(keyID int, peerPublicB64 string) (int, error) {
 }
 
 // ChannelUnwrapGroupSharedKey unwraps the group shared key using the channel.
-func (r *Runner) ChannelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB64 string) (int, error) {
+func (r *Runner) ChannelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB64 string) (out0 int, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return 0, r.failure
+	}
+	defer r.finishOperation("ChannelUnwrapGroupSharedKey", &err, true, func() { out0 = 0 })
+	return r.channelUnwrapGroupSharedKey(channelID, encryptedSharedKeyB64)
+}
+
+func (r *Runner) channelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB64 string) (int, error) {
 
 	chanPtr, err := r.getChannel(channelID)
 	if err != nil {
@@ -674,15 +931,18 @@ func (r *Runner) ChannelUnwrapGroupSharedKey(channelID int, encryptedSharedKeyB6
 }
 
 // KeyDestroy releases an unwrapped group key and every channel created from it.
-func (r *Runner) KeyDestroy(keyID int) error {
+func (r *Runner) KeyDestroy(keyID int) (err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return r.failure
+	}
+	defer r.finishOperation("KeyDestroy", &err, true, func() {})
 
 	keyPtr, err := r.getKey(keyID)
 	if err != nil {
 		return err
 	}
-	var errs []error
 	for cacheKey, channelID := range r.channelsByKey {
 		if cacheKey.keyID != keyID {
 			continue
@@ -691,19 +951,35 @@ func (r *Runner) KeyDestroy(keyID int) error {
 		delete(r.channelsByKey, cacheKey)
 		delete(r.channelStore, channelID)
 		delete(r.goChannels, channelID)
-		errs = append(errs, r.destroyPanicSafe("E2EEChannel", r.rt.E2EEChannelDestroy, chanPtr))
+		if err = r.rt.E2EEChannelDestroy(chanPtr); err != nil {
+			err = errors.Join(ErrRunnerClosed, fmt.Errorf("destroy group channel: %w", err))
+			r.discard(err)
+			return err
+		}
 	}
 	delete(r.keyStore, keyID)
 	delete(r.goKeys, keyID)
-	errs = append(errs, r.destroyPanicSafe("E2EEKey", r.rt.E2EEKeyDestroy, keyPtr))
-	return errors.Join(errs...)
+	if err = r.rt.E2EEKeyDestroy(keyPtr); err != nil {
+		err = errors.Join(ErrRunnerClosed, fmt.Errorf("destroy group key: %w", err))
+		r.discard(err)
+		return err
+	}
+	return nil
 }
 
 // ChannelEncryptV1 encrypts plaintext with channel V1 (AES-256-CBC + MAC).
 // Uses pure Go crypto when a Go channel is available.
-func (r *Runner) ChannelEncryptV1(channelID int, plaintext string) (string, error) {
+func (r *Runner) ChannelEncryptV1(channelID int, plaintext string) (out0 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer r.finishOperation("ChannelEncryptV1", &err, false, func() { out0 = "" })
+	return r.channelEncryptV1(channelID, plaintext)
+}
+
+func (r *Runner) channelEncryptV1(channelID int, plaintext string) (string, error) {
 
 	// Prefer pure Go channel
 	if goChan, ok := r.goChannels[channelID]; ok {
@@ -731,9 +1007,17 @@ func (r *Runner) ChannelEncryptV1(channelID int, plaintext string) (string, erro
 // ChannelEncryptV2 encrypts plaintext with channel v2.
 // Uses pure Go crypto when a Go channel is available (faster, and V2 works
 // correctly in Go whereas it fails in the WASM bridge due to SKB issues).
-func (r *Runner) ChannelEncryptV2(channelID int, to, from string, senderKeyID, receiverKeyID, contentType, seq int, plaintext string) (string, error) {
+func (r *Runner) ChannelEncryptV2(channelID int, to, from string, senderKeyID, receiverKeyID, contentType, seq int, plaintext string) (out0 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer r.finishOperation("ChannelEncryptV2", &err, false, func() { out0 = "" })
+	return r.channelEncryptV2(channelID, to, from, senderKeyID, receiverKeyID, contentType, seq, plaintext)
+}
+
+func (r *Runner) channelEncryptV2(channelID int, to, from string, senderKeyID, receiverKeyID, contentType, seq int, plaintext string) (string, error) {
 
 	// Prefer pure Go channel (V2 is broken in WASM due to SKB AAD failure)
 	if goChan, ok := r.goChannels[channelID]; ok {
@@ -761,9 +1045,20 @@ func (r *Runner) ChannelEncryptV2(channelID int, to, from string, senderKeyID, r
 
 // ChannelDecryptV1 decrypts ciphertext with channel v1 (ios).
 // Uses pure Go crypto when a Go channel is available.
-func (r *Runner) ChannelDecryptV1(channelID, senderKeyID, receiverKeyID int, ciphertext string) (string, string, error) {
+func (r *Runner) ChannelDecryptV1(channelID, senderKeyID, receiverKeyID int, ciphertext string) (out0 string, out1 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", "", r.failure
+	}
+	defer r.finishOperation("ChannelDecryptV1", &err, false, func() {
+		out0 = ""
+		out1 = ""
+	})
+	return r.channelDecryptV1(channelID, senderKeyID, receiverKeyID, ciphertext)
+}
+
+func (r *Runner) channelDecryptV1(channelID, senderKeyID, receiverKeyID int, ciphertext string) (string, string, error) {
 
 	ctBytes, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
@@ -795,9 +1090,20 @@ func (r *Runner) ChannelDecryptV1(channelID, senderKeyID, receiverKeyID int, cip
 
 // ChannelDecryptV2 decrypts ciphertext with channel v2.
 // Uses pure Go crypto when a Go channel is available (V2 is broken in WASM).
-func (r *Runner) ChannelDecryptV2(channelID int, to, from string, senderKeyID, receiverKeyID, contentType int, ciphertext string) (string, string, error) {
+func (r *Runner) ChannelDecryptV2(channelID int, to, from string, senderKeyID, receiverKeyID, contentType int, ciphertext string) (out0 string, out1 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", "", r.failure
+	}
+	defer r.finishOperation("ChannelDecryptV2", &err, false, func() {
+		out0 = ""
+		out1 = ""
+	})
+	return r.channelDecryptV2(channelID, to, from, senderKeyID, receiverKeyID, contentType, ciphertext)
+}
+
+func (r *Runner) channelDecryptV2(channelID int, to, from string, senderKeyID, receiverKeyID, contentType int, ciphertext string) (string, string, error) {
 
 	ctBytes, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
@@ -831,9 +1137,17 @@ func (r *Runner) ChannelDecryptV2(channelID int, to, from string, senderKeyID, r
 // GenerateE2EESecret generates a login secret with PIN and public key.
 // The Curve25519Key is used because GenerateConfirmHash and
 // LoginUnwrapKeyChain require the SKB-wrapped key for ECDH.
-func (r *Runner) GenerateE2EESecret() (*SecretResult, error) {
+func (r *Runner) GenerateE2EESecret() (out0 *SecretResult, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return nil, r.failure
+	}
+	defer r.finishOperation("GenerateE2EESecret", &err, true, func() { out0 = nil })
+	return r.generateE2EESecret()
+}
+
+func (r *Runner) generateE2EESecret() (*SecretResult, error) {
 
 	ckPtr, err := r.rt.Curve25519KeyNew(r.skPtr)
 	if err != nil {
@@ -865,14 +1179,21 @@ func (r *Runner) GenerateE2EESecret() (*SecretResult, error) {
 
 // GenerateConfirmHash derives the hash key chain for confirmE2EELogin.
 // Must be called after GenerateE2EESecret.
-func (r *Runner) GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 string) (string, error) {
+func (r *Runner) GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 string) (out0 string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer r.finishOperation("GenerateConfirmHash", &err, true, func() { out0 = "" })
+	return r.generateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64)
+}
+
+func (r *Runner) generateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 string) (string, error) {
 	normalizedServerPub, err := normalizeServerPublicKeyB64(serverPublicKeyB64)
 	if err != nil {
 		return "", err
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.loginCurveKey == 0 {
 		return "", fmt.Errorf("login key not initialized")
@@ -903,9 +1224,17 @@ func (r *Runner) GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64 st
 
 // ReadChannelRaw returns 128 bytes of the channel C++ object's WASM linear memory.
 // Used for debugging the shared secret offset in the E2EEChannel/Curve25519KeyChannel object.
-func (r *Runner) ReadChannelRaw(channelID int) ([]byte, error) {
+func (r *Runner) ReadChannelRaw(channelID int) (out0 []byte, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return nil, r.failure
+	}
+	defer r.finishOperation("ReadChannelRaw", &err, true, func() { out0 = nil })
+	return r.readChannelRaw(channelID)
+}
+
+func (r *Runner) readChannelRaw(channelID int) ([]byte, error) {
 
 	chanPtr, err := r.getChannel(channelID)
 	if err != nil {
@@ -927,9 +1256,42 @@ func (r *Runner) ReadChannelRaw(channelID int) ([]byte, error) {
 // (from KeyGenerate), not raw bytes.
 //
 // Returns base64-encoded ciphertext ready for registerE2EEGroupKey.
-func (r *Runner) ChannelWrapGroupSharedKey(channelID int, keyID int) (string, error) {
+func (r *Runner) ChannelWrapGroupSharedKey(channelID int, keyID int) (out0 string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer r.finishOperation("ChannelWrapGroupSharedKey", &err, false, func() { out0 = "" })
+	return r.channelWrapGroupSharedKey(channelID, keyID)
+}
+
+func (r *Runner) WrapRegistrationGroupKey(channelIDs []int) (out0 []string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return nil, r.failure
+	}
+	defer r.finishOperation("WrapRegistrationGroupKey", &err, false, func() { out0 = nil })
+	chanPtrs := make([]uint32, len(channelIDs))
+	for i, channelID := range channelIDs {
+		chanPtrs[i], err = r.getChannel(channelID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	wrapped, err := r.rt.WrapRegistrationGroupKey(chanPtrs)
+	if err != nil {
+		return nil, err
+	}
+	out0 = make([]string, len(wrapped))
+	for i, data := range wrapped {
+		out0[i] = base64.StdEncoding.EncodeToString(data)
+	}
+	return out0, nil
+}
+
+func (r *Runner) channelWrapGroupSharedKey(channelID int, keyID int) (string, error) {
 
 	chanPtr, err := r.getChannel(channelID)
 	if err != nil {
@@ -942,8 +1304,6 @@ func (r *Runner) ChannelWrapGroupSharedKey(channelID int, keyID int) (string, er
 	}
 
 	// Use the WASM module's wrapGroupSharedKey directly (same as LINE Extension).
-	// keyPtr is an emval handle wrapping the Curve25519Key C++ object.
-	// The C++ method expects an emscripten::val, which the emval handle represents.
 	wrapped, err := r.rt.E2EEChannelWrapGroupSharedKey(chanPtr, keyPtr)
 	if err != nil {
 		return "", err

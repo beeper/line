@@ -19,7 +19,6 @@ import (
 
 	gen "github.com/highesttt/matrix-line-messenger/pkg"
 	"github.com/highesttt/matrix-line-messenger/pkg/line/password"
-	"github.com/highesttt/matrix-line-messenger/pkg/line/secret"
 )
 
 const (
@@ -43,12 +42,34 @@ var (
 )
 
 type Client struct {
-	HTTPClient  *http.Client
-	OBSClient   *http.Client
-	AccessToken string
+	LoginAttempt *LoginAttempt
+	HTTPClient   *http.Client
+	OBSClient    *http.Client
+	AccessToken  string
 
 	channelTokenMu    sync.Mutex
 	channelTokenCache map[string]cachedChannelAccessToken
+}
+
+type LoginAttempt struct {
+	Runner  *gen.Runner
+	Context context.Context
+	cancel  context.CancelFunc
+}
+
+func (a *LoginAttempt) Close() {
+	if a == nil {
+		return
+	}
+	a.cancel()
+	a.Runner.Close()
+}
+
+func (c *Client) requestContext() context.Context {
+	if c.LoginAttempt != nil {
+		return c.LoginAttempt.Context
+	}
+	return context.Background()
 }
 
 type OBSDownloadOptions struct {
@@ -80,6 +101,32 @@ func (c *Client) obsHTTPClient() *http.Client {
 }
 
 func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
+	return c.LoginContext(context.Background(), email, pass, certificate)
+}
+
+func (c *Client) LoginContext(ctx context.Context, email, pass, certificate string) (result *LoginResult, err error) {
+	if c.LoginAttempt != nil {
+		c.LoginAttempt.Close()
+	}
+	r, err := gen.NewRunner()
+	if err != nil {
+		return nil, err
+	}
+	attemptCtx, cancel := context.WithCancel(ctx)
+	attempt := &LoginAttempt{Runner: r, Context: attemptCtx, cancel: cancel}
+	c.LoginAttempt = attempt
+	defer func() {
+		if ctx.Err() != nil {
+			result = nil
+			err = ctx.Err()
+		}
+		if result == nil {
+			attempt.Close()
+		} else {
+			result.Attempt = attempt
+		}
+	}()
+
 	// 1. Get RSA Key Info
 	rsaKey, err := c.GetRSAKeyInfo()
 	if err != nil {
@@ -93,7 +140,7 @@ func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
 	}
 
 	// 3. Generate E2EE Secret
-	secretRes, err := secret.GenerateSecret()
+	secretRes, err := attempt.Runner.GenerateE2EESecret()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate e2ee secret: %w", err)
 	}
@@ -139,6 +186,9 @@ func (c *Client) Login(email, pass, certificate string) (*LoginResult, error) {
 	}
 
 	res.NoE2EE = noE2EE
+	if noE2EE {
+		attempt.Runner.Close()
+	}
 
 	// Prefer the V3 token if present, otherwise fall back to legacy authToken.
 	// LINE returns only the V3 token when re-authenticating with a stored
@@ -161,7 +211,22 @@ func isLoginNotSupported(err error) bool {
 	return strings.Contains(msg, "\"code\":89") || strings.Contains(msg, "not supported")
 }
 
-func (c *Client) WaitForLogin(verifier string, noE2EE bool) (*LoginResult, error) {
+func (c *Client) WaitForLogin(verifier string, noE2EE bool) (res *LoginResult, err error) {
+	defer func() {
+		if c.requestContext().Err() != nil {
+			res = nil
+			err = c.requestContext().Err()
+		}
+		if err != nil && c.LoginAttempt != nil {
+			c.LoginAttempt.Close()
+		}
+
+		if res != nil {
+			res.Attempt = c.LoginAttempt
+			res.NoE2EE = noE2EE
+		}
+	}()
+
 	if noE2EE {
 		return c.waitForLoginJQ(verifier)
 	}
@@ -172,7 +237,7 @@ func (c *Client) WaitForLogin(verifier string, noE2EE bool) (*LoginResult, error
 func (c *Client) waitForLoginJQ(verifier string) (*LoginResult, error) {
 	url := "https://line-chrome-gw.line-apps.com/api/talk/long-polling/JQ"
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(c.requestContext(), "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +301,7 @@ func (c *Client) waitForLoginJQ(verifier string) (*LoginResult, error) {
 func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
 	url := "https://line-chrome-gw.line-apps.com/api/talk/long-polling/LF1"
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(c.requestContext(), "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +396,7 @@ func (c *Client) GetRSAKeyInfo() (*RSAKeyInfo, error) {
 }
 
 func (c *Client) callRPC(service, method string, args ...interface{}) ([]byte, error) {
-	return c.callRPCContext(context.Background(), service, method, args...)
+	return c.callRPCContext(c.requestContext(), service, method, args...)
 }
 
 func (c *Client) callRPCContext(ctx context.Context, service, method string, args ...interface{}) ([]byte, error) {
@@ -343,7 +408,7 @@ func (c *Client) callShopRPC(service, method string, args ...interface{}) ([]byt
 }
 
 func (c *Client) callRPCWithBaseURL(baseURL, service, method string, args ...interface{}) ([]byte, error) {
-	return c.callRPCWithBaseURLContext(context.Background(), baseURL, service, method, args...)
+	return c.callRPCWithBaseURLContext(c.requestContext(), baseURL, service, method, args...)
 }
 
 func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service, method string, args ...interface{}) ([]byte, error) {
@@ -404,10 +469,10 @@ func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service
 // ConfirmE2EELogin completes the E2EE handshake after LF1 by hashing the encrypted key
 // chain and posting it alongside the verifier.
 func (c *Client) ConfirmE2EELogin(verifier, serverPublicKeyB64, encryptedKeyChainB64 string) (string, error) {
-	runner, err := gen.GetRunner()
-	if err != nil {
-		return "", fmt.Errorf("failed to init runner: %w", err)
+	if c.LoginAttempt == nil {
+		return "", errors.New("missing E2EE login attempt")
 	}
+	runner := c.LoginAttempt.Runner
 
 	hash, err := runner.GenerateConfirmHash(serverPublicKeyB64, encryptedKeyChainB64)
 	if err != nil {
@@ -445,7 +510,7 @@ func (c *Client) ConfirmE2EELogin(verifier, serverPublicKeyB64, encryptedKeyChai
 // postWithHMAC is a small helper for non-standard RPC endpoints that still expect
 // the same headers and HMAC signature as the Talk endpoints.
 func (c *Client) postWithHMAC(fullURL string, body []byte) ([]byte, error) {
-	req, err := http.NewRequest("POST", fullURL, bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(c.requestContext(), "POST", fullURL, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
