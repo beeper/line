@@ -18,6 +18,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
@@ -571,6 +572,13 @@ func (lc *LineClient) resolveMatrixReaction(ctx context.Context, msg *bridgev2.M
 	if !strings.HasPrefix(key, "mxc://") {
 		return lineReactionRef{}, unsupportedMatrixReactionError(key)
 	}
+	emote, err := lc.resolveSticker(ctx, id.ContentURIString(key))
+	if err != nil {
+		lc.UserLogin.Log.Warn().Err(err).Str("key", key).Msg("Failed to resolve LINE emoji reaction")
+	}
+	if emote != nil {
+		return lineEmoteReaction(key, emote)
+	}
 	if msg.TargetMessage == nil || msg.Portal == nil || msg.Portal.Bridge == nil || msg.Portal.Bridge.DB == nil {
 		return lineReactionRef{}, errors.New("reaction target database context is missing")
 	}
@@ -589,6 +597,26 @@ func (lc *LineClient) resolveMatrixReaction(ctx context.Context, msg *bridgev2.M
 		return lineReactionRef{}, unsupportedMatrixReactionError(key)
 	}
 	return ref, nil
+}
+
+func lineEmoteReaction(key string, emote *lineSticker) (lineReactionRef, error) {
+	if emote.Shop != line.SticonShop {
+		return lineReactionRef{}, unsupportedMatrixReactionError(key)
+	}
+	version, err := strconv.ParseInt(emote.Version, 10, 32)
+	if err != nil || version <= 0 {
+		return lineReactionRef{}, fmt.Errorf("invalid LINE emoji reaction version")
+	}
+	resourceType := 1
+	if emote.Option == "A" {
+		resourceType = 2
+	}
+	return newLineReactionRef(linePaidReactionRef{
+		ProductID:    emote.ProductID,
+		EmojiID:      emote.ID,
+		ResourceType: resourceType,
+		Version:      int(version),
+	}.reactionType())
 }
 
 func unsupportedMatrixReactionError(key string) error {

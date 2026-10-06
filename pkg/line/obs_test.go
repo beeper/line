@@ -2,6 +2,8 @@ package line
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -9,6 +11,51 @@ import (
 	"testing"
 	"time"
 )
+
+func TestUploadOBSPlainOriginalImage(t *testing.T) {
+	installCachedOBSToken(t)
+	client := NewClient("line-token")
+	requests := 0
+	client.OBSClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		paramsJSON, err := base64.StdEncoding.DecodeString(req.Header.Get("X-Obs-Params"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var params map[string]string
+		if err = json.Unmarshal(paramsJSON, &params); err != nil {
+			t.Fatal(err)
+		}
+		if params["ver"] != "2.0" || params["type"] != "image" {
+			t.Fatalf("unexpected OBS params: %v", params)
+		}
+		if requests == 1 {
+			if params["cat"] != "original" || params["name"] != "animation.gif" {
+				t.Fatalf("original GIF upload missing Chrome parameters: %v", params)
+			}
+		} else if _, ok := params["cat"]; ok {
+			t.Fatal("regular upload unexpectedly has original category")
+		}
+		body, _ := io.ReadAll(req.Body)
+		if string(body) != "GIF89a-original-bytes" || req.Method != http.MethodPost || req.URL.Path != "/r/talk/m/message-id" {
+			t.Fatalf("unexpected upload: %s %s %q", req.Method, req.URL.Path, body)
+		}
+		if req.Header.Get("X-Line-Access") != "obs-token" {
+			t.Fatal("missing OBS token")
+		}
+		return obsResponse(http.StatusCreated, ""), nil
+	})}
+	data := []byte("GIF89a-original-bytes")
+	if err := client.UploadOBSPlainOriginalImage(data, "message-id", "animation.gif"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.UploadOBSPlain(data, "message-id", "image"); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
 
 type observedOBSRequest struct {
 	path    string

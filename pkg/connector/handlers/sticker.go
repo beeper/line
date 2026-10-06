@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"image"
 	"io"
 	"strings"
 
@@ -14,7 +16,7 @@ import (
 	"github.com/highesttt/matrix-line-messenger/pkg/line"
 )
 
-// ConvertSticker converts a LINE sticker message to a Matrix image or text fallback.
+// ConvertSticker converts a LINE sticker message to a Matrix sticker or text fallback.
 func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
 	stkID := data.ContentMetadata["STKID"]
 	stkTxt := data.ContentMetadata["STKTXT"]
@@ -75,7 +77,12 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 					ext = "png"
 				}
 
+				dimensions, _, _ := image.DecodeConfig(bytes.NewReader(stkData))
 				bodyName := "sticker." + ext
+				body := stkTxt
+				if body == "" {
+					body = bodyName
+				}
 
 				mxc, file, err := intent.UploadMedia(ctx, portal.MXID, stkData, bodyName, mimeType)
 				if err != nil {
@@ -84,15 +91,17 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 					return &bridgev2.ConvertedMessage{
 						Parts: []*bridgev2.ConvertedMessagePart{
 							{
-								Type: event.EventMessage,
+								Type: event.EventSticker,
 								Content: &event.MessageEventContent{
-									MsgType: event.MsgImage,
-									Body:    bodyName,
-									URL:     mxc,
-									File:    file,
+									Body: body,
+									URL:  mxc,
+									File: file,
 									Info: &event.FileInfo{
-										MimeType: mimeType,
-										Size:     len(stkData),
+										MimeType:   mimeType,
+										Width:      dimensions.Width,
+										Height:     dimensions.Height,
+										IsAnimated: isAnimated,
+										Size:       len(stkData),
 									},
 									RelatesTo: relatesTo,
 								},

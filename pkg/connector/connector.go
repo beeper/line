@@ -14,6 +14,7 @@ import (
 	"go.mau.fi/util/configupgrade"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
@@ -41,6 +42,9 @@ func (lc *LineConnector) Init(bridge *bridgev2.Bridge) {
 	// user doesn't already have one.
 	bridge.Config.BridgeStatusNotices = "none"
 	lc.br = bridge
+	if processor, ok := bridge.Commands.(*commands.Processor); ok {
+		processor.AddHandlers(commandStickers)
+	}
 }
 
 func (lc *LineConnector) Start(ctx context.Context) error {
@@ -52,14 +56,14 @@ func (lc *LineConnector) Start(ctx context.Context) error {
 }
 
 func (lc *LineConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 3
+	return 1, 4
 }
 
 func (lc *LineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return &bridgev2.NetworkGeneralCapabilities{
 		AggressiveUpdateInfo: true,
 		Provisioning: bridgev2.ProvisioningCapabilities{
-			ImagePackImport: false,
+			ImagePackImport: true,
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
 				Search:      true,
 				ContactList: true,

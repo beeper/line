@@ -539,6 +539,14 @@ func obsTypeFromSID(sid string) string {
 // UploadOBSPlain uploads plain (non-E2EE) media to a specific OID via the "m" endpoint.
 // obsType should be "image", "video", "audio", or "file".
 func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
+	return c.uploadOBSPlain(data, oid, obsType, "", "")
+}
+
+func (c *Client) UploadOBSPlainOriginalImage(data []byte, oid, fileName string) error {
+	return c.uploadOBSPlain(data, oid, "image", fileName, "original")
+}
+
+func (c *Client) uploadOBSPlain(data []byte, oid, obsType, fileName, category string) error {
 	obsToken, err := c.AcquireEncryptedAccessToken()
 	if err != nil {
 		return fmt.Errorf("failed to acquire OBS token: %w", err)
@@ -555,6 +563,12 @@ func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
 		"ver":  "2.0",
 		"name": fmt.Sprintf("%d", time.Now().UnixMilli()),
 		"type": obsType,
+	}
+	if fileName != "" {
+		obsParams["name"] = fileName
+	}
+	if category != "" {
+		obsParams["cat"] = category
 	}
 	obsParamsJSON, _ := json.Marshal(obsParams)
 	obsParamsB64 := base64.StdEncoding.EncodeToString(obsParamsJSON)

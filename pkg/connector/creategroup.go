@@ -119,14 +119,14 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 	return &bridgev2.CreateChatResponse{
 		PortalKey: portalKey,
 		Portal:    portal,
-		PortalInfo: &bridgev2.ChatInfo{
+		PortalInfo: lc.withStickerPacks(&bridgev2.ChatInfo{
 			Type: &ct,
 			Name: &chatName,
 			Members: &bridgev2.ChatMemberList{
 				IsFull:    true,
 				MemberMap: chatMemberMapFromList(members),
 			},
-		},
+		}),
 	}, nil
 }
 
