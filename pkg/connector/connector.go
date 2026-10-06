@@ -716,17 +716,19 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		displayName = "LINE User"
 	}
 
-	certificate := res.Certificate
-	if certificate == "" {
-		certificate = ll.Certificate
-	}
 	mid := profile.Mid
 	if mid == "" || (res.Mid != "" && res.Mid != mid) {
 		return nil, errors.New("login result does not match verified LINE account")
 	}
-
-	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
 	sameAccount := ll.ExistingMetadata != nil && ll.ExistingLogin != nil && ll.ExistingLogin.UserLogin != nil && mid == string(ll.ExistingLogin.ID) && mid == ll.ExistingMetadata.Mid
+	certificate := res.Certificate
+	if certificate == "" && (ll.ExistingMetadata == nil || sameAccount) {
+		certificate = ll.Certificate
+	}
+	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
+	if sameAccount && meta.Email == "" && meta.Password == "" {
+		meta.Email, meta.Password = ll.ExistingMetadata.Email, ll.ExistingMetadata.Password
+	}
 
 	loginManager, err := ll.fetchLoginKeys(res, meta, client)
 	if err != nil {
