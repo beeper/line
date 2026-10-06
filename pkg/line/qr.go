@@ -88,7 +88,7 @@ func (c *Client) CheckQRCodeVerifiedContext(ctx context.Context, session string,
 func (c *Client) VerifyQRCertificate(ctx context.Context, session, certificate string) (bool, error) {
 	err := c.callQRRPC(ctx, "verifyCertificate", "", 0, map[string]string{"authSessionId": session, "certificate": certificate}, nil)
 	var response *qrRPCError
-	if errors.As(err, &response) && (response.httpStatus == 400 || (response.httpStatus == 200 && response.code != 0)) {
+	if errors.As(err, &response) && response.httpStatus == http.StatusBadRequest {
 		return false, nil
 	}
 	return err == nil, err

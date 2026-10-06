@@ -23,6 +23,7 @@ import (
 var (
 	errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
 	errLineClientSuperseded   = errors.New("LINE client was superseded")
+	errLineQRLoginRequired    = errors.New("LINE requires a new QR scan. Reconnect in Beeper to continue")
 )
 
 const lineMissingE2EEKeyMessage = "LINE encryption keys are unavailable. Reconnect LINE in Beeper to restore message decryption."
@@ -702,6 +703,11 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	}
 
 	if email == "" || password == "" {
+		if lc.UserLogin.Bridge != nil {
+			if network, ok := lc.UserLogin.Bridge.Network.(*LineConnector); ok && network.Config.QRLogin {
+				return errLineQRLoginRequired
+			}
+		}
 		return fmt.Errorf("no stored credentials available for re-login")
 	}
 

@@ -1134,9 +1134,7 @@ func (r *Runner) channelDecryptV2(channelID int, to, from string, senderKeyID, r
 	return string(ptBytes), base64.StdEncoding.EncodeToString(ptBytes), nil
 }
 
-// GenerateE2EESecret generates a login secret with PIN and public key.
-// The Curve25519Key is used because GenerateConfirmHash and
-// LoginUnwrapKeyChain require the SKB-wrapped key for ECDH.
+// GenerateE2EESecret generates a fresh login key, PIN and public key.
 func (r *Runner) GenerateE2EESecret() (out0 *SecretResult, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

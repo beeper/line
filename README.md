@@ -283,6 +283,20 @@ cd data
 
 ## Login
 
+Email/password login is always available. Set `network.qr_login: true` in
+`config.yaml` and restart to make QR Code the first login option. Scan with
+the LINE mobile app, then enter the displayed PIN on your phone. Set the setting
+back to `false` to disable new QR login attempts.
+
+Beeper Services controls client rollout with
+`bridge:line:login:dev.highest.matrix.line.qr_login`, defaulting to `false`.
+Distribute that flag before enabling QR login in the cloud bridge config.
+
+Use `logging.min_level: warn` when enabling QR login: provisioning info/debug
+logs include QR URLs and verification codes. Passwordless accounts need another
+QR scan if token refresh fails. QR login currently requires a Letter Sealing
+keychain; accounts without one fail before a login is stored.
+
 ### Via Beeper Desktop Settings
 
 1. Open Beeper Desktop Settings

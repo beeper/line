@@ -186,7 +186,7 @@ func (lc *LineConnector) CreateLogin(ctx context.Context, user *bridgev2.User, f
 	if flowID != LoginFlowIDEmail {
 		return nil, bridgev2.ErrInvalidLoginFlowID
 	}
-	return &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu}, nil
+	return &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu, qrEnabled: lc.Config.QRLogin}, nil
 }
 
 type LineEmailLogin struct {
@@ -200,6 +200,8 @@ type LineEmailLogin struct {
 
 	ExistingMetadata *UserLoginMetadata
 	ExistingLogin    *bridgev2.UserLogin
+	qrEnabled        bool
+	qrLogin          *LineQRLogin
 
 	pollResult    chan *line.LoginResult
 	pollErr       chan error
@@ -250,6 +252,14 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 	ll.ExistingLogin = override
 
 	if ll.Email == "" || ll.Password == "" {
+		if ll.qrEnabled {
+			ll.Email, ll.Password = "", ""
+			ll.mu.Lock()
+			ll.qrLogin = &LineQRLogin{login: ll}
+			qrLogin := ll.qrLogin
+			ll.mu.Unlock()
+			return qrLogin.StartWithOverride(ctx, override)
+		}
 		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
 	}
 	if meta.ForceFullE2EELogin || len(meta.ExportedKeyMap) == 0 {
@@ -523,6 +533,10 @@ func (ll *LineEmailLogin) loginCredentials(ctx context.Context, certificate stri
 
 func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 	ll.mu.Lock()
+	if qrLogin := ll.qrLogin; qrLogin != nil {
+		ll.mu.Unlock()
+		return qrLogin.Wait(ctx)
+	}
 	verifier, awaitingPIN := ll.Verifier, ll.AwaitingPIN
 	resultCh, errCh := ll.pollResult, ll.pollErr
 	var done <-chan struct{}
