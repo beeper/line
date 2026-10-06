@@ -1149,7 +1149,7 @@ func (r *Runner) GenerateE2EESecret() (out0 *SecretResult, err error) {
 
 func (r *Runner) generateE2EESecret() (*SecretResult, error) {
 
-	ckPtr, err := r.rt.Curve25519KeyNew(r.skPtr)
+	ckPtr, err := r.rt.Curve25519KeyGenerate()
 	if err != nil {
 		return nil, err
 	}

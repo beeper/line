@@ -28,6 +28,7 @@ const (
 )
 
 type LineConnector struct {
+	Config          Config
 	br              *bridgev2.Bridge
 	loginFinalizeMu sync.Mutex
 	directMedia     atomic.Bool
@@ -96,7 +97,17 @@ func (lc *LineConnector) GetName() bridgev2.BridgeName {
 }
 
 func (lc *LineConnector) GetConfig() (example string, data any, upgrader configupgrade.Upgrader) {
-	return "", nil, nil
+	const base = "qr_login: false\n"
+	return base, &lc.Config, &configupgrade.StructUpgrader{
+		Base: base,
+		SimpleUpgrader: func(helper configupgrade.Helper) {
+			helper.Copy(configupgrade.Bool, "qr_login")
+		},
+	}
+}
+
+type Config struct {
+	QRLogin bool `yaml:"qr_login"`
 }
 
 func (lc *LineConnector) GetDBMetaTypes() database.MetaTypes {
@@ -154,16 +165,24 @@ func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.User
 }
 
 const LoginFlowIDEmail = "dev.highest.matrix.line.email_login"
+const LoginFlowIDQR = "dev.highest.matrix.line.qr_login"
 
 func (lc *LineConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
+	flows := []bridgev2.LoginFlow{{
 		Name:        "Login",
 		Description: "Login with your LINE Email and Password",
 		ID:          LoginFlowIDEmail,
 	}}
+	if lc.Config.QRLogin {
+		flows = append([]bridgev2.LoginFlow{{Name: "QR Code", Description: "Scan a QR code with the LINE mobile app", ID: LoginFlowIDQR}}, flows...)
+	}
+	return flows
 }
 
 func (lc *LineConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
+	if flowID == LoginFlowIDQR && lc.Config.QRLogin {
+		return &LineQRLogin{login: &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu}}, nil
+	}
 	if flowID != LoginFlowIDEmail {
 		return nil, bridgev2.ErrInvalidLoginFlowID
 	}
