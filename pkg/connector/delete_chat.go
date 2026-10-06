@@ -18,6 +18,13 @@ func (lc *LineClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.
 		return errors.New("delete for everyone is not supported on LINE")
 	}
 	chatMid := string(msg.Portal.ID)
+	if msg.Portal.MessageRequest {
+		reqSeq := lc.nextUntrackedReqSeq()
+		_, err := lc.callLine(ctx, func(client *line.Client) error {
+			return client.RejectChatInvitationContext(ctx, int64(reqSeq), chatMid)
+		})
+		return err
+	}
 	_, boxes, err := callLineResult(lc, ctx, func(client *line.Client) (map[string]line.MessageBox, error) {
 		return client.GetMessageBoxesByIDsContext(ctx, []string{chatMid})
 	})

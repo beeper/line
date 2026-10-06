@@ -883,7 +883,18 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chat.ChatMid).Msg("Failed to find existing group portal before sync")
 			}
 			if (existingPortal == nil || existingPortal.MXID == "") && lc.shouldSkipDeletedChat(chat.ChatMid, "") {
-				continue
+				var boxes map[string]line.MessageBox
+				client, boxes, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (map[string]line.MessageBox, error) {
+					return client.GetMessageBoxesByIDsContext(ctx, []string{chat.ChatMid})
+				})
+				if err != nil {
+					lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chat.ChatMid).Msg("Failed to fetch deleted group's latest message ID")
+					continue
+				}
+				latest := boxes[chat.ChatMid].LastDeliveredMessageID
+				if latest == nil || lc.shouldSkipDeletedChat(chat.ChatMid, latest.MessageID) {
+					continue
+				}
 			}
 
 			info := lc.chatToChatInfo(ctx, &chat, true)
