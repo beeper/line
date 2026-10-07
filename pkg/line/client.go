@@ -569,19 +569,26 @@ func (c *Client) RefreshAccessToken(refreshToken string) (*TokenV3IssueResult, e
 		return nil, err
 	}
 
-	var res TokenV3IssueResult
-	if err := json.Unmarshal(respBytes, &res); err != nil {
+	var response struct {
+		TokenV3IssueResult
+		Code int             `json:"code"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(respBytes, &response); err != nil {
 		return nil, fmt.Errorf("failed to parse refresh response: %w", err)
 	}
-
-	// Treat an empty access token as a refresh failure. LINE occasionally
-	// returns HTTP 200 with a non-token body (e.g. an error JSON that doesn't
-	// match TokenV3IssueResult), in which case the unmarshal silently yields a
-	// zeroed struct. Without this guard the caller would clear the in-memory
-	// access token and the bridge would silently go into a "not logged in"
-	// state on the next API call.
+	if response.Code != 0 {
+		return nil, newTokenRefreshError(response.Code, respBytes)
+	}
+	res := response.TokenV3IssueResult
+	if response.Data != nil && !bytes.Equal(bytes.TrimSpace(response.Data), []byte("null")) {
+		res = TokenV3IssueResult{}
+		if err := json.Unmarshal(response.Data, &res); err != nil {
+			return nil, fmt.Errorf("failed to parse refresh response: %w", err)
+		}
+	}
 	if res.AccessToken == "" {
-		return nil, fmt.Errorf("refresh response missing access token: %s", string(respBytes))
+		return nil, newTokenRefreshError(0, respBytes)
 	}
 
 	c.AccessToken = res.AccessToken

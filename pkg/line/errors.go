@@ -1,6 +1,8 @@
 package line
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,11 +16,103 @@ var (
 	ErrGroupKeyNotFound      = errors.New("group key not found")
 )
 
+type tokenRefreshError struct {
+	code             int
+	loggedOut        bool
+	invalidSenderKey bool
+	refreshRequired  bool
+	requestNeedLogin bool
+	diagnostic       string
+}
+
+func newTokenRefreshError(code int, response []byte) *tokenRefreshError {
+	err := errors.New(string(response))
+	result := &tokenRefreshError{
+		code: code, loggedOut: IsLoggedOut(err), invalidSenderKey: IsInvalidSenderKey(err),
+		refreshRequired: IsRefreshRequired(err), requestNeedLogin: IsRequestNeedLogin(err),
+	}
+	if !result.loggedOut && !result.invalidSenderKey && !result.refreshRequired && !result.requestNeedLogin {
+		result.diagnostic = refreshResponseDiagnostic(response)
+	}
+	return result
+}
+
+func refreshResponseDiagnostic(response []byte) string {
+	kind := func(raw []byte) string {
+		raw = bytes.TrimSpace(raw)
+		if len(raw) == 0 {
+			return "absent"
+		}
+		switch raw[0] {
+		case '{':
+			return "object"
+		case '[':
+			return "array"
+		case '"':
+			return "string"
+		case 't', 'f':
+			return "boolean"
+		case 'n':
+			return "null"
+		default:
+			return "number"
+		}
+	}
+	var root, data map[string]json.RawMessage
+	_ = json.Unmarshal(response, &root)
+	_ = json.Unmarshal(root["data"], &data)
+	parts := []string{"body=" + kind(response)}
+	for _, scope := range []struct {
+		name   string
+		fields map[string]json.RawMessage
+	}{{"root", root}, {"data", data}} {
+		parts = append(parts, fmt.Sprintf("%s.keys=%d", scope.name, len(scope.fields)))
+		for _, key := range []string{"code", "status", "message", "name", "reason", "data", "error", "accessToken", "refreshToken"} {
+			value := kind(scope.fields[key])
+			if key == "code" || key == "status" {
+				var number *int64
+				if json.Unmarshal(scope.fields[key], &number) == nil && number != nil {
+					value += fmt.Sprintf("(%d)", *number)
+				}
+			}
+			parts = append(parts, scope.name+"."+key+"="+value)
+		}
+	}
+	summary := strings.Join(parts, ",")
+	fingerprint := sha256.Sum256([]byte(summary))
+	return fmt.Sprintf("response{%s; shape_sha256=%x}", summary, fingerprint[:8])
+}
+
+func (e *tokenRefreshError) Error() string {
+	message := "refresh response missing access token"
+	if e.code != 0 {
+		message = fmt.Sprintf("refresh rejected: code %d", e.code)
+	}
+	switch {
+	case e.invalidSenderKey:
+		return message + ": invalid sender key"
+	case e.requestNeedLogin:
+		return message + ": REQUEST_NEED_LOGIN"
+	case e.loggedOut:
+		return message + ": V3_TOKEN_CLIENT_LOGGED_OUT"
+	case e.refreshRequired:
+		return message + ": access token refresh required"
+	}
+	if e.diagnostic != "" {
+		return message + ": " + e.diagnostic
+	}
+	return message
+}
+
 // IsRefreshRequired returns true when LINE reports that the access token must
 // be refreshed before the request can be retried.
 func IsRefreshRequired(err error) bool {
 	if err == nil {
 		return false
+	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.refreshRequired {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "\"code\":119") ||
@@ -29,6 +123,10 @@ func IsLoggedOut(err error) bool {
 	if err == nil {
 		return false
 	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.loggedOut {
+		return true
+	}
 	return strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") ||
 		IsInvalidSenderKey(err) ||
 		IsRequestNeedLogin(err)
@@ -37,6 +135,10 @@ func IsLoggedOut(err error) bool {
 func IsInvalidSenderKey(err error) bool {
 	if err == nil {
 		return false
+	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.invalidSenderKey {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return hasResponseErrorCode(msg) &&
@@ -48,6 +150,10 @@ func IsInvalidSenderKey(err error) bool {
 func IsRequestNeedLogin(err error) bool {
 	if err == nil {
 		return false
+	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.requestNeedLogin {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "request_need_login") ||
