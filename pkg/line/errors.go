@@ -14,6 +14,24 @@ var (
 	ErrGroupKeyNotFound      = errors.New("group key not found")
 )
 
+type tokenRefreshError struct {
+	code             int
+	loggedOut        bool
+	invalidSenderKey bool
+}
+
+func newTokenRefreshError(code int, response []byte) *tokenRefreshError {
+	err := errors.New(string(response))
+	return &tokenRefreshError{code: code, loggedOut: IsLoggedOut(err), invalidSenderKey: IsInvalidSenderKey(err)}
+}
+
+func (e *tokenRefreshError) Error() string {
+	if e.code != 0 {
+		return fmt.Sprintf("refresh rejected: code %d", e.code)
+	}
+	return "refresh response missing access token"
+}
+
 // IsRefreshRequired returns true when LINE reports that the access token must
 // be refreshed before the request can be retried.
 func IsRefreshRequired(err error) bool {
@@ -29,6 +47,10 @@ func IsLoggedOut(err error) bool {
 	if err == nil {
 		return false
 	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.loggedOut {
+		return true
+	}
 	return strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") ||
 		IsInvalidSenderKey(err) ||
 		IsRequestNeedLogin(err)
@@ -37,6 +59,10 @@ func IsLoggedOut(err error) bool {
 func IsInvalidSenderKey(err error) bool {
 	if err == nil {
 		return false
+	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.invalidSenderKey {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return hasResponseErrorCode(msg) &&
