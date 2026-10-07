@@ -259,13 +259,16 @@ type talkExceptionData struct {
 
 func loginPollingFailure(httpStatus int, body []byte) error {
 	var response struct {
-		Code    int               `json:"code"`
+		Code    *int              `json:"code"`
 		Message string            `json:"message"`
 		Data    talkExceptionData `json:"data"`
 	}
 	decodeErr := json.Unmarshal(body, &response)
-	details := fmt.Sprintf("LINE response code %d", response.Code)
-	if decodeErr == nil && response.Code == 10051 && strings.EqualFold(response.Message, "RESPONSE_ERROR") && strings.EqualFold(response.Data.Name, "TalkException") {
+	details := "LINE response without a valid code"
+	if decodeErr == nil && response.Code != nil {
+		details = fmt.Sprintf("LINE response code %d", *response.Code)
+	}
+	if decodeErr == nil && response.Code != nil && *response.Code == 10051 && strings.EqualFold(response.Message, "RESPONSE_ERROR") && strings.EqualFold(response.Data.Name, "TalkException") {
 		response.Message = "RESPONSE_ERROR"
 		response.Data.Name = "TalkException"
 		response.Data.Message = safeLoginPollingReason(response.Data.Message)
@@ -277,7 +280,7 @@ func loginPollingFailure(httpStatus int, body []byte) error {
 	if httpStatus != http.StatusOK {
 		return fmt.Errorf("LF1 polling failed: API error %d: %s", httpStatus, details)
 	}
-	return fmt.Errorf("LF1 polling failed (code %d): %s", response.Code, details)
+	return fmt.Errorf("LF1 polling failed: %s", details)
 }
 
 func safeLoginPollingReason(reason string) string {
