@@ -581,7 +581,7 @@ func (c *Client) RefreshAccessToken(refreshToken string) (*TokenV3IssueResult, e
 		return nil, newTokenRefreshError(response.Code, respBytes)
 	}
 	res := response.TokenV3IssueResult
-	if response.Data != nil {
+	if response.Data != nil && !bytes.Equal(bytes.TrimSpace(response.Data), []byte("null")) {
 		res = TokenV3IssueResult{}
 		if err := json.Unmarshal(response.Data, &res); err != nil {
 			return nil, fmt.Errorf("failed to parse refresh response: %w", err)

@@ -18,18 +18,34 @@ type tokenRefreshError struct {
 	code             int
 	loggedOut        bool
 	invalidSenderKey bool
+	refreshRequired  bool
+	requestNeedLogin bool
 }
 
 func newTokenRefreshError(code int, response []byte) *tokenRefreshError {
 	err := errors.New(string(response))
-	return &tokenRefreshError{code: code, loggedOut: IsLoggedOut(err), invalidSenderKey: IsInvalidSenderKey(err)}
+	return &tokenRefreshError{
+		code: code, loggedOut: IsLoggedOut(err), invalidSenderKey: IsInvalidSenderKey(err),
+		refreshRequired: IsRefreshRequired(err), requestNeedLogin: IsRequestNeedLogin(err),
+	}
 }
 
 func (e *tokenRefreshError) Error() string {
+	message := "refresh response missing access token"
 	if e.code != 0 {
-		return fmt.Sprintf("refresh rejected: code %d", e.code)
+		message = fmt.Sprintf("refresh rejected: code %d", e.code)
 	}
-	return "refresh response missing access token"
+	switch {
+	case e.invalidSenderKey:
+		return message + ": invalid sender key"
+	case e.requestNeedLogin:
+		return message + ": REQUEST_NEED_LOGIN"
+	case e.loggedOut:
+		return message + ": V3_TOKEN_CLIENT_LOGGED_OUT"
+	case e.refreshRequired:
+		return message + ": access token refresh required"
+	}
+	return message
 }
 
 // IsRefreshRequired returns true when LINE reports that the access token must
@@ -37,6 +53,10 @@ func (e *tokenRefreshError) Error() string {
 func IsRefreshRequired(err error) bool {
 	if err == nil {
 		return false
+	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.refreshRequired {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "\"code\":119") ||
@@ -74,6 +94,10 @@ func IsInvalidSenderKey(err error) bool {
 func IsRequestNeedLogin(err error) bool {
 	if err == nil {
 		return false
+	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.requestNeedLogin {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "request_need_login") ||
