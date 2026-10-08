@@ -331,15 +331,27 @@ func (c *Client) waitForLoginLF1(verifier string) (*LoginResult, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read LF1 polling response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, loginPollingFailure(resp.StatusCode, body)
+	}
 
 	var wrapper struct {
-		Code    int                `json:"code"`
+		Code    *int               `json:"code"`
 		Message string             `json:"message"`
 		Data    LoginPollingResult `json:"data"`
 	}
 	if err := json.Unmarshal(body, &wrapper); err != nil {
 		return nil, fmt.Errorf("failed to parse LF1 polling response: %w", err)
+	}
+	if wrapper.Code == nil {
+		return nil, errors.New("LF1 polling returned an invalid response without a success code")
+	}
+	if *wrapper.Code != 0 {
+		return nil, loginPollingFailure(resp.StatusCode, body)
 	}
 
 	meta := wrapper.Data.Result.Metadata

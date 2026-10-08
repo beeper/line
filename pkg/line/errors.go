@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -254,6 +255,50 @@ type talkExceptionData struct {
 	Message string `json:"message"`
 	Code    int    `json:"code"`
 	Reason  string `json:"reason"`
+}
+
+func loginPollingFailure(httpStatus int, body []byte) error {
+	var response struct {
+		Code    *int              `json:"code"`
+		Message string            `json:"message"`
+		Data    talkExceptionData `json:"data"`
+	}
+	decodeErr := json.Unmarshal(body, &response)
+	details := "LINE response without a valid code"
+	if decodeErr == nil && response.Code != nil {
+		details = fmt.Sprintf("LINE response code %d", *response.Code)
+	}
+	if decodeErr == nil && response.Code != nil && *response.Code == 10051 && strings.EqualFold(response.Message, "RESPONSE_ERROR") && strings.EqualFold(response.Data.Name, "TalkException") {
+		response.Message = "RESPONSE_ERROR"
+		response.Data.Name = "TalkException"
+		response.Data.Message = safeLoginPollingReason(response.Data.Message)
+		response.Data.Reason = safeLoginPollingReason(response.Data.Reason)
+		if sanitized, err := json.Marshal(response); err == nil {
+			details = string(sanitized)
+		}
+	}
+	if httpStatus != http.StatusOK {
+		return fmt.Errorf("LF1 polling failed: API error %d: %s", httpStatus, details)
+	}
+	return fmt.Errorf("LF1 polling failed: %s", details)
+}
+
+func safeLoginPollingReason(reason string) string {
+	// Arbitrary provider text can echo secrets, so retain only fixed rejection messages.
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "authentication failed":
+		return "authentication failed"
+	case "failed to issue v3 token":
+		return "Failed to issue V3 token"
+	case "blocked user":
+		return "blocked user"
+	case "account id or password is invalid":
+		return "Account ID or password is invalid"
+	case "too many login attempts":
+		return "Too many login attempts"
+	default:
+		return ""
+	}
 }
 
 // IsE2EEGroupMemberMismatch identifies a rejected registration that needs a
