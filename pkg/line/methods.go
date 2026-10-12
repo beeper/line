@@ -640,6 +640,25 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 	return &wrapper.Data, nil
 }
 
+func (c *Client) GetRoomsV2(mids []string) ([]Room, error) {
+	resp, err := c.callRPC("TalkService", "getRoomsV2", mids)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    []Room `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, err
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getRoomsV2 failed: %s", wrapper.Message)
+	}
+	return wrapper.Data, nil
+}
+
 func (c *Client) GetLastOpRevision() (int64, error) {
 	return c.GetLastOpRevisionContext(context.Background())
 }

@@ -151,16 +151,36 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	mid := string(portal.ID)
 	lowerMid := strings.ToLower(mid)
 	if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
-		_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
-			return client.GetChats([]string{mid}, true, true)
-		})
-		if err != nil {
-			return nil, err
+		var chat *line.Chat
+		if strings.HasPrefix(lowerMid, "r") {
+			// Legacy multi-person rooms aren't returned by getChats.
+			_, rooms, err := callLineResult(lc, ctx, func(client *line.Client) ([]line.Room, error) {
+				return client.GetRoomsV2([]string{mid})
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(rooms) == 0 {
+				return nil, fmt.Errorf("room not found")
+			}
+			chat = &line.Chat{
+				ChatMid: mid,
+				Type:    1,
+				Extra:   line.ChatExtra{GroupExtra: &line.GroupExtra{MemberMids: rooms[0].MemberMids}},
+			}
+		} else {
+			_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.GetChatsResponse, error) {
+				return client.GetChats([]string{mid}, true, true)
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(res.Chats) == 0 {
+				return nil, fmt.Errorf("chat not found")
+			}
+			chat = &res.Chats[0]
 		}
-		if len(res.Chats) == 0 {
-			return nil, fmt.Errorf("chat not found")
-		}
-		info := lc.chatToChatInfo(ctx, &res.Chats[0], true)
+		info := lc.chatToChatInfo(ctx, chat, true)
 		if portal.MXID == "" && lc.shouldSkipDeletedChat(mid, "") {
 			lc.stripRemoteMembersFromInitialChatInfo(info)
 		}
