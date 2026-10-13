@@ -27,6 +27,7 @@ var (
 )
 
 const lineMissingE2EEKeyMessage = "LINE encryption keys are unavailable. Reconnect LINE in Beeper to restore message decryption."
+const linePINRequiredMessage = "LINE needs you to confirm this sign-in. Open the LINE app on your phone and enter this PIN: %s"
 
 var newLineAPIClient = line.NewClient
 var newE2EEManager = e2ee.NewManager
@@ -694,7 +695,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	workersStarted = true
 }
 
-func (lc *LineClient) tryLogin(ctx context.Context) error {
+func (lc *LineClient) tryLogin(ctx context.Context) (err error) {
 	var email, password, certificate string
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
 		email = meta.Email
@@ -741,11 +742,17 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 			lc.UserLogin.Bridge.Log.Warn().Msg("PIN verification required — check your LINE mobile app to complete re-login")
 			// Send the PIN via bridge state so the user sees it in their Matrix client
 			lc.UserLogin.BridgeState.Send(status.BridgeState{
-				StateEvent: status.StateConnecting,
+				StateEvent: status.StateTransientDisconnect,
 				Error:      "line-pin-required",
-				Message:    fmt.Sprintf("Enter this PIN on your LINE mobile app: %s", pin),
-				UserAction: status.UserActionRelogin,
+				Message:    fmt.Sprintf(linePINRequiredMessage, pin),
+				UserAction: status.UserActionOpenNative,
+				Info:       map[string]any{"pin": pin},
 			})
+			defer func() {
+				if err == nil && !lc.superseded.Load() && !lc.isSessionInvalidated() {
+					lc.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+				}
+			}()
 		}
 
 		lc.UserLogin.Bridge.Log.Info().Msg("Waiting for PIN verification on mobile device...")
