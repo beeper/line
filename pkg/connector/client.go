@@ -68,6 +68,8 @@ type LineClient struct {
 	deletedChatsMu sync.Mutex
 	deletedChats   map[string]string
 
+	obsTokenCache line.OBSTokenCache
+
 	tokenMu              sync.RWMutex
 	recoverMu            sync.Mutex
 	recoverTime          time.Time
@@ -222,7 +224,13 @@ func (lc *LineClient) claimForcedLogoutState() bool {
 }
 
 func (lc *LineClient) newClient() *line.Client {
-	return newLineAPIClient(lc.getAccessToken())
+	return lc.newClientWithToken(lc.getAccessToken())
+}
+
+func (lc *LineClient) newClientWithToken(token string) *line.Client {
+	client := newLineAPIClient(token)
+	client.OBSTokenCache = &lc.obsTokenCache
+	return client
 }
 
 func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
@@ -314,7 +322,7 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 
 	// Rotating the main access token invalidates any OBS token derived from it,
 	// so drop the cached one — the next OBS call will mint a fresh one.
-	line.InvalidateOBSTokenCache()
+	lc.obsTokenCache.Invalidate()
 
 	meta := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	meta.AccessToken = accessToken
@@ -346,7 +354,7 @@ func (lc *LineClient) markLoggedOutByOtherClient(ctx context.Context, err error)
 func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err error) {
 	if lc.UserLogin == nil {
 		lc.invalidateAccessToken()
-		line.InvalidateOBSTokenCache()
+		lc.obsTokenCache.Invalidate()
 		lc.cancelActiveRun()
 		return
 	}
@@ -361,7 +369,7 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 	}
 	sendState := lc.claimForcedLogoutState()
 	lc.invalidateAccessToken()
-	line.InvalidateOBSTokenCache()
+	lc.obsTokenCache.Invalidate()
 	stateError := status.BridgeStateErrorCode("line-logged-out")
 	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
 	invalidSenderKey := line.IsInvalidSenderKey(err)
@@ -854,7 +862,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	}
 	lc.setTokens(accessToken, refreshToken)
 	lc.Mid = staged.Mid
-	line.InvalidateOBSTokenCache()
+	lc.obsTokenCache.Invalidate()
 	if mgr != nil {
 		lc.missingE2EEKeyMarked = false
 	}

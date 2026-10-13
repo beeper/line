@@ -11,26 +11,39 @@ import (
 	"time"
 )
 
-var (
-	obsTokenMu     sync.Mutex
-	obsTokenCache  string
-	obsTokenExpiry time.Time
-)
-
 const obsTokenBuffer = 30 * time.Second
 
 const defaultChannelTokenLifetime = 5 * time.Minute
 
-// InvalidateOBSTokenCache clears the cached OBS access token. The OBS token is
-// derived from the main LINE access token; when the latter is rotated (refresh
-// or re-login) any previously-issued OBS token is invalidated server-side, but
-// the cache here would keep handing it out until its original TTL expires.
-// Callers must invoke this after any successful re-authentication.
-func InvalidateOBSTokenCache() {
-	obsTokenMu.Lock()
-	obsTokenCache = ""
-	obsTokenExpiry = time.Time{}
-	obsTokenMu.Unlock()
+type OBSTokenCache struct {
+	mu     sync.Mutex
+	token  string
+	expiry time.Time
+}
+
+func (c *OBSTokenCache) get() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.token != "" && time.Now().Before(c.expiry) {
+		return c.token, true
+	}
+	return "", false
+}
+
+func (c *OBSTokenCache) set(token string, expiry time.Time) {
+	c.mu.Lock()
+	c.token = token
+	c.expiry = expiry
+	c.mu.Unlock()
+}
+
+// Invalidate clears the cached OBS access token. The OBS token is derived from
+// the main LINE access token; when the latter is rotated (refresh or re-login)
+// any previously-issued OBS token is invalidated server-side, but the cache
+// would keep handing it out until its original TTL expires. Callers must invoke
+// this after any successful re-authentication.
+func (c *OBSTokenCache) Invalidate() {
+	c.set("", time.Time{})
 }
 
 // LoginV2 performs the loginV2 RPC call to authenticate a user
@@ -691,13 +704,9 @@ func (c *Client) GetLastOpRevisionContext(ctx context.Context) (int64, error) {
 
 // this token is used to encrypt images, videos, and files uploaded to LINE's OBS storage
 func (c *Client) AcquireEncryptedAccessToken() (string, error) {
-	obsTokenMu.Lock()
-	if obsTokenCache != "" && time.Now().Before(obsTokenExpiry) {
-		cached := obsTokenCache
-		obsTokenMu.Unlock()
+	if cached, ok := c.OBSTokenCache.get(); ok {
 		return cached, nil
 	}
-	obsTokenMu.Unlock()
 
 	// 2 = FeatureType::OBS_Authorization.
 	resp, err := c.callRPC("TalkService", "acquireEncryptedAccessToken", 2)
@@ -726,10 +735,7 @@ func (c *Client) AcquireEncryptedAccessToken() (string, error) {
 
 	token := parts[1]
 	if expirySec, err := strconv.Atoi(parts[0]); err == nil && expirySec > 0 {
-		obsTokenMu.Lock()
-		obsTokenCache = token
-		obsTokenExpiry = time.Now().Add(time.Duration(expirySec)*time.Second - obsTokenBuffer)
-		obsTokenMu.Unlock()
+		c.OBSTokenCache.set(token, time.Now().Add(time.Duration(expirySec)*time.Second-obsTokenBuffer))
 	}
 
 	return token, nil

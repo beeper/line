@@ -42,10 +42,11 @@ var (
 )
 
 type Client struct {
-	LoginAttempt *LoginAttempt
-	HTTPClient   *http.Client
-	OBSClient    *http.Client
-	AccessToken  string
+	LoginAttempt  *LoginAttempt
+	HTTPClient    *http.Client
+	OBSClient     *http.Client
+	AccessToken   string
+	OBSTokenCache *OBSTokenCache
 
 	channelTokenMu    sync.Mutex
 	channelTokenCache map[string]cachedChannelAccessToken
@@ -84,9 +85,10 @@ type cachedChannelAccessToken struct {
 
 func NewClient(token string) *Client {
 	return &Client{
-		HTTPClient:  &http.Client{Timeout: rpcClientTimeout},
-		OBSClient:   &http.Client{},
-		AccessToken: token,
+		HTTPClient:    &http.Client{Timeout: rpcClientTimeout},
+		OBSClient:     &http.Client{},
+		AccessToken:   token,
+		OBSTokenCache: &OBSTokenCache{},
 	}
 }
 

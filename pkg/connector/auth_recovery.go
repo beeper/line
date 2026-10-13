@@ -113,7 +113,7 @@ func (lc *LineClient) recoverClientAfterAuthError(ctx context.Context, failedCli
 				Msg("Retrying LINE request after response from stale access token")
 		}
 		lc.recoverMu.Unlock()
-		return newLineAPIClient(currentToken), nil
+		return lc.newClientWithToken(currentToken), nil
 	}
 
 	if line.IsLoggedOut(err) {

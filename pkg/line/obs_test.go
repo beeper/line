@@ -16,20 +16,10 @@ type observedOBSRequest struct {
 	headers http.Header
 }
 
-func installCachedOBSToken(t *testing.T) {
-	t.Helper()
-	obsTokenMu.Lock()
-	oldToken := obsTokenCache
-	oldExpiry := obsTokenExpiry
-	obsTokenCache = "obs-token"
-	obsTokenExpiry = time.Now().Add(time.Hour)
-	obsTokenMu.Unlock()
-	t.Cleanup(func() {
-		obsTokenMu.Lock()
-		obsTokenCache = oldToken
-		obsTokenExpiry = oldExpiry
-		obsTokenMu.Unlock()
-	})
+func newClientWithCachedOBSToken(token string) *Client {
+	client := NewClient(token)
+	client.OBSTokenCache.set("obs-token", time.Now().Add(time.Hour))
+	return client
 }
 
 func obsResponse(status int, body string) *http.Response {
@@ -41,10 +31,8 @@ func obsResponse(status int, body string) *http.Response {
 }
 
 func TestDownloadOBSPlainMatchesChromeRequestFlow(t *testing.T) {
-	installCachedOBSToken(t)
-
 	var requests []observedOBSRequest
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests = append(requests, observedOBSRequest{
@@ -156,10 +144,8 @@ func TestDownloadOBSPublicResourceClassifiesMissingObject(t *testing.T) {
 }
 
 func TestDownloadOBSResourceUsesReceiveServiceAndSID(t *testing.T) {
-	installCachedOBSToken(t)
-
 	var requests []observedOBSRequest
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests = append(requests, observedOBSRequest{
@@ -200,10 +186,8 @@ func TestDownloadOBSResourceUsesReceiveServiceAndSID(t *testing.T) {
 }
 
 func TestDownloadOBSPreflightsBaseObjectBeforeTID(t *testing.T) {
-	installCachedOBSToken(t)
-
 	var requests []observedOBSRequest
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests = append(requests, observedOBSRequest{path: req.URL.Path, query: req.URL.RawQuery})
@@ -238,10 +222,8 @@ func TestDownloadOBSPreflightsBaseObjectBeforeTID(t *testing.T) {
 }
 
 func TestDownloadOBSEncryptedIncludesTalkMeta(t *testing.T) {
-	installCachedOBSToken(t)
-
 	var talkMetaHeaders []string
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			talkMetaHeaders = append(talkMetaHeaders, req.Header.Get("X-Talk-Meta"))
@@ -267,13 +249,12 @@ func TestDownloadOBSEncryptedIncludesTalkMeta(t *testing.T) {
 }
 
 func TestDownloadOBSWaitsForObjectEncoding(t *testing.T) {
-	installCachedOBSToken(t)
 	oldDelay := obsRetryDelay
 	obsRetryDelay = 0
 	t.Cleanup(func() { obsRetryDelay = oldDelay })
 
 	var paths []string
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			paths = append(paths, req.URL.Path)
@@ -306,9 +287,7 @@ func TestDownloadOBSWaitsForObjectEncoding(t *testing.T) {
 }
 
 func TestDownloadOBSClassifiesMissingObject(t *testing.T) {
-	installCachedOBSToken(t)
-
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return obsResponse(http.StatusOK, `{"status":"notexist"}`), nil
@@ -322,9 +301,7 @@ func TestDownloadOBSClassifiesMissingObject(t *testing.T) {
 }
 
 func TestDownloadOBSDoesNotCallObjectInfoHTTP404Expired(t *testing.T) {
-	installCachedOBSToken(t)
-
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return obsResponse(http.StatusNotFound, "not found"), nil
@@ -341,9 +318,7 @@ func TestDownloadOBSDoesNotCallObjectInfoHTTP404Expired(t *testing.T) {
 }
 
 func TestDownloadOBSClassifiesObjectInfoUnauthorized(t *testing.T) {
-	installCachedOBSToken(t)
-
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return obsResponse(http.StatusUnauthorized, "unauthorized"), nil
@@ -357,10 +332,8 @@ func TestDownloadOBSClassifiesObjectInfoUnauthorized(t *testing.T) {
 }
 
 func TestDownloadOBSDoesNotCallPostPreflight404Expired(t *testing.T) {
-	installCachedOBSToken(t)
-
 	var requests int
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests++
@@ -381,13 +354,12 @@ func TestDownloadOBSDoesNotCallPostPreflight404Expired(t *testing.T) {
 }
 
 func TestDownloadOBSClassifiesEncodingRetryExhaustion(t *testing.T) {
-	installCachedOBSToken(t)
 	oldDelay := obsRetryDelay
 	obsRetryDelay = 0
 	t.Cleanup(func() { obsRetryDelay = oldDelay })
 
 	var requests int
-	client := NewClient("line-token")
+	client := newClientWithCachedOBSToken("line-token")
 	client.OBSClient = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			requests++
