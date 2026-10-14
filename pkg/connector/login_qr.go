@@ -107,6 +107,9 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 	case err := <-lq.poll:
 		if err != nil {
 			lq.Cancel()
+			if line.IsQRLoginPollExpired(err) {
+				return nil, fmt.Errorf("%w: %w", ErrLoginVerificationFailed, err)
+			}
 			return nil, err
 		}
 	case <-lq.login.attemptCtx.Done():
