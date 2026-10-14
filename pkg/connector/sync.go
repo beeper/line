@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -161,8 +162,17 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, err
 	_, blockedRecommendationMIDs, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
 		return client.GetBlockedRecommendationIds()
 	})
+	meta, _ := lc.UserLogin.Metadata.(*UserLoginMetadata)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to refresh blocked recommendations, keeping last known recommendations")
+		if meta != nil {
+			blockedRecommendationMIDs = meta.BlockedRecommendationMIDs
+		}
+	} else if meta != nil {
+		meta.BlockedRecommendationMIDs = append([]string{}, blockedRecommendationMIDs...)
 	}
 	blockedMIDs = append(blockedMIDs, blockedRecommendationMIDs...)
 
@@ -180,6 +190,12 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, err
 	for mid := range metadataBlockedUsers {
 		previousBlockedUsers[mid] = true
 	}
+	if err != nil && (meta == nil || meta.BlockedRecommendationMIDs == nil) {
+		// Legacy snapshots do not distinguish friends from recommendations.
+		for mid := range previousBlockedUsers {
+			blockedUsers[mid] = true
+		}
+	}
 	var newlyUnblocked []string
 	for mid := range previousBlockedUsers {
 		if !blockedUsers[mid] {
@@ -190,8 +206,8 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, err
 	lc.cacheMu.Unlock()
 
 	lc.saveBlockedContacts(ctx, blockedUsers)
-	lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedMIDs)).Msg("Refreshed blocked contacts")
-	for _, mid := range blockedMIDs {
+	lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedUsers)).Msg("Refreshed blocked contacts")
+	for mid := range blockedUsers {
 		lc.queueUserBlocked(ctx, mid, true)
 	}
 	return newlyUnblocked, nil
@@ -235,6 +251,17 @@ func (lc *LineClient) saveBlockedContactsSnapshot(ctx context.Context) {
 	lc.cacheMu.Unlock()
 
 	lc.saveBlockedContacts(ctx, blockedUsers)
+}
+
+func (lc *LineClient) updateBlockedRecommendation(mid string, blocked bool) {
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok || meta.BlockedRecommendationMIDs == nil {
+		return
+	}
+	meta.BlockedRecommendationMIDs = slices.DeleteFunc(slices.Clone(meta.BlockedRecommendationMIDs), func(other string) bool { return other == mid })
+	if blocked {
+		meta.BlockedRecommendationMIDs = append(meta.BlockedRecommendationMIDs, mid)
+	}
 }
 
 func (lc *LineClient) syncDMChats(ctx context.Context) {
@@ -1850,6 +1877,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Lock()
 		lc.blockedUsers[mid] = true
 		lc.cacheMu.Unlock()
+		lc.updateBlockedRecommendation(mid, op.Param2 == "RECOMMEND")
 		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact blocked")
 		if !isChatMID(mid) {
@@ -1861,6 +1889,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Lock()
 		delete(lc.blockedUsers, mid)
 		lc.cacheMu.Unlock()
+		lc.updateBlockedRecommendation(mid, false)
 		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact unblocked")
 		// Reattach the DM portal and, when silent batch sending is available,

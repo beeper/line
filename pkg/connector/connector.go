@@ -141,6 +141,8 @@ type UserLoginMetadata struct {
 	ExportedKeyMap     map[string]string `json:"exported_key_map,omitempty"`
 	ForceFullE2EELogin bool              `json:"force_full_e2ee_login,omitempty"`
 	BlockedMIDs        []string          `json:"blocked_mids,omitempty"`
+
+	BlockedRecommendationMIDs []string `json:"blocked_recommendation_mids"`
 }
 
 func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
