@@ -1877,7 +1877,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Lock()
 		lc.blockedUsers[mid] = true
 		lc.cacheMu.Unlock()
-		lc.updateBlockedRecommendation(mid, op.Param2 == "RECOMMEND")
+		if op.Param2 == "RECOMMEND" {
+			lc.updateBlockedRecommendation(mid, true)
+		}
 		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact blocked")
 		if !isChatMID(mid) {
