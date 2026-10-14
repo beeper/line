@@ -1097,6 +1097,47 @@ func (c *Client) GetBlockedContactIds() ([]string, error) {
 	return wrapper.Data, nil
 }
 
+// GetBlockedRecommendationIds returns the MIDs of blocked users who aren't friends.
+func (c *Client) GetBlockedRecommendationIds() ([]string, error) {
+	resp, err := c.callRPC("TalkService", "getBlockedRecommendationIds")
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int      `json:"code"`
+		Message string   `json:"message"`
+		Data    []string `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse getBlockedRecommendationIds response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getBlockedRecommendationIds failed: %s", wrapper.Message)
+	}
+	return wrapper.Data, nil
+}
+
+func (c *Client) SetContactBlocked(ctx context.Context, reqSeq int64, mid string, blocked bool) error {
+	method, args := "unblockContact", []any{reqSeq, mid, ""}
+	if blocked {
+		method, args = "blockContact", []any{reqSeq, mid}
+	}
+	resp, err := c.callRPCContext(ctx, "TalkService", method, args...)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse %s response: %w", method, err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("%s failed: %s", method, resp)
+	}
+	return nil
+}
+
 // DetermineMediaMessageFlow asks the server which upload path to use for media
 // in a given chat. Flow value 2 = E2EE encrypted upload, 1 = plain upload.
 func (c *Client) DetermineMediaMessageFlow(chatMid string) (*MediaMessageFlowResponse, error) {

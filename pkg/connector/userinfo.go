@@ -45,8 +45,8 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 }
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
-	return &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_10_12",
+	caps := &event.RoomFeatures{
+		ID:               "dev.highest.matrix.line.capabilities.2026_10_14",
 		MaxTextLength:    5000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
@@ -141,6 +141,11 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			},
 		},
 	}
+	if portal != nil && portal.RoomType == database.RoomTypeDM && !lc.isOwnMID(string(portal.ID)) {
+		caps.ID += "+dm"
+		caps.BlockUser = true
+	}
+	return caps
 }
 
 func (lc *LineClient) IsThisUser(ctx context.Context, userID networkid.UserID) bool {
@@ -191,9 +196,10 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	dmType := database.RoomTypeDM
 	chatName := contact.EffectiveDisplayName()
 	return &bridgev2.ChatInfo{
-		Type:   &dmType,
-		Name:   &chatName,
-		Avatar: lc.avatarFromPicturePath(contact.PicturePath),
+		Type:        &dmType,
+		Name:        &chatName,
+		Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
+		UserBlocked: ptr.Ptr(lc.isUserBlocked(mid)),
 		Members: &bridgev2.ChatMemberList{
 			IsFull: true,
 			MemberMap: chatMemberMapFromList([]bridgev2.ChatMember{

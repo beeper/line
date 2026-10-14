@@ -158,6 +158,13 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, err
 	if err != nil {
 		return nil, err
 	}
+	_, blockedRecommendationMIDs, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
+		return client.GetBlockedRecommendationIds()
+	})
+	if err != nil {
+		return nil, err
+	}
+	blockedMIDs = append(blockedMIDs, blockedRecommendationMIDs...)
 
 	blockedUsers := make(map[string]bool, len(blockedMIDs))
 	for _, mid := range blockedMIDs {
@@ -184,6 +191,9 @@ func (lc *LineClient) refreshBlockedContacts(ctx context.Context) ([]string, err
 
 	lc.saveBlockedContacts(ctx, blockedUsers)
 	lc.UserLogin.Bridge.Log.Info().Int("count", len(blockedMIDs)).Msg("Refreshed blocked contacts")
+	for _, mid := range blockedMIDs {
+		lc.queueUserBlocked(ctx, mid, true)
+	}
 	return newlyUnblocked, nil
 }
 
@@ -250,8 +260,6 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
 			continue
 		}
-		// Skip DMs with blocked contacts so a fullSync doesn't recreate a portal
-		// we just deleted in response to OpBlockContact.
 		if lc.isUserBlocked(mid) {
 			continue
 		}
@@ -532,7 +540,7 @@ func (lc *LineClient) queueUnblockBackfillFallback(ctx context.Context, mid stri
 }
 
 func (lc *LineClient) queueUnblockedDMRestore(ctx context.Context, mid, reason string) {
-	if isChatMID(mid) {
+	if isChatMID(mid) || lc.queueUserBlocked(ctx, mid, false) {
 		return
 	}
 	capabilities := lc.UserLogin.Bridge.Matrix.GetCapabilities()
@@ -1844,22 +1852,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		lc.cacheMu.Unlock()
 		lc.saveBlockedContactsSnapshot(ctx)
 		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Msg("Contact blocked")
-		// Block operations should only carry user MIDs; skip if it looks like a group/room
-		// to avoid blast-radius deleting a group portal on an unexpected payload.
-		lowerMid := strings.ToLower(mid)
-		if strings.HasPrefix(lowerMid, "c") || strings.HasPrefix(lowerMid, "r") {
-			lc.UserLogin.Bridge.Log.Warn().Str("mid", mid).Msg("OpBlockContact carried non-user MID, skipping portal delete")
-			return
+		if !isChatMID(mid) {
+			lc.queueUserBlocked(ctx, mid, true)
 		}
-		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatDelete{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatDelete,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-			OnlyForMe: true,
-		})
 
 	case OpUnblockContact:
 		mid := op.Param1
