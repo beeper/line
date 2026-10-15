@@ -1,9 +1,11 @@
 package connector
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
+	"github.com/beeper/line/pkg/line"
 	"maunium.net/go/mautrix/bridgev2"
 )
 
@@ -53,6 +55,8 @@ func wrapLineLoginError(err error) error {
 		reason = details.ErrorMessage
 	}
 	switch {
+	case errors.Is(err, line.ErrLoginVerificationExpired):
+		mapped = ErrLoginVerificationFailed
 	case isBlockedUserLoginError(reason):
 		mapped = ErrLoginTooManyAttempts
 	case details.HTTPStatus == http.StatusTooManyRequests:

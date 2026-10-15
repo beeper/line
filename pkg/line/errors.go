@@ -12,9 +12,10 @@ import (
 )
 
 var (
-	ErrNoUsableE2EEPublicKey = errors.New("no usable E2EE public key")
-	ErrNoUsableE2EEGroupKey  = errors.New("no usable E2EE group key")
-	ErrGroupKeyNotFound      = errors.New("group key not found")
+	ErrLoginVerificationExpired = errors.New("LINE login verification expired")
+	ErrNoUsableE2EEPublicKey    = errors.New("no usable E2EE public key")
+	ErrNoUsableE2EEGroupKey     = errors.New("no usable E2EE group key")
+	ErrGroupKeyNotFound         = errors.New("group key not found")
 )
 
 type tokenRefreshError struct {
@@ -264,6 +265,19 @@ func loginPollingFailure(httpStatus int, body []byte) error {
 		Data    talkExceptionData `json:"data"`
 	}
 	decodeErr := json.Unmarshal(body, &response)
+	if decodeErr == nil && response.Code != nil && *response.Code == 10052 {
+		var httpError struct {
+			Data struct {
+				StatusCode int `json:"statusCode"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(body, &httpError) == nil && httpError.Data.StatusCode == http.StatusGone {
+			if httpStatus != http.StatusOK {
+				return fmt.Errorf("LF1 polling failed: API error %d: LINE response code 10052, status 410: %w", httpStatus, ErrLoginVerificationExpired)
+			}
+			return fmt.Errorf("LF1 polling failed: LINE response code 10052, status 410: %w", ErrLoginVerificationExpired)
+		}
+	}
 	details := "LINE response without a valid code"
 	if decodeErr == nil && response.Code != nil {
 		details = fmt.Sprintf("LINE response code %d", *response.Code)
