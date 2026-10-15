@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/beeper/line/pkg/line"
 	"maunium.net/go/mautrix/bridgev2"
+
+	"github.com/beeper/line/pkg/line"
 )
 
 // genericLoginFailureReason is shown in the login form when LINE rejects the sign-in but
