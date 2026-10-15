@@ -289,9 +289,12 @@ func (c *Client) waitForLoginJQ(verifier string) (*LoginResult, error) {
 	if wrapper.Data.Result.AuthPhase != "QRCODE_VERIFIED" {
 		return nil, fmt.Errorf("JQ polling: unexpected authPhase %q", wrapper.Data.Result.AuthPhase)
 	}
+	if wrapper.Data.Result.Verifier == "" {
+		return nil, errors.New("JQ polling returned an empty verifier")
+	}
 
 	log.Printf("[LINE] JQ poll verified, finalizing non-E2EE login")
-	res, err := c.LoginV2WithVerifier(verifier)
+	res, err := c.LoginV2WithVerifier(wrapper.Data.Result.Verifier)
 	if err != nil {
 		return nil, fmt.Errorf("non-E2EE login finalization failed: %w", err)
 	}
