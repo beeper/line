@@ -71,3 +71,23 @@ func TestGetProfileContextCancellation(t *testing.T) {
 		return err
 	})
 }
+
+func TestIdentifierLookupContextCancellation(t *testing.T) {
+	for name, call := range map[string]func(*Client, context.Context) error{
+		"findContactByUserid": func(c *Client, ctx context.Context) error {
+			_, err := c.FindContactByUseridContext(ctx, "carol")
+			return err
+		},
+		"getContactsV2": func(c *Client, ctx context.Context) error {
+			_, err := c.GetContactsV2Context(ctx, []string{"u0123456789abcdef0123456789abcdef"})
+			return err
+		},
+		"getBuddyProfile": func(c *Client, ctx context.Context) error {
+			_, err := c.GetBuddyProfileContext(ctx, "u0123456789abcdef0123456789abcdef")
+			return err
+		},
+		"getAllContactIds": func(c *Client, ctx context.Context) error { _, err := c.GetAllContactIdsContext(ctx); return err },
+	} {
+		t.Run(name, func(t *testing.T) { testRPCContextCancellation(t, name, call) })
+	}
+}
