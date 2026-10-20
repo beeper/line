@@ -2,6 +2,7 @@ package line
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -185,8 +186,16 @@ func TestGetSignatureEvictsSigningContexts(t *testing.T) {
 	}
 	r := newSigningTestRunner(t)
 	wantByToken := make(map[string]string)
-	for i := 0; i < 6000; i++ {
+	t.Cleanup(r.Close)
+	// Three complete rotations exercise initial fill, eviction and recreation
+	// of every token. Thousands of white-box key derivations test throughput,
+	// not additional cache states, and exceed the race suite's time budget.
+	for i := 0; i < 3*(signingCacheCapacity+2); i++ {
 		token := fmt.Sprintf("token-%d", i%(signingCacheCapacity+2))
+		var victim [sha256.Size]byte
+		if len(r.signingLRU) == signingCacheCapacity {
+			victim = r.signingLRU[0]
+		}
 		signature, err := r.GetSignature("/api/test", "{}", token)
 		if err != nil {
 			t.Fatalf("signature %d failed: %v", i+1, err)
@@ -196,9 +205,38 @@ func TestGetSignatureEvictsSigningContexts(t *testing.T) {
 		} else if signature != want {
 			t.Fatalf("signature for %q changed: got %q want %q", token, signature, want)
 		}
+		if got := len(r.signingContexts); got != min(i+1, signingCacheCapacity) {
+			t.Fatalf("signature %d: cache size %d", i+1, got)
+		}
+		if len(r.signingLRU) != len(r.signingContexts) {
+			t.Fatal("LRU and context map sizes differ")
+		}
+		if _, retained := r.signingContexts[victim]; retained {
+			t.Fatal("least recently used signing context was not evicted")
+		}
+		key := sha256.Sum256([]byte(token))
+		if r.signingLRU[len(r.signingLRU)-1] != key {
+			t.Fatal("new signing context is not most recently used")
+		}
 	}
 	if got := len(r.signingContexts); got != signingCacheCapacity {
 		t.Fatalf("unexpected signing cache size: got %d want %d", got, signingCacheCapacity)
+	}
+	// Exercise the refresh boundary with a populated, churned cache without
+	// deriving thousands of keys just to advance the successful-call counter.
+	oldRuntime := r.signingRT
+	r.signingCalls = signingRefreshCalls - 1
+	for i := 0; i < 2; i++ {
+		got, err := r.GetSignature("/api/test", "{}", "token-5")
+		if err != nil || got != wantByToken["token-5"] {
+			t.Fatalf("signature across refresh = %q, %v", got, err)
+		}
+		if (r.signingRT != oldRuntime) != (i == 1) {
+			t.Fatal("signing runtime refreshed at the wrong call boundary")
+		}
+	}
+	if len(r.signingContexts) != 1 || len(r.signingLRU) != 1 {
+		t.Fatal("refresh retained stale signing contexts")
 	}
 }
 
