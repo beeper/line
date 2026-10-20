@@ -730,6 +730,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	// deliver messages. Otherwise an existing LINE group whose Matrix room
 	// doesn't exist yet may be created by the first message, which makes the
 	// sender's existing membership look like a fresh join.
+	lc.UserLogin.Bridge.Log.Info().Str("sync_trigger", "connect").Msg("Starting LINE conversation synchronization")
 	lc.syncChatsNow(ctx)
 	if ctx.Err() != nil {
 		return
