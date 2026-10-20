@@ -92,6 +92,16 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 // LINE's E2EE file format: [encrypted_data][32-byte HMAC]
 // The keyMaterial is derived using HKDF to get encKey (32), macKey (32), and nonce (12 bytes)
 func (lc *LineClient) decryptImageData(encryptedData []byte, keyMaterialB64 string) ([]byte, error) {
+	return lc.decryptMediaData(encryptedData, keyMaterialB64, func(ciphertext []byte) []byte {
+		return ciphertext
+	})
+}
+
+func (lc *LineClient) decryptVideoData(encryptedData []byte, keyMaterialB64 string) ([]byte, error) {
+	return lc.decryptMediaData(encryptedData, keyMaterialB64, generateChunkHashes)
+}
+
+func (lc *LineClient) decryptMediaData(encryptedData []byte, keyMaterialB64 string, macInput func([]byte) []byte) ([]byte, error) {
 	keyMaterial, err := base64.StdEncoding.DecodeString(keyMaterialB64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode key material: %w", err)
@@ -106,7 +116,7 @@ func (lc *LineClient) decryptImageData(encryptedData []byte, keyMaterialB64 stri
 	}
 
 	encKey := derived[0:32]
-	// macKey := derived[32:64] // for HMAC verification
+	macKey := derived[32:64]
 	nonce := derived[64:76]
 
 	// Create 16-byte counter: nonce(12 bytes) + zero counter(4 bytes)
@@ -117,7 +127,14 @@ func (lc *LineClient) decryptImageData(encryptedData []byte, keyMaterialB64 stri
 	if len(encryptedData) < 32 {
 		return nil, fmt.Errorf("encrypted data too short (< 32 bytes for HMAC)")
 	}
-	encryptedData = encryptedData[:len(encryptedData)-32]
+	ciphertext := encryptedData[:len(encryptedData)-32]
+	receivedMAC := encryptedData[len(encryptedData)-32:]
+
+	h := hmac.New(sha256.New, macKey)
+	h.Write(macInput(ciphertext))
+	if !hmac.Equal(receivedMAC, h.Sum(nil)) {
+		return nil, fmt.Errorf("media HMAC verification failed")
+	}
 
 	block, err := aes.NewCipher(encKey)
 	if err != nil {
@@ -126,8 +143,8 @@ func (lc *LineClient) decryptImageData(encryptedData []byte, keyMaterialB64 stri
 
 	stream := cipher.NewCTR(block, counter)
 
-	decrypted := make([]byte, len(encryptedData))
-	stream.XORKeyStream(decrypted, encryptedData)
+	decrypted := make([]byte, len(ciphertext))
+	stream.XORKeyStream(decrypted, ciphertext)
 
 	return decrypted, nil
 }
