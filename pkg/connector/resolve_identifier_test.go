@@ -39,6 +39,8 @@ type resolutionMatrix struct {
 	mu         sync.Mutex
 	created    int
 	failCreate bool
+	ownerLeft  bool
+	deleted    int
 }
 
 func (*resolutionMatrix) Init(*bridgev2.Bridge) {}
@@ -53,8 +55,14 @@ func (*resolutionMatrix) GetCapabilities() *bridgev2.MatrixCapabilities {
 }
 func (*resolutionMatrix) ParseGhostMXID(id.UserID) (networkid.UserID, bool)         { return "", false }
 func (*resolutionMatrix) GenerateDeterministicRoomID(networkid.PortalKey) id.RoomID { return "" }
-func (*resolutionMatrix) GetMembers(context.Context, id.RoomID) (map[id.UserID]*event.MemberEventContent, error) {
-	return map[id.UserID]*event.MemberEventContent{"@owner:example.com": {Membership: event.MembershipJoin}}, nil
+func (m *resolutionMatrix) GetMembers(context.Context, id.RoomID) (map[id.UserID]*event.MemberEventContent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	membership := event.MembershipJoin
+	if m.ownerLeft {
+		membership = event.MembershipLeave
+	}
+	return map[id.UserID]*event.MemberEventContent{"@owner:example.com": {Membership: membership}}, nil
 }
 
 type resolutionIntent struct {
@@ -83,6 +91,13 @@ func (i *resolutionIntent) CreateRoom(ctx context.Context, req *mautrix.ReqCreat
 	}
 	i.matrix.created++
 	return id.RoomID(fmt.Sprintf("!created%d:example.com", i.matrix.created)), nil
+}
+
+func (i *resolutionIntent) DeleteRoom(context.Context, id.RoomID, bool) error {
+	i.matrix.mu.Lock()
+	defer i.matrix.mu.Unlock()
+	i.matrix.deleted++
+	return nil
 }
 
 func newResolutionClient(t *testing.T, transport resolutionTransport) *LineClient {
@@ -317,6 +332,24 @@ func TestResolveIdentifierCancellation(t *testing.T) {
 	assertPortalCount(t, lc, 0)
 }
 
+func TestResolveIdentifierDeadlineAndMismatchedMID(t *testing.T) {
+	lc := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(req.URL.Path, "/getContactsV2") {
+			return nil, fmt.Errorf("unexpected endpoint: %s", req.URL.Path)
+		}
+		return resolutionResponse(`{"code":0,"data":{"contacts":{"` + resolutionMID + `":{"contact":{"mid":"u22222222222222222222222222222222","displayName":"Wrong recipient"}}}}}`), nil
+	})
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if resp, err := lc.ResolveIdentifier(ctx, resolutionMID, true); resp != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired lookup: %+v %v", resp, err)
+	}
+	if resp, err := lc.ResolveIdentifier(context.Background(), resolutionMID, true); resp != nil || err == nil {
+		t.Fatalf("mismatched MID accepted: %+v %v", resp, err)
+	}
+	assertPortalCount(t, lc, 0)
+}
+
 func TestResolveIdentifierConcurrentCanonicalPortalReuse(t *testing.T) {
 	lc := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(req.URL.Path, "/findContactByUserid") {
@@ -409,6 +442,16 @@ func TestStartChatCreatesReusesAndRetriesRoom(t *testing.T) {
 	}
 	if matrix.created != 1 {
 		t.Fatalf("created %d rooms", matrix.created)
+	}
+	assertPortalCount(t, lc, 1)
+	oldRoomID := created.DMRoomID
+	matrix.ownerLeft = true
+	reopened, err := provisionutil.ResolveIdentifier(ctx, lc.UserLogin, "carol.id", true)
+	if err != nil || reopened.DMRoomID == oldRoomID || reopened.DMRoomID == "" {
+		t.Fatalf("reopen after leaving: %+v %v", reopened, err)
+	}
+	if matrix.created != 2 || matrix.deleted != 1 {
+		t.Fatalf("create/delete counts = %d/%d", matrix.created, matrix.deleted)
 	}
 	assertPortalCount(t, lc, 1)
 }
