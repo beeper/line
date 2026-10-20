@@ -768,6 +768,7 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	// a hidden resync so a truncated recent-message window cannot leave a room
 	// at an old membership or name.
 	if backfilledSystemEvents.Load() && ctx.Err() == nil {
+		lc.UserLogin.Bridge.Log.Debug().Str("sync_trigger", "backfill_state_restore").Msg("Starting LINE conversation synchronization")
 		lc.syncChatsNow(ctx)
 	}
 }
@@ -1646,7 +1647,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 
 		// handle fullsync requests
 		if eventType == "fullSync" {
-			lc.UserLogin.Bridge.Log.Info().Msg("Received fullSync request")
+			lc.UserLogin.Bridge.Log.Info().Str("sync_trigger", "line_full_sync").Msg("Received fullSync request")
 
 			var fsPayload struct {
 				NextRevision string `json:"nextRevision"`
