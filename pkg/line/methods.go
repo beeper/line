@@ -391,7 +391,11 @@ func (c *Client) GetE2EEPublicKey(mid string, keyVersion, keyID int) (*E2EEPubli
 }
 
 func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
-	resp, err := c.callRPC("TalkService", "sendMessage", reqSeq, msg)
+	return c.SendMessageContext(c.requestContext(), reqSeq, msg)
+}
+
+func (c *Client) SendMessageContext(ctx context.Context, reqSeq int64, msg *Message) (*Message, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "sendMessage", reqSeq, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -404,7 +408,12 @@ func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
 		return nil, err
 	}
 	if wrapper.Code != 0 {
-		return nil, fmt.Errorf("sendMessage failed: %s", wrapper.Message)
+		// Keep TalkException codes available to auth recovery and send retries,
+		// including when LINE wraps an error in an HTTP 200 response.
+		return nil, fmt.Errorf("sendMessage failed: %s", resp)
+	}
+	if wrapper.Data == nil || wrapper.Data.ID == "" {
+		return nil, fmt.Errorf("sendMessage returned no message acknowledgement")
 	}
 	return wrapper.Data, nil
 }

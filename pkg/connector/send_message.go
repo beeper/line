@@ -64,6 +64,14 @@ func lineGroupE2EEFetchFailureError(err error) error {
 }
 
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
+	logContext := lc.UserLogin.Bridge.Log.With().
+		Str("line_login_id", string(lc.UserLogin.ID)).
+		Str("line_recipient", string(msg.Portal.ID))
+	if msg.Event != nil {
+		logContext = logContext.Stringer("matrix_event_id", msg.Event.ID).Stringer("matrix_sender", msg.Event.Sender)
+	}
+	log := logContext.Logger()
+	log.Debug().Msg("Handling outbound Matrix message for LINE")
 	if err := lc.checkLineCall(ctx); err != nil {
 		return nil, err
 	}
@@ -83,8 +91,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		var err error
 		var sentMsg *line.Message
 		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
-			return client.SendMessage(int64(reqSeq), lineMsg)
+			return client.SendMessageContext(ctx, int64(reqSeq), lineMsg)
 		})
+		resultLog := log.Debug().Bool("success", err == nil)
+		if sentMsg != nil {
+			resultLog = resultLog.Str("line_message_id", sentMsg.ID)
+		}
+		resultLog.Msg("Finished LINE API send attempt")
 		return sentMsg, err
 	}
 	portalMid := string(msg.Portal.ID)
