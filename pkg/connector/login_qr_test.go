@@ -191,3 +191,13 @@ func TestQRStartPreservesDeadline(t *testing.T) {
 		t.Fatalf("start after deadline = %+v, %v; want DeadlineExceeded", step, err)
 	}
 }
+
+func TestQRPasswordlessReconnectNeedsApproval(t *testing.T) {
+	lc := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("unexpected passwordless authentication request: %s", req.URL.Path)
+	})
+	lc.UserLogin.Bridge.Network.(*LineConnector).Config.QRLogin = true
+	if err := lc.tryLogin(context.Background()); !errors.Is(err, errLineQRLoginRequired) {
+		t.Fatalf("passwordless QR session must request fresh approval: %v", err)
+	}
+}
