@@ -46,44 +46,46 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	input, err := os.CreateTemp("", "line-image-*.heic")
+	dir, err := os.MkdirTemp("", "line-heic-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary HEIC file: %w", err)
+		return nil, fmt.Errorf("failed to create temporary HEIC directory: %w", err)
 	}
-	inputPath := input.Name()
-	defer os.Remove(inputPath)
+	defer os.RemoveAll(dir)
 
-	if _, err = input.Write(imageData); err != nil {
-		input.Close()
+	inputPath := filepath.Join(dir, "input.heic")
+	outputPath := filepath.Join(dir, "output.jpg")
+	if err = os.WriteFile(inputPath, imageData, 0o600); err != nil {
 		return nil, fmt.Errorf("failed to write temporary HEIC file: %w", err)
 	}
-	if err = input.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close temporary HEIC file: %w", err)
-	}
 
-	var output bytes.Buffer
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-hide_banner", "-loglevel", "error",
-		"-i", inputPath,
-		"-frames:v", "1", "-q:v", "2",
-		"-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
-	)
-	cmd.Stdout = &output
-	err = cmd.Run()
-	if err != nil {
+	// iPhone photos are HEIF grids of tiles. The ffmpeg CLI only decodes the
+	// first tile, while libheif assembles the full image.
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "heif-dec", "--quiet", inputPath, outputPath)
+	cmd.Stderr = &stderr
+	if err = cmd.Run(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, fmt.Errorf("ffmpeg failed: %w", ctxErr)
+			return nil, fmt.Errorf("heif-dec failed: %w", ctxErr)
 		}
-		return nil, fmt.Errorf("ffmpeg failed: %w", err)
+		return nil, fmt.Errorf("heif-dec failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
-	jpegData := output.Bytes()
+	// heif-dec writes output-1.jpg, output-2.jpg, ... instead of output.jpg
+	// when the file holds several top-level images. Use the first one.
+	outputs, err := filepath.Glob(filepath.Join(dir, "output*.jpg"))
+	if err != nil || len(outputs) == 0 {
+		return nil, fmt.Errorf("heif-dec produced no output")
+	}
+	jpegData, err := os.ReadFile(outputs[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to read converted JPEG: %w", err)
+	}
 	config, format, err := image.DecodeConfig(bytes.NewReader(jpegData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate converted JPEG: %w", err)
 	}
 	if format != "jpeg" || config.Width <= 0 || config.Height <= 0 {
-		return nil, fmt.Errorf("ffmpeg produced invalid JPEG output")
+		return nil, fmt.Errorf("heif-dec produced invalid JPEG output")
 	}
 	return jpegData, nil
 }
