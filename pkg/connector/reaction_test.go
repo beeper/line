@@ -632,7 +632,7 @@ func TestUnsupportedMatrixReactionError(t *testing.T) {
 }
 
 func TestReactionNotAMemberError(t *testing.T) {
-	err := reactionNotAMemberError()
+	err := wrapSendError(errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":10,"reason":"not a member"}}`))
 	var status bridgev2.MessageStatus
 	if !errors.As(err, &status) {
 		t.Fatalf("error %T does not wrap bridgev2.MessageStatus", err)
@@ -643,8 +643,8 @@ func TestReactionNotAMemberError(t *testing.T) {
 	if status.ErrorReason != event.MessageStatusNoPermission {
 		t.Fatalf("ErrorReason = %q, want %q", status.ErrorReason, event.MessageStatusNoPermission)
 	}
-	if !status.IsCertain || !status.ErrorAsMessage {
-		t.Fatalf("status certainty/message flags = %v/%v, want true/true", status.IsCertain, status.ErrorAsMessage)
+	if !status.IsCertain || status.Message == "" {
+		t.Fatalf("status certainty/message = %v/%q, want true and a message", status.IsCertain, status.Message)
 	}
 }
 

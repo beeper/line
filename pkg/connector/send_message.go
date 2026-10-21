@@ -59,7 +59,7 @@ func lineGroupE2EEFetchFailureError(err error) error {
 	if errStatus := lineGroupE2EEReconnectRequiredError(err); errStatus != nil {
 		return errStatus
 	}
-	return err
+	return wrapSendError(err)
 }
 
 func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
@@ -94,10 +94,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	// Block sends to blocked contacts in DMs.
 	if !isGroup && lc.isUserBlocked(portalMid) {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("user is blocked on LINE: unblock them to send messages")).
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusGenericError)
+		return nil, errBlockedContact
 	}
 
 	// Determine whether we need to send as plain text (peer/group has Letter Sealing off).
@@ -115,7 +112,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if errPeer != nil && line.IsNoUsableE2EEPublicKey(errPeer) {
 			plainText = true
 		} else if errPeer != nil {
-			return nil, fmt.Errorf("failed to get peer key: %w", errPeer)
+			return nil, wrapSendError(fmt.Errorf("failed to get peer key: %w", errPeer))
 		}
 	}
 
@@ -183,14 +180,14 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		} else {
 			payload, err = json.Marshal(map[string]string{"text": msg.Content.Body})
 			if err != nil {
-				return nil, fmt.Errorf("failed to marshal text payload: %w", err)
+				return nil, wrapConvertError(fmt.Errorf("failed to marshal text payload: %w", err))
 			}
 		}
 
 	case event.MsgImage:
 		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download media from matrix: %w", err)
+			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
 
 		mimeType := msg.Content.Info.MimeType
@@ -198,7 +195,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if isHEICImage(mimeType, fileName) {
 			data, err = convertHEICToJPEG(ctx, data)
 			if err != nil {
-				return nil, fmt.Errorf("failed to convert HEIC image to JPEG: %w", err)
+				return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaConvertFailed, err)
 			}
 			mimeType = "image/jpeg"
 			fileName = jpegFileName(fileName)
@@ -264,14 +261,14 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			uploadData, keyMaterialB64, err := lc.encryptFileData(data)
 			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt image data: %w", err)
+				return nil, wrapConvertError(fmt.Errorf("failed to encrypt image data: %w", err))
 			}
 
 			oid, err := callLineString(func(client *line.Client) (string, error) {
 				return client.UploadOBS(uploadData)
 			})
 			if err != nil {
-				return nil, fmt.Errorf("failed to upload image to OBS: %w", err)
+				return nil, wrapMediaUploadError(fmt.Errorf("failed to upload image to OBS: %w", err))
 			}
 
 			thumbnailData, thumbWidth, thumbHeight, err := generateThumbnail(data)
@@ -333,7 +330,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	case event.MsgFile:
 		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download file from matrix: %w", err)
+			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
 
 		contentType = int(ContentFile)
@@ -365,14 +362,14 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			uploadData, keyMaterialB64, err := lc.encryptFileData(data)
 			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt file data: %w", err)
+				return nil, wrapConvertError(fmt.Errorf("failed to encrypt file data: %w", err))
 			}
 
 			oid, err := callLineString(func(client *line.Client) (string, error) {
 				return client.UploadOBSWithSID(uploadData, "emf")
 			})
 			if err != nil {
-				return nil, fmt.Errorf("failed to upload file to OBS: %w", err)
+				return nil, wrapMediaUploadError(fmt.Errorf("failed to upload file to OBS: %w", err))
 			}
 
 			contentMetadata["OID"] = oid
@@ -398,7 +395,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	case event.MsgVideo:
 		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download video from matrix: %w", err)
+			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
 
 		contentType = int(ContentVideo)
@@ -448,14 +445,14 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			uploadData, keyMaterialB64, err := lc.encryptVideoData(data)
 			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt video data: %w", err)
+				return nil, wrapConvertError(fmt.Errorf("failed to encrypt video data: %w", err))
 			}
 
 			oid, err := callLineString(func(client *line.Client) (string, error) {
 				return client.UploadOBSWithSID(uploadData, "emv")
 			})
 			if err != nil {
-				return nil, fmt.Errorf("failed to upload video to OBS: %w", err)
+				return nil, wrapMediaUploadError(fmt.Errorf("failed to upload video to OBS: %w", err))
 			}
 
 			chunkHashes := generateChunkHashes(uploadData[:len(uploadData)-32])
@@ -529,7 +526,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	case event.MsgAudio:
 		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download audio from matrix: %w", err)
+			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
 
 		contentType = int(ContentAudio)
@@ -550,14 +547,14 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			uploadData, keyMaterialB64, err := lc.encryptFileData(data)
 			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt audio data: %w", err)
+				return nil, wrapConvertError(fmt.Errorf("failed to encrypt audio data: %w", err))
 			}
 
 			oid, err := callLineString(func(client *line.Client) (string, error) {
 				return client.UploadOBSWithSID(uploadData, "ema")
 			})
 			if err != nil {
-				return nil, fmt.Errorf("failed to upload audio to OBS: %w", err)
+				return nil, wrapMediaUploadError(fmt.Errorf("failed to upload audio to OBS: %w", err))
 			}
 
 			contentMetadata["OID"] = oid
@@ -574,7 +571,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	default:
-		return nil, fmt.Errorf("message type %s not implemented", effectiveMsgType)
+		return nil, fmt.Errorf("%w %s", bridgev2.ErrUnsupportedMessageType, effectiveMsgType)
 	}
 
 	// Process mentions — set MENTION content metadata for LINE notification
@@ -652,18 +649,18 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			// 1-1 Encryption (peer key already fetched above)
 			myRaw, myKeyID, errKey := lc.E2EE.MyKeyIDs()
 			if errKey != nil {
-				return nil, fmt.Errorf("missing own E2EE key: %w", errKey)
+				return nil, wrapConvertError(fmt.Errorf("missing own E2EE key: %w", errKey))
 			}
 			peerRaw, peerPub, errPeer := lc.ensurePeerKey(ctx, portalMid)
 			if errPeer != nil {
-				return nil, fmt.Errorf("failed to get peer key: %w", errPeer)
+				return nil, wrapSendError(fmt.Errorf("failed to get peer key: %w", errPeer))
 			}
 
 			chunks, err = lc.E2EE.EncryptMessageV2Raw(portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, payload)
 		}
 
 		if err != nil {
-			return nil, fmt.Errorf("encrypt failed: %w", err)
+			return nil, wrapConvertError(fmt.Errorf("encrypt failed: %w", err))
 		}
 	}
 
@@ -722,7 +719,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 		zipData, zipErr := wrapInZip(rawFileName, rawFileData)
 		if zipErr != nil {
-			return nil, fmt.Errorf("failed to wrap file in zip: %w", zipErr)
+			return nil, wrapConvertError(fmt.Errorf("failed to wrap file in zip: %w", zipErr))
 		}
 		zipFileName := rawFileName + ".zip"
 
@@ -736,13 +733,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			// Re-encrypt and re-upload the zipped data
 			uploadData, keyMaterialB64, encErr := lc.encryptFileData(zipData)
 			if encErr != nil {
-				return nil, fmt.Errorf("failed to encrypt zipped file: %w", encErr)
+				return nil, wrapConvertError(fmt.Errorf("failed to encrypt zipped file: %w", encErr))
 			}
 			oid, uploadErr := callLineString(func(client *line.Client) (string, error) {
 				return client.UploadOBSWithSID(uploadData, "emf")
 			})
 			if uploadErr != nil {
-				return nil, fmt.Errorf("failed to upload zipped file to OBS: %w", uploadErr)
+				return nil, wrapMediaUploadError(fmt.Errorf("failed to upload zipped file to OBS: %w", uploadErr))
 			}
 			contentMetadata["OID"] = oid
 			contentMetadata["ENC_KM"] = keyMaterialB64
@@ -767,16 +764,16 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			} else {
 				myRaw, myKeyID, errKey := lc.E2EE.MyKeyIDs()
 				if errKey != nil {
-					return nil, fmt.Errorf("missing own E2EE key for zip retry: %w", errKey)
+					return nil, wrapConvertError(fmt.Errorf("missing own E2EE key for zip retry: %w", errKey))
 				}
 				peerRaw, peerPub, errPeer := lc.ensurePeerKey(ctx, portalMid)
 				if errPeer != nil {
-					return nil, fmt.Errorf("failed to get peer key for zip retry: %w", errPeer)
+					return nil, wrapSendError(fmt.Errorf("failed to get peer key for zip retry: %w", errPeer))
 				}
 				chunks, err = lc.E2EE.EncryptMessageV2Raw(portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, zipPayload)
 			}
 			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt zipped file message: %w", err)
+				return nil, wrapConvertError(fmt.Errorf("failed to encrypt zipped file message: %w", err))
 			}
 			lineMsg.Chunks = chunks
 		}
@@ -834,7 +831,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	if err != nil {
-		return nil, err
+		return nil, wrapSendError(err)
 	}
 
 	// For plain media: upload media to r/talk/m/{serverMessageId} after sending
@@ -852,7 +849,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if err := callLineErr(func(client *line.Client) error {
 			return client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType)
 		}); err != nil {
-			return nil, fmt.Errorf("failed to upload plain media to OBS: %w", err)
+			return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("failed to upload plain media to OBS: %w", err)).
+				WithIsCertain(false).
+				WithSendNotice(true).
+				WithStatus(event.MessageStatusFail).
+				WithMessage("the message was sent to LINE, but the attachment failed to upload")
 		}
 		lc.UserLogin.Bridge.Log.Info().
 			Str("message_id", sentMsg.ID).
@@ -935,13 +936,22 @@ func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridge
 		return client.UnsendMessage(int64(reqSeq), string(msg.TargetMessage.ID))
 	})
 	if err != nil && strings.Contains(err.Error(), "message too old") {
-		return bridgev2.WrapErrorInStatus(fmt.Errorf("message too old to unsend on LINE (24h limit)")).
+		return bridgev2.WrapErrorInStatus(fmt.Errorf("message too old to unsend on LINE (24h limit): %w", err)).
 			WithStatus(event.MessageStatusFail).
 			WithErrorReason(event.MessageStatusTooOld).
 			WithIsCertain(true).
-			WithSendNotice(true)
+			WithSendNotice(true).
+			WithMessage("messages can only be unsent on LINE within 24 hours")
 	}
-	return err
+	if line.IsTalkExceptionNotFound(err) {
+		return bridgev2.WrapErrorInStatus(err).
+			WithStatus(event.MessageStatusFail).
+			WithErrorReason(event.MessageStatusUnsupported).
+			WithIsCertain(true).
+			WithSendNotice(true).
+			WithMessage("the message was not found on LINE")
+	}
+	return wrapSendError(err)
 }
 
 func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev2.Portal) error {
@@ -955,7 +965,7 @@ func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev
 		_, err := lc.callLine(ctx, func(client *line.Client) error {
 			return client.RejectChatInvitation(int64(reqSeq), string(portal.ID))
 		})
-		return err
+		return wrapSendError(err)
 	}
 
 	lc.trackReqSeq(reqSeq)
@@ -963,7 +973,7 @@ func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
 		return client.SendChatRemoved(int64(reqSeq), string(portal.ID), "0", 0)
 	})
-	return err
+	return wrapSendError(err)
 }
 
 // Compile-time assertion that LineClient handles Beeper message-request acceptance.
@@ -976,7 +986,7 @@ func (lc *LineClient) HandleMatrixAcceptMessageRequest(ctx context.Context, msg 
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
 		return client.AcceptChatInvitation(reqSeq, string(msg.Portal.ID))
 	})
-	return err
+	return wrapSendError(err)
 }
 
 func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedBody string, mentions *event.Mentions) map[string]string {

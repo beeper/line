@@ -39,7 +39,7 @@ func (lc *LineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCre
 		return client.CreateChat(participantMids, lineName, chatType)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create LINE chat: %w", err)
+		return nil, wrapLineRespError(fmt.Errorf("failed to create LINE chat: %w", err))
 	}
 
 	lc.UserLogin.Bridge.Log.Info().

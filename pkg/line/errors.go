@@ -18,6 +18,40 @@ var (
 	ErrGroupKeyNotFound         = errors.New("group key not found")
 )
 
+// HTTPError is returned when a LINE endpoint answers with an unexpected HTTP status.
+type HTTPError struct {
+	StatusCode int
+	text       string
+}
+
+func newHTTPError(statusCode int, format string, args ...any) *HTTPError {
+	return &HTTPError{StatusCode: statusCode, text: fmt.Sprintf(format, args...)}
+}
+
+func (e *HTTPError) Error() string {
+	return e.text
+}
+
+// HTTPStatusCode returns the HTTP status of a failed LINE request, or 0 if the
+// request didn't get an HTTP response.
+func HTTPStatusCode(err error) int {
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode
+	}
+	return 0
+}
+
+// IsTalkException returns true when LINE rejected a Talk API call with a
+// TalkException response.
+func IsTalkException(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return hasResponseErrorCode(msg) && strings.Contains(msg, "talkexception")
+}
+
 type tokenRefreshError struct {
 	code             int
 	loggedOut        bool

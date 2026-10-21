@@ -26,7 +26,7 @@ func (lc *LineClient) HandleMatrixBlockUser(ctx context.Context, msg *bridgev2.M
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
 		return client.SetContactBlocked(ctx, int64(reqSeq), mid, msg.Content.Block)
 	})
-	return err
+	return wrapSendError(err)
 }
 
 func (lc *LineClient) queueUserBlocked(ctx context.Context, mid string, blocked bool) bool {

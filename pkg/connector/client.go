@@ -26,6 +26,14 @@ var (
 	errLineQRLoginRequired    = errors.New("LINE requires a new QR scan. Reconnect in Beeper to continue")
 )
 
+func init() {
+	status.BridgeStateHumanErrors.Update(status.BridgeStateErrorMap{
+		"line-login-failed":     "LINE could not sign you in. Sign in again.",
+		"line-token-expired":    "Your LINE session expired and could not be restored. Sign in again.",
+		"line-sse-disconnected": "Disconnected from LINE, reconnecting",
+	})
+}
+
 const lineMissingE2EEKeyMessage = "LINE encryption keys are unavailable. Reconnect LINE in Beeper to restore message decryption."
 
 var newLineAPIClient = line.NewClient
@@ -419,6 +427,20 @@ func (lc *LineClient) sendConnectedStateIfCurrent(ctx context.Context) bool {
 	return true
 }
 
+func (lc *LineClient) sendSSEDisconnectedIfCurrent(ctx context.Context, err error) bool {
+	lc.recoverMu.Lock()
+	defer lc.recoverMu.Unlock()
+	if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || lc.UserLogin.BridgeState == nil {
+		return false
+	}
+	lc.UserLogin.BridgeState.Send(status.BridgeState{
+		StateEvent: status.StateTransientDisconnect,
+		Error:      "line-sse-disconnected",
+		Info:       map[string]any{"go_error": err.Error()},
+	})
+	return true
+}
+
 func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
 	if lc.UserLogin == nil || lc.UserLogin.UserLogin == nil {
 		return
@@ -603,7 +625,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 			lc.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      "line-login-failed",
-				Message:    err.Error(),
+				Info:       map[string]any{"go_error": err.Error()},
 				UserAction: status.UserActionRelogin,
 			})
 			return
@@ -622,7 +644,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		lc.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      "line-token-expired",
-			Message:    fmt.Sprintf("session expired and could not be restored: %v", err),
+			Info:       map[string]any{"go_error": err.Error()},
 			UserAction: status.UserActionRelogin,
 		})
 		return

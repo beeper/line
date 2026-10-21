@@ -607,14 +607,6 @@ func invalidReactionTargetError(messageID string) error {
 		WithErrorReason(event.MessageStatusUnsupported)
 }
 
-func reactionNotAMemberError() error {
-	return bridgev2.WrapErrorInStatus(fmt.Errorf("LINE says this account is not a member of the chat")).
-		WithStatus(event.MessageStatusFail).
-		WithIsCertain(true).
-		WithErrorAsMessage().
-		WithErrorReason(event.MessageStatusNoPermission)
-}
-
 func parseReactionTargetMessageID(messageID networkid.MessageID) (string, error) {
 	raw := string(messageID)
 	if raw == "" || strings.HasPrefix(raw, "local-") || strings.HasPrefix(raw, "$") {
@@ -737,10 +729,7 @@ func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Ma
 		if line.IsInvalidPaidReactionType(err) {
 			return nil, unsupportedMatrixReactionError(key)
 		}
-		if line.IsNotAMemberError(err) {
-			return nil, reactionNotAMemberError()
-		}
-		return nil, err
+		return nil, wrapSendError(err)
 	}
 
 	return &database.Reaction{
@@ -762,8 +751,5 @@ func (lc *LineClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridg
 	_, err = lc.callLine(ctx, func(client *line.Client) error {
 		return client.CancelReaction(int64(reqSeq), targetID)
 	})
-	if line.IsNotAMemberError(err) {
-		return reactionNotAMemberError()
-	}
-	return err
+	return wrapSendError(err)
 }

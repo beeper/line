@@ -477,7 +477,7 @@ func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, newHTTPError(resp.StatusCode, "API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	return respBody, nil
@@ -664,7 +664,7 @@ func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return fmt.Errorf("OBS upload failed (%d): %s", resp.StatusCode, string(body))
+		return newHTTPError(resp.StatusCode, "OBS upload failed (%d): %s", resp.StatusCode, string(body))
 	}
 
 	return nil
@@ -726,7 +726,7 @@ func (c *Client) UploadOBSWithSID(data []byte, sid string) (string, error) {
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return "", fmt.Errorf("OBS upload failed (%d): %s", resp.StatusCode, string(body))
+		return "", newHTTPError(resp.StatusCode, "OBS upload failed (%d): %s", resp.StatusCode, string(body))
 	}
 
 	// The OID is typically returned in the x-obs-oid header
@@ -784,7 +784,7 @@ func (c *Client) UploadOBSWithOIDAndSID(data []byte, oid string, sid string) err
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return fmt.Errorf("OBS upload failed (%d): %s", resp.StatusCode, string(body))
+		return newHTTPError(resp.StatusCode, "OBS upload failed (%d): %s", resp.StatusCode, string(body))
 	}
 
 	return nil

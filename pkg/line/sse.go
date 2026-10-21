@@ -65,9 +65,9 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSEErrorBodyBytes))
 		if bodyText := strings.TrimSpace(string(body)); bodyText != "" {
-			return fmt.Errorf("SSE error: %d: %s", resp.StatusCode, bodyText)
+			return newHTTPError(resp.StatusCode, "SSE error: %d: %s", resp.StatusCode, bodyText)
 		}
-		return fmt.Errorf("SSE error: %d", resp.StatusCode)
+		return newHTTPError(resp.StatusCode, "SSE error: %d", resp.StatusCode)
 	}
 
 	reader := bufio.NewReader(resp.Body)

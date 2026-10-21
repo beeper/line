@@ -23,13 +23,13 @@ func (lc *LineClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.
 		_, err := lc.callLine(ctx, func(client *line.Client) error {
 			return client.RejectChatInvitationContext(ctx, int64(reqSeq), chatMid)
 		})
-		return err
+		return wrapSendError(err)
 	}
 	_, boxes, err := callLineResult(lc, ctx, func(client *line.Client) (map[string]line.MessageBox, error) {
 		return client.GetMessageBoxesByIDsContext(ctx, []string{chatMid})
 	})
 	if err != nil {
-		return err
+		return wrapSendError(err)
 	}
 	lastDelivered := boxes[chatMid].LastDeliveredMessageID
 	if lastDelivered == nil || lastDelivered.MessageID == "" || lastDelivered.MessageID == "-1" {
@@ -43,7 +43,7 @@ func (lc *LineClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.
 		return client.SendChatRemovedContext(ctx, int64(reqSeq), chatMid, lastDelivered.MessageID, 0)
 	})
 	if err != nil {
-		return err
+		return wrapSendError(err)
 	}
 	return lc.saveChatDeletion(context.WithoutCancel(ctx), chatMid, lastDelivered.MessageID)
 }
