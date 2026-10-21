@@ -87,12 +87,13 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 	if format != "jpeg" || config.Width <= 0 || config.Height <= 0 {
 		return nil, fmt.Errorf("heif-dec produced invalid JPEG output")
 	}
-	return stripJPEGExif(jpegData), nil
+	return stripJPEGMetadata(jpegData), nil
 }
 
-// stripJPEGExif drops APP1 Exif segments, which heif-dec copies from the HEIC
-// (GPS location, device model). Rotation is already applied to the pixels.
-func stripJPEGExif(data []byte) []byte {
+// stripJPEGMetadata drops every APP1 segment. heif-dec copies the HEIC's EXIF
+// (split over several APP1 segments when large) and XMP into them, including
+// GPS location and device model. Rotation is already applied to the pixels.
+func stripJPEGMetadata(data []byte) []byte {
 	if len(data) < 4 || data[0] != 0xFF || data[1] != 0xD8 {
 		return data
 	}
@@ -109,7 +110,7 @@ func stripJPEGExif(data []byte) []byte {
 		if length < 2 || end > len(data) {
 			return data
 		}
-		if marker != 0xE1 || !bytes.HasPrefix(data[pos+4:end], []byte("Exif\x00\x00")) {
+		if marker != 0xE1 {
 			out = append(out, data[pos:end]...)
 		}
 		pos = end
