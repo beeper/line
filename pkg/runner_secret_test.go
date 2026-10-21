@@ -252,6 +252,23 @@ func TestGetSignatureRecoversFromExhaustedRuntime(t *testing.T) {
 	oldRuntime := r.signingRT
 	e2eeMemory := bytes.Clone(r.rt.ModuleMem())
 
+	// Establish heap pressure with the real native allocator, rather than
+	// spending most of the test repeatedly decoding the same token. Keep the
+	// final real key allocations and the original abort/recovery assertions:
+	// malloc exhaustion alone must not be mistaken for a cryptographic abort.
+	const reserveSize = 64 * 1024
+	reserved := 0
+	for range len(oldRuntime.ModuleMem()) / reserveSize {
+		if oldRuntime.AllocMemory(reserveSize) == 0 {
+			break
+		}
+		reserved += reserveSize
+	}
+	if reserved == 0 {
+		t.Fatal("failed to establish native heap pressure")
+	}
+	t.Logf("reserved %d native heap bytes before real key allocation", reserved)
+
 	// Retain native keys until the fixed WASM heap is exhausted, so the next
 	// cache miss exercises real allocator failure during key derivation.
 	func() {
