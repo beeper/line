@@ -102,6 +102,7 @@ type qrRPCError struct {
 	exceptionCode *int
 	exceptionType string
 	reason        string
+	alert         string
 }
 
 func (e *qrRPCError) Error() string {
@@ -120,6 +121,9 @@ func (e *qrRPCError) Error() string {
 	}
 	if e.reason != "" {
 		message += ", reason " + e.reason
+	}
+	if e.alert != "" {
+		message += ", alert " + e.alert
 	}
 	return message
 }
@@ -233,6 +237,7 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 			Code       *int   `json:"code"`
 			Name       string `json:"name"`
 			Reason     string `json:"reason"`
+			Alert      string `json:"alertMessage"`
 		}
 		if json.Unmarshal(wrapper.Data, &details) == nil {
 			response.statusCode = details.StatusCode
@@ -240,7 +245,7 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 			// Provider strings may contain credentials. Retain fixed schema labels
 			// and allowlisted reasons only, never arbitrary message/reason values.
 			switch details.Name {
-			case "TalkException", "LoginException", "SecondaryQrCodeLoginException":
+			case "TalkException", "LoginException", "SecondaryQrCodeLoginException", "SecondaryQrCodeException":
 				response.exceptionType = details.Name
 			case "":
 			default:
@@ -249,6 +254,10 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 			response.reason = safeLoginPollingReason(details.Reason)
 			if details.Reason != "" && response.reason == "" {
 				response.reason = "redacted"
+			}
+			response.alert = safeLoginPollingReason(details.Alert)
+			if details.Alert != "" && response.alert == "" {
+				response.alert = "redacted"
 			}
 		}
 		return response

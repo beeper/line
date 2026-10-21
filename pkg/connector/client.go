@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
+	errLineSessionInvalidated = errors.New("LINE session invalidated")
 	errLineClientSuperseded   = errors.New("LINE client was superseded")
 	errLineQRLoginRequired    = errors.New("LINE requires a new QR scan. Reconnect in Beeper to continue")
 )
@@ -379,7 +379,7 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 	lc.invalidateAccessToken()
 	lc.obsTokenCache.Invalidate()
 	stateError := status.BridgeStateErrorCode("line-logged-out")
-	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
+	stateMessage := "LINE invalidated this Chrome Extension session. Click Reconnect in Beeper to reconnect LINE."
 	invalidSenderKey := line.IsInvalidSenderKey(err)
 	needsFullE2EELogin := invalidSenderKey
 	lc.missingE2EEKeyMu.Lock()
