@@ -95,17 +95,38 @@ func (c *Client) VerifyQRCertificate(ctx context.Context, session, certificate s
 }
 
 type qrRPCError struct {
-	method                       string
-	httpStatus, code, statusCode int
+	method        string
+	httpStatus    int
+	code          *int
+	statusCode    *int
+	exceptionCode *int
+	exceptionType string
+	reason        string
 }
 
 func (e *qrRPCError) Error() string {
-	return fmt.Sprintf("QR %s failed: HTTP %d, code %d, status %d", e.method, e.httpStatus, e.code, e.statusCode)
+	message := fmt.Sprintf("QR %s failed: HTTP %d", e.method, e.httpStatus)
+	if e.code != nil {
+		message += fmt.Sprintf(", code %d", *e.code)
+	}
+	if e.statusCode != nil {
+		message += fmt.Sprintf(", status %d", *e.statusCode)
+	}
+	if e.exceptionCode != nil {
+		message += fmt.Sprintf(", exception code %d", *e.exceptionCode)
+	}
+	if e.exceptionType != "" {
+		message += ", exception type " + e.exceptionType
+	}
+	if e.reason != "" {
+		message += ", reason " + e.reason
+	}
+	return message
 }
 
 func IsQRLoginPollExpired(err error) bool {
 	var response *qrRPCError
-	return errors.As(err, &response) && response.code == 10052 && response.statusCode == 410
+	return errors.As(err, &response) && response.code != nil && *response.code == 10052 && response.statusCode != nil && *response.statusCode == 410
 }
 
 func (c *Client) CreatePinCode(ctx context.Context, session string) (string, error) {
@@ -206,15 +227,29 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 	}
 	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&wrapper)
 	if resp.StatusCode != http.StatusOK || (wrapper.Code != nil && *wrapper.Code != 0) {
-		response := &qrRPCError{method: method, httpStatus: resp.StatusCode}
-		if wrapper.Code != nil {
-			response.code = *wrapper.Code
-		}
+		response := &qrRPCError{method: method, httpStatus: resp.StatusCode, code: wrapper.Code}
 		var details struct {
-			StatusCode int `json:"statusCode"`
+			StatusCode *int   `json:"statusCode"`
+			Code       *int   `json:"code"`
+			Name       string `json:"name"`
+			Reason     string `json:"reason"`
 		}
 		if json.Unmarshal(wrapper.Data, &details) == nil {
 			response.statusCode = details.StatusCode
+			response.exceptionCode = details.Code
+			// Provider strings may contain credentials. Retain fixed schema labels
+			// and allowlisted reasons only, never arbitrary message/reason values.
+			switch details.Name {
+			case "TalkException", "LoginException", "SecondaryQrCodeLoginException":
+				response.exceptionType = details.Name
+			case "":
+			default:
+				response.exceptionType = "other"
+			}
+			response.reason = safeLoginPollingReason(details.Reason)
+			if details.Reason != "" && response.reason == "" {
+				response.reason = "redacted"
+			}
 		}
 		return response
 	}
