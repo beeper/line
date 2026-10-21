@@ -724,7 +724,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	client.LoginAttempt = res.Attempt
 	profile, err := client.GetProfileContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to verify token: %w", err)
+		return nil, wrapLineLoginError(fmt.Errorf("failed to verify token: %w", err))
 	}
 
 	displayName := profile.DisplayName

@@ -562,7 +562,7 @@ func (c *Client) postWithHMAC(fullURL string, body []byte) ([]byte, error) {
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, newHTTPError(resp.StatusCode, "HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	return io.ReadAll(resp.Body)
@@ -635,7 +635,7 @@ func (c *Client) UploadOBSPlain(data []byte, oid string, obsType string) error {
 
 	url := fmt.Sprintf("%s/r/talk/m/%s", OBSBaseURL, oid)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(c.requestContext(), "POST", url, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("failed to create OBS request: %w", err)
 	}
@@ -693,7 +693,7 @@ func (c *Client) UploadOBSWithSID(data []byte, sid string) (string, error) {
 
 	url := fmt.Sprintf("%s/r/talk/%s/reqid-%s", OBSBaseURL, sid, reqID)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(c.requestContext(), "POST", url, bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("failed to create OBS request: %w", err)
 	}
@@ -754,7 +754,7 @@ func (c *Client) UploadOBSWithOIDAndSID(data []byte, oid string, sid string) err
 
 	url := fmt.Sprintf("%s/r/talk/%s/%s", OBSBaseURL, sid, oid)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(c.requestContext(), "POST", url, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("failed to create OBS request: %w", err)
 	}
@@ -842,7 +842,7 @@ func (c *Client) DownloadOBSPublicResource(ctx context.Context, resourcePath str
 	case http.StatusNotFound:
 		return nil, ErrOBSObjectNotFound
 	default:
-		return nil, fmt.Errorf("public OBS resource download failed (%d): %s", resp.StatusCode, string(body))
+		return nil, newHTTPError(resp.StatusCode, "public OBS resource download failed (%d): %s", resp.StatusCode, string(body))
 	}
 }
 
@@ -902,7 +902,7 @@ func (c *Client) DownloadAlbumPreview(ctx context.Context, oid, chatID, albumID 
 	case http.StatusNotFound:
 		return nil, ErrOBSObjectNotFound
 	default:
-		return nil, fmt.Errorf("OBS download failed (%d): %s", resp.StatusCode, string(body))
+		return nil, newHTTPError(resp.StatusCode, "OBS download failed (%d): %s", resp.StatusCode, string(body))
 	}
 }
 
@@ -986,7 +986,7 @@ func (c *Client) checkOBSObjectReady(ctx context.Context, obsURL, obsToken, mess
 		return fmt.Errorf("failed to read OBS object info response: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("OBS object info failed (%d): %s", resp.StatusCode, string(body))
+		return newHTTPError(resp.StatusCode, "OBS object info failed (%d): %s", resp.StatusCode, string(body))
 	}
 
 	var info obsObjectInfo
@@ -1026,7 +1026,7 @@ func (c *Client) downloadOBSObject(ctx context.Context, obsURL, obsToken, messag
 	case http.StatusAccepted:
 		return nil, ErrOBSEncodingIncomplete
 	default:
-		return nil, fmt.Errorf("OBS download failed (%d): %s", resp.StatusCode, string(body))
+		return nil, newHTTPError(resp.StatusCode, "OBS download failed (%d): %s", resp.StatusCode, string(body))
 	}
 }
 
@@ -1090,7 +1090,7 @@ func (c *Client) constructTalkMeta(messageID string) string {
 
 func (c *Client) GetPageInfo(url string) (*PageInfoResult, error) {
 	apiURL := "https://legy-jp.line-apps.com/sc/api/v2/pageinfo/get"
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(c.requestContext(), "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1113,7 +1113,7 @@ func (c *Client) GetPageInfo(url string) (*PageInfoResult, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("pageinfo request failed: %d", resp.StatusCode)
+		return nil, newHTTPError(resp.StatusCode, "pageinfo request failed: %d", resp.StatusCode)
 	}
 
 	var wrapper PageInfoResponse

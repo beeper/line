@@ -38,11 +38,7 @@ var (
 		Err:        genericLoginFailureReason,
 		StatusCode: http.StatusUnauthorized,
 	}
-	ErrLoginUnknown = bridgev2.RespError{
-		ErrCode:    "M_UNKNOWN",
-		Err:        "Internal error logging in to LINE",
-		StatusCode: http.StatusInternalServerError,
-	}
+	ErrLoginUnknown = bridgev2.RespError(mautrix.MUnknown.WithMessage("Internal error logging in to LINE"))
 )
 
 // wrapLineLoginError translates a LINE error into one the client can act on, keeping the
