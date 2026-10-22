@@ -417,6 +417,10 @@ func (lc *LineClient) sendConnectedStateIfCurrent(ctx context.Context) bool {
 	// Whichever transition gets this lock last determines the visible state.
 	lc.recoverMu.Lock()
 	defer lc.recoverMu.Unlock()
+	return lc.sendConnectedStateLocked(ctx)
+}
+
+func (lc *LineClient) sendConnectedStateLocked(ctx context.Context) bool {
 	if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || !lc.hasAccessToken() {
 		return false
 	}
@@ -427,10 +431,24 @@ func (lc *LineClient) sendConnectedStateIfCurrent(ctx context.Context) bool {
 	return true
 }
 
+// SSE reconnects must not replace the relogin prompt sent by markMissingE2EEKey.
+func (lc *LineClient) sendSSEConnectedIfCurrent(ctx context.Context) bool {
+	lc.recoverMu.Lock()
+	defer lc.recoverMu.Unlock()
+	lc.missingE2EEKeyMu.Lock()
+	defer lc.missingE2EEKeyMu.Unlock()
+	if lc.missingE2EEKeyMarked {
+		return false
+	}
+	return lc.sendConnectedStateLocked(ctx)
+}
+
 func (lc *LineClient) sendSSEDisconnectedIfCurrent(ctx context.Context, err error) bool {
 	lc.recoverMu.Lock()
 	defer lc.recoverMu.Unlock()
-	if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || lc.UserLogin.BridgeState == nil {
+	lc.missingE2EEKeyMu.Lock()
+	defer lc.missingE2EEKeyMu.Unlock()
+	if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || lc.missingE2EEKeyMarked || lc.UserLogin.BridgeState == nil {
 		return false
 	}
 	lc.UserLogin.BridgeState.Send(status.BridgeState{

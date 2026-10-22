@@ -1640,7 +1640,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 
 	sseDisconnected := false
 	handler := func(eventType, data string) {
-		if sseDisconnected && lc.sendConnectedStateIfCurrent(ctx) {
+		if sseDisconnected && lc.sendSSEConnectedIfCurrent(ctx) {
 			sseDisconnected = false
 		}
 
