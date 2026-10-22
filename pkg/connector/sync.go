@@ -1645,7 +1645,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		}
 
 		// handle keep alives
-		if eventType == "ping" || eventType == "connInfoRevision" {
+		if eventType == line.SSEEventOpen || eventType == "ping" || eventType == "connInfoRevision" {
 			return
 		}
 
