@@ -59,3 +59,104 @@ func TestQRErrorDetailsAndRedaction(t *testing.T) {
 		})
 	}
 }
+
+func TestQRLoginFailureDetailIgnoresOtherErrors(t *testing.T) {
+	detail, ok := QRLoginFailureDetail(errors.New("not a QR error"))
+	if ok || detail.Method != "" {
+		t.Fatal("unrelated error was reported as a QR failure")
+	}
+}
+
+func TestQRRPCErrorAuthError(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		body                    string
+		status                  int
+		wantCategory            AuthErrorCategory
+		wantCooldownTriggered   bool
+		wantRetryRecommended    bool
+		wantProviderAlertStatus string
+		wantProviderReason      string
+	}{
+		{
+			name:                    "HTTP 429",
+			body:                    `{"code":10051,"data":{"name":"SecondaryQrCodeException","code":100}}`,
+			status:                  http.StatusTooManyRequests,
+			wantCategory:            AuthErrorTooManyAttempts,
+			wantCooldownTriggered:   true,
+			wantRetryRecommended:    true,
+			wantProviderAlertStatus: "unrecognized",
+			wantProviderReason:      "absent",
+		},
+		{
+			name:                    "retry later",
+			body:                    `{"code":10051,"data":{"name":"SecondaryQrCodeException","code":5}}`,
+			status:                  http.StatusBadRequest,
+			wantCategory:            AuthErrorRetryLater,
+			wantCooldownTriggered:   true,
+			wantRetryRecommended:    true,
+			wantProviderAlertStatus: "unrecognized",
+			wantProviderReason:      "absent",
+		},
+		{
+			name:                    "verification temporarily unavailable",
+			body:                    `{"code":10051,"data":{"name":"SecondaryQrCodeException","code":100,"alertMessage":"Verification is temporarily unavailable"}}`,
+			status:                  http.StatusBadRequest,
+			wantCategory:            AuthErrorVerificationTemporarilyUnavailable,
+			wantCooldownTriggered:   true,
+			wantRetryRecommended:    true,
+			wantProviderAlertStatus: "recognized",
+			wantProviderReason:      "verification_temporarily_unavailable",
+		},
+		{
+			name:                    "QR login not allowed",
+			body:                    `{"code":10051,"data":{"name":"SecondaryQrCodeException","code":3}}`,
+			status:                  http.StatusBadRequest,
+			wantCategory:            AuthErrorQRLoginNotAllowed,
+			wantCooldownTriggered:   true,
+			wantRetryRecommended:    false,
+			wantProviderAlertStatus: "unrecognized",
+			wantProviderReason:      "absent",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, err := gen.NewRunner()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			client := NewClient("")
+			client.LoginAttempt = &LoginAttempt{Runner: runner, Context: ctx, cancel: cancel}
+			defer client.LoginAttempt.Close()
+			client.HTTPClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})
+			_, err = client.QRCodeLoginV2(ctx, "session")
+			cancel()
+
+			var qrErr *QRRPCError
+			if !errors.As(err, &qrErr) {
+				t.Fatalf("error is not a QRRPCError: %v", err)
+			}
+			ae := qrErr.AuthError()
+			if ae == nil {
+				t.Fatal("AuthError was nil")
+			}
+			if ae.Category != tc.wantCategory {
+				t.Fatalf("category = %v, want %v", ae.Category, tc.wantCategory)
+			}
+			if ae.CooldownTriggered != tc.wantCooldownTriggered {
+				t.Fatalf("cooldownTriggered = %v, want %v", ae.CooldownTriggered, tc.wantCooldownTriggered)
+			}
+			if ae.RetryRecommended != tc.wantRetryRecommended {
+				t.Fatalf("retryRecommended = %v, want %v", ae.RetryRecommended, tc.wantRetryRecommended)
+			}
+			if ae.ProviderAlertStatus != tc.wantProviderAlertStatus {
+				t.Fatalf("providerAlertStatus = %q, want %q", ae.ProviderAlertStatus, tc.wantProviderAlertStatus)
+			}
+			if ae.ProviderReason != tc.wantProviderReason {
+				t.Fatalf("providerReason = %q, want %q", ae.ProviderReason, tc.wantProviderReason)
+			}
+		})
+	}
+}

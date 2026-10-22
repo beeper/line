@@ -95,14 +95,34 @@ func (c *Client) VerifyQRCertificate(ctx context.Context, session, certificate s
 }
 
 type qrRPCError struct {
-	method        string
-	httpStatus    int
-	code          *int
-	statusCode    *int
-	exceptionCode *int
-	exceptionType string
-	reason        string
-	alert         string
+	method         string
+	httpStatus     int
+	code           *int
+	statusCode     *int
+	exceptionCode  *int
+	exceptionType  string
+	exceptionLabel string
+	reason         string
+	alert          string
+	authError      *AuthError
+}
+
+// QRRPCError is the exported alias for qrRPCError, allowing callers to
+// type-assert and access the structured AuthError.
+type QRRPCError = qrRPCError
+
+// secondaryQrCodeErrorLabels maps the fixed error codes of
+// SecondaryQrCodeException to their schema labels. The codes are only
+// interpreted for that exception class, since other classes reuse the numbers.
+var secondaryQrCodeErrorLabels = map[int]string{
+	0:   "INTERNAL_ERROR",
+	1:   "ILLEGAL_ARGUMENT",
+	2:   "VERIFICATION_FAILED",
+	3:   "NOT_ALLOWED_QR_CODE_LOGIN",
+	4:   "VERIFICATION_NOTICE_FAILED",
+	5:   "RETRY_LATER",
+	100: "INVALID_CONTEXT",
+	101: "APP_UPGRADE_REQUIRED",
 }
 
 func (e *qrRPCError) Error() string {
@@ -126,6 +146,213 @@ func (e *qrRPCError) Error() string {
 		message += ", alert " + e.alert
 	}
 	return message
+}
+
+// buildAuthError constructs a structured AuthError from the raw provider
+// fields captured before sanitization. It never exposes raw provider text
+// through user-facing fields.
+func (e *qrRPCError) buildAuthError(rawName string, rawCode *int, rawReason, rawAlert string) *AuthError {
+	ae := &AuthError{
+		Flow:                "qr",
+		Stage:               AuthStageQRTokenIssue,
+		HTTPStatus:          e.httpStatus,
+		ResponseCode:        e.code,
+		ExceptionType:       e.exceptionType,
+		ExceptionCode:       e.exceptionCode,
+		Category:            AuthErrorUnknown,
+		ProviderReason:      SanitizeProviderAlert(rawReason),
+		ProviderAlertStatus: SafeAlertStatus(rawAlert != ""),
+		UserMessage:         UserMessageForCategory(AuthErrorUnknown),
+		RetryRecommended:    false,
+		Temporary:           false,
+		UserActionRequired:  true,
+		BridgeFailure:       false,
+		CooldownTriggered:   false,
+		Err:                 e,
+	}
+	if ae.ProviderReason == "absent" && rawAlert != "" {
+		ae.ProviderReason = SanitizeProviderAlert(rawAlert)
+	}
+
+	switch {
+	case e.httpStatus == http.StatusTooManyRequests:
+		ae.Category = AuthErrorTooManyAttempts
+		ae.RetryRecommended, ae.Temporary, ae.CooldownTriggered = true, true, true
+	case rawName == "SecondaryQrCodeException" && e.exceptionCode != nil:
+		ae.Category, ae.RetryRecommended, ae.Temporary, ae.CooldownTriggered =
+			classifySecondaryQrCode(*e.exceptionCode, rawAlert)
+	case rawName == "SecondaryQrCodeLoginException" && e.exceptionCode != nil:
+		ae.Category, ae.RetryRecommended, ae.Temporary, ae.CooldownTriggered =
+			classifySecondaryQrCode(*e.exceptionCode, rawAlert)
+	case e.exceptionType == "TalkException" || e.exceptionType == "LoginException":
+		ae.Category = classifyTalkException(e.exceptionCode, rawReason, rawAlert)
+	case e.exceptionType == "other":
+		ae.Category = AuthErrorUnknown
+	}
+
+	// Reason and alert text can override schema-label classification when they
+	// unambiguously indicate a rate limit or verification unavailability.
+	switch {
+	case SanitizeProviderAlert(rawReason) == "too_many_login_attempts" || SanitizeProviderAlert(rawAlert) == "too_many_login_attempts":
+		ae.Category = AuthErrorTooManyAttempts
+	case SanitizeProviderAlert(rawReason) == "blocked_user" || SanitizeProviderAlert(rawAlert) == "blocked_user":
+		ae.Category = AuthErrorTooManyAttempts
+	case SanitizeProviderAlert(rawReason) == "verification_temporarily_unavailable" || SanitizeProviderAlert(rawAlert) == "verification_temporarily_unavailable":
+		ae.Category = AuthErrorVerificationTemporarilyUnavailable
+	}
+
+	// Apply consistent retry/temporary/cooldown semantics for categories not
+	// already configured by their classifier.
+	applyCategoryDefaults(&ae.RetryRecommended, &ae.Temporary, &ae.CooldownTriggered, ae.Category)
+
+	ae.UserMessage = userMessageForStageAndCategory(ae.Stage, ae.Category, rawAlert)
+	return ae
+}
+
+// applyCategoryDefaults sets RetryRecommended, Temporary, and CooldownTriggered
+// from the category when the classifier did not already set them.
+func applyCategoryDefaults(retry, temporary, cooldown *bool, cat AuthErrorCategory) {
+	switch cat {
+	case AuthErrorTooManyAttempts, AuthErrorRetryLater, AuthErrorVerificationTemporarilyUnavailable, AuthErrorServiceUnavailable:
+		*retry, *temporary, *cooldown = true, true, true
+	case AuthErrorVerificationRequired:
+		*retry, *temporary, *cooldown = true, true, true
+	case AuthErrorInvalidCredentials, AuthErrorQRLoginNotAllowed, AuthErrorUnsupportedMethod:
+		*retry, *temporary, *cooldown = false, false, true
+	case AuthErrorQRContextExpired:
+		*retry, *temporary, *cooldown = true, false, false
+	default:
+		*retry, *temporary, *cooldown = false, false, false
+	}
+}
+
+// AuthError returns the structured authentication error, or nil if the error
+// did not carry structured provider metadata.
+func (e *qrRPCError) AuthError() *AuthError {
+	return e.authError
+}
+
+// classifySecondaryQrCode maps SecondaryQrCodeException exception codes to
+// bridge-side categories. Code 100 is intentionally NOT treated as ordinary
+// QR expiration by default; it maps to VERIFICATION_TEMPORARILY_UNAVAILABLE
+// only when the provider alert confirms that meaning.
+func classifySecondaryQrCode(code int, alert string) (AuthErrorCategory, bool, bool, bool) {
+	switch code {
+	case 0:
+		return AuthErrorServiceUnavailable, true, true, true
+	case 1:
+		return AuthErrorInvalidCredentials, false, false, true
+	case 2:
+		return AuthErrorVerificationRequired, true, true, true
+	case 3:
+		return AuthErrorQRLoginNotAllowed, false, false, true
+	case 4:
+		return AuthErrorVerificationRequired, true, true, true
+	case 5:
+		return AuthErrorRetryLater, true, true, true
+	case 100:
+		// Code 100 is INVALID_CONTEXT in the schema label map, but the actual
+		// provider alert determines the meaning. A confirmed temporary
+		// verification alert maps accordingly; otherwise use a neutral
+		// fallback rather than claiming QR expiration.
+		if SanitizeProviderAlert(alert) == "verification_temporarily_unavailable" {
+			return AuthErrorVerificationTemporarilyUnavailable, true, true, true
+		}
+		return AuthErrorQRContextExpired, true, false, false
+	case 101:
+		return AuthErrorUnsupportedMethod, false, false, true
+	default:
+		return AuthErrorUnknown, false, false, false
+	}
+}
+
+// classifyTalkException maps TalkException codes to categories.
+func classifyTalkException(code *int, reason, alert string) AuthErrorCategory {
+	if code == nil {
+		return AuthErrorUnknown
+	}
+	switch *code {
+	case 1:
+		return AuthErrorInvalidCredentials
+	case 83:
+		return AuthErrorInvalidCredentials
+	case 99:
+		return AuthErrorServiceUnavailable
+	default:
+		if SanitizeProviderAlert(reason) == "too_many_login_attempts" ||
+			SanitizeProviderAlert(alert) == "too_many_login_attempts" {
+			return AuthErrorTooManyAttempts
+		}
+		return AuthErrorUnknown
+	}
+}
+
+// userMessageForStageAndCategory returns a stage-aware user-facing message.
+func userMessageForStageAndCategory(stage AuthErrorStage, cat AuthErrorCategory, alert string) string {
+	switch cat {
+	case AuthErrorVerificationTemporarilyUnavailable:
+		return "LINE verification is temporarily unavailable for this sign-in. Please wait before trying again."
+	case AuthErrorTooManyAttempts:
+		return "LINE is temporarily limiting login attempts. Please wait before trying again."
+	case AuthErrorRetryLater:
+		return "LINE asked us to try the sign-in again later. Please wait before trying again."
+	case AuthErrorQRLoginNotAllowed:
+		return "LINE is not allowing QR-code login for this account or session. Please sign in with your email and password instead."
+	case AuthErrorQRContextExpired:
+		return "This QR sign-in has expired. Start a new QR login."
+	case AuthErrorInvalidCredentials:
+		return "LINE rejected the sign-in credentials. Check your credentials and try again."
+	case AuthErrorVerificationRequired:
+		return "LINE requires additional verification. Please complete the verification prompt and try again."
+	case AuthErrorServiceUnavailable:
+		return "LINE is temporarily unavailable. Please try again later."
+	case AuthErrorUnsupportedMethod:
+		return "LINE does not support this authentication method. Please try a different sign-in method."
+	case AuthErrorNetworkUnavailable:
+		return "Unable to reach LINE right now. Please try again later."
+	default:
+		if stage == AuthStageQRTokenIssue {
+			return "LINE rejected the QR sign-in request. Please check the bridge logs or contact your administrator."
+		}
+		return "LINE rejected the login request, but did not provide a recognized reason. Please check the bridge logs or contact your administrator."
+	}
+}
+
+// QRFailureDetail describes a rejected QR login request. Every field is a fixed
+// schema label or an allowlisted category, never raw provider text.
+type QRFailureDetail struct {
+	Method         string
+	HTTPStatus     int
+	ResponseCode   int
+	ExceptionType  string
+	ExceptionCode  int
+	ExceptionLabel string
+	Reason         string
+	Alert          string
+}
+
+// QRLoginFailureDetail extracts the sanitized details of a rejected QR login
+// request. It reports false for errors that did not come from a QR request.
+func QRLoginFailureDetail(err error) (QRFailureDetail, bool) {
+	var response *qrRPCError
+	if !errors.As(err, &response) {
+		return QRFailureDetail{}, false
+	}
+	detail := QRFailureDetail{
+		Method:         response.method,
+		HTTPStatus:     response.httpStatus,
+		ExceptionType:  response.exceptionType,
+		ExceptionLabel: response.exceptionLabel,
+		Reason:         response.reason,
+		Alert:          response.alert,
+	}
+	if response.code != nil {
+		detail.ResponseCode = *response.code
+	}
+	if response.exceptionCode != nil {
+		detail.ExceptionCode = *response.exceptionCode
+	}
+	return detail, true
 }
 
 func IsQRLoginPollExpired(err error) bool {
@@ -259,6 +486,12 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 			if details.Alert != "" && response.alert == "" {
 				response.alert = "redacted"
 			}
+			if details.Name == "SecondaryQrCodeException" && details.Code != nil {
+				response.exceptionLabel = secondaryQrCodeErrorLabels[*details.Code]
+			}
+			response.authError = response.buildAuthError(
+				details.Name, details.Code, details.Reason, details.Alert,
+			)
 		}
 		return response
 	}

@@ -57,6 +57,70 @@ before profile verification or lookup/portal validation runs. This does not prov
 that the deployment or earlier diagnostic activity could not have affected remote
 session state; the initiating cause of token invalidation remains unknown.
 
+## Account login rate limits
+
+The operator observed that the affected account could not complete a QR login
+while the account had not been used for login attempts that day, and that a
+later attempt succeeded. That is consistent with an account-level login rate
+limit rather than a protocol or identity defect, and it matches the repeated
+attempts made during this troubleshooting session. The hypothesis is not proven:
+the rejected response reported a nested exception code of 100, which the public
+`SecondaryQrCodeException` enum names `INVALID_CONTEXT`, and the response did
+not carry an explicit rate-limit reason.
+
+The bridge now handles the rate limit explicitly instead of failing opaquely:
+
+* Rate limits are recognised from the signals LINE actually returns: HTTP 429,
+  the fixed "too many login attempts" reason, and the fixed `RETRY_LATER` code
+  of `SecondaryQrCodeException`. A verification or credential failure is not
+  treated as a rate limit.
+* A rate-limited QR login is reported to the user as the standard
+  "Too many login attempts" error, and a "retry later" rejection as a request
+  to wait a few minutes, instead of a generic failure.
+* After a rate-limited rejection the bridge stops starting new login attempts
+  for that account for 15 minutes (5 minutes for a "retry later" rejection) and
+  tells the user when to come back. Repeated attempts keep the account locked,
+  so the bridge waits instead of retrying. The wait is in-memory and per
+  account, and it is cleared once it expires.
+* The same handling applies to the email login flow, because the limit is
+  enforced per account rather than per sign-in method. The automatic reconnect
+  after a bridge restart still makes a single attempt, because that is the only
+  way to restore a saved session, and it is reported the same way if the
+  account is still locked.
+
+The cooldown lengths are conservative defaults, not measured LINE values. The
+bridge cannot know how long the account stays locked, so it waits and reports
+the remaining time instead of guessing an exact unlock moment.
+
+## Structured authentication errors
+
+LINE login failures are now normalized into a structured `AuthError` model in
+`pkg/line/auth_error.go` before they reach connector logic:
+
+* Provider-specific exception names, codes, reasons and alerts are classified
+  into stable categories such as `TOO_MANY_ATTEMPTS`, `RETRY_LATER`,
+  `VERIFICATION_TEMPORARILY_UNAVAILABLE`, `INVALID_CONTEXT`/`QR_CONTEXT_EXPIRED`,
+  `QR_LOGIN_NOT_ALLOWED`, etc.
+* Provider text is never exposed directly. Fixed schema labels and a small
+  allowlist of safe reason strings are used; everything else is recorded as
+  `unrecognized`/`redacted`.
+* Each `AuthError` carries flags (`retry_recommended`, `temporary`,
+  `user_action_required`, `bridge_failure`, `cooldown_triggered`) and a safe
+  `provider_alert_status` (`recognized`, `unrecognized`, `absent`).
+* The connector uses these categories to pick user-facing messages, decide
+  whether a cooldown applies, and emit structured log fields. Raw error strings
+  still appear in logs only at the original wrapped error level.
+
+## Extended cooldown handling
+
+A confirmed "Verification is temporarily unavailable" alert now triggers its
+own cooldown category (`loginRateLimitVerificationUnavailable`) with a
+10-minute bridge-side wait. This prevents rapid retry loops when LINE indicates
+verification is temporarily unavailable, while still allowing a fresh attempt
+after the cooldown expires. The category is detected both from the structured
+`AuthError` and, as a fallback, from the raw provider reason text during email
+login.
+
 ## Actual shortcomings corrected locally
 
 1. The diagnostic allowlist omitted `SecondaryQrCodeException`, and did not inspect

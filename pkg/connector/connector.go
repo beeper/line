@@ -481,16 +481,69 @@ func (ll *LineEmailLogin) logLoginFailure(err error, flow string) {
 	event.Msg("LINE login attempt failed")
 }
 
+// logQRFailure records the sanitized details of a rejected QR login request.
+// The mobile app shows no detail for these rejections, so the bridge log is the
+// only structured record of what LINE rejected. If the error carries a structured
+// AuthError, its safe classification fields are also logged.
+func (ll *LineEmailLogin) logQRFailure(err error, flow string) {
+	if err == nil || ll.User == nil {
+		return
+	}
+	event := ll.User.Log.Warn().Str("login_flow", flow)
+
+	detail, ok := line.QRLoginFailureDetail(err)
+	if ok {
+		if detail.Method != "" {
+			event.Str("qr_method", detail.Method)
+		}
+		event.Int("http_status", detail.HTTPStatus)
+		if detail.ResponseCode != 0 {
+			event.Int("line_response_code", detail.ResponseCode)
+		}
+		if detail.ExceptionType != "" {
+			event.Str("line_error_name", detail.ExceptionType)
+		}
+		if detail.ExceptionCode != 0 {
+			event.Int("line_error_code", detail.ExceptionCode)
+		}
+		if detail.ExceptionLabel != "" {
+			event.Str("line_error_label", detail.ExceptionLabel)
+		}
+		if detail.Reason != "" {
+			event.Str("line_error_reason", detail.Reason)
+		}
+		if detail.Alert != "" {
+			event.Str("line_error_alert", detail.Alert)
+		}
+	}
+
+	var qrErr *line.QRRPCError
+	if errors.As(err, &qrErr) && qrErr.AuthError() != nil {
+		ae := qrErr.AuthError()
+		event.Str("auth_error_flow", ae.Flow).
+			Str("auth_error_stage", ae.Stage.String()).
+			Str("auth_error_category", ae.Category.String())
+		if ae.ProviderReason != "" {
+			event.Str("provider_reason", ae.ProviderReason)
+		}
+		event.Str("provider_alert_status", string(ae.ProviderAlertStatus)).
+			Bool("retry_recommended", ae.RetryRecommended).
+			Bool("temporary", ae.Temporary).
+			Bool("user_action_required", ae.UserActionRequired).
+			Bool("bridge_failure", ae.BridgeFailure).
+			Bool("cooldown_triggered", ae.CooldownTriggered)
+	}
+
+	event.Msg("LINE QR login attempt failed")
+}
+
 func loginErrorReason(err error) string {
 	details := parseLoginErrorDetails(err)
 	reason := details.ErrorReason
 	if reason == "" {
 		reason = details.ErrorMessage
 	}
-	if isBlockedUserLoginError(reason) {
-		return loginTooManyAttemptsReason
-	}
-	return reason
+	return safeEmailLoginReason(reason)
 }
 
 func isBlockedUserLoginError(message string) bool {

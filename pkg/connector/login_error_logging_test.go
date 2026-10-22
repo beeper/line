@@ -96,6 +96,27 @@ func TestLoginErrorSummaryDoesNotIncludeNonJSONResponseBody(t *testing.T) {
 	}
 }
 
+func TestLoginErrorReasonDoesNotLeakUnknownProviderText(t *testing.T) {
+	for _, tc := range []struct {
+		reason, want string
+	}{
+		{"blocked user", loginTooManyAttemptsReason},
+		{"Too many login attempts", loginTooManyAttemptsReason},
+		{"Verification is temporarily unavailable", line.UserMessageForCategory(line.AuthErrorVerificationTemporarilyUnavailable)},
+		{"Account ID or password is invalid", "Account ID or password is invalid"},
+		{"Authentication failed", "Authentication failed"},
+		{"", ""},
+		{"response-token secret", ""},
+		{"password: hunter2", ""},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			if got := safeEmailLoginReason(tc.reason); got != tc.want {
+				t.Fatalf("safeEmailLoginReason(%q) = %q, want %q", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoginErrorSummaryAllowsKnownContextErrors(t *testing.T) {
 	err := fmt.Errorf("login failed: %w", context.DeadlineExceeded)
 	details := parseLoginErrorDetails(err)
