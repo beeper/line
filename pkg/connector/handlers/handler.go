@@ -40,6 +40,8 @@ type Handler struct {
 
 	// DecryptMedia decrypts E2EE encrypted media data using the given key material.
 	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
+	// DecryptVideoMedia verifies the video-specific chunk-hash HMAC before decryption.
+	DecryptVideoMedia func(data []byte, keyMaterial string) ([]byte, error)
 }
 
 func (h *Handler) decryptDownloadedMedia(data []byte, decryptedBody string, metadata map[string]string, kind string) ([]byte, error) {
@@ -90,13 +92,17 @@ func (h *Handler) decryptMediaWithKeys(data []byte, keys []string, encrypted boo
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("%w: encrypted %s has no usable media key", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))
 	}
-	if h.DecryptMedia == nil {
+	decrypt := h.DecryptMedia
+	if kind == "video" {
+		decrypt = h.DecryptVideoMedia
+	}
+	if decrypt == nil {
 		return nil, fmt.Errorf("%w: encrypted %s has no media decryptor", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind))
 	}
 
 	decryptErrors := make([]error, 0, len(keys))
 	for _, key := range keys {
-		decrypted, err := h.DecryptMedia(data, key)
+		decrypted, err := decrypt(data, key)
 		if err == nil {
 			return decrypted, nil
 		}

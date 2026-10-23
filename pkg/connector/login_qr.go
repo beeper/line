@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -11,18 +12,23 @@ import (
 )
 
 type LineQRLogin struct {
-	login   *LineEmailLogin
-	client  *line.Client
-	session string
-	qr      *line.QRCodeResponse
-	poll    chan error
-	pin     bool
+	operationMu sync.Mutex
+	login       *LineEmailLogin
+	client      *line.Client
+	session     string
+	qr          *line.QRCodeResponse
+	poll        chan error
+	pin         bool
 }
 
 var _ bridgev2.LoginProcessDisplayAndWait = (*LineQRLogin)(nil)
 var _ bridgev2.LoginProcessWithOverride = (*LineQRLogin)(nil)
 
 func (lq *LineQRLogin) StartWithOverride(ctx context.Context, override *bridgev2.UserLogin) (*bridgev2.LoginStep, error) {
+	if !lq.operationMu.TryLock() {
+		return nil, fmt.Errorf("QR login operation already in progress")
+	}
+	defer lq.operationMu.Unlock()
 	meta, ok := override.Metadata.(*UserLoginMetadata)
 	if !ok {
 		return nil, fmt.Errorf("existing LINE login metadata has unexpected type %T", override.Metadata)
@@ -32,10 +38,21 @@ func (lq *LineQRLogin) StartWithOverride(ctx context.Context, override *bridgev2
 	if meta.ForceFullE2EELogin || len(meta.ExportedKeyMap) == 0 {
 		lq.login.Certificate = ""
 	}
-	return lq.Start(ctx)
+	return lq.start(ctx)
 }
 
 func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	if !lq.operationMu.TryLock() {
+		return nil, fmt.Errorf("QR login operation already in progress")
+	}
+	defer lq.operationMu.Unlock()
+	return lq.start(ctx)
+}
+
+func (lq *LineQRLogin) start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	ll := lq.login
 	ll.mu.Lock()
 	if ll.canceled || ll.attemptCtx != nil {
@@ -55,10 +72,15 @@ func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	canceled := ll.canceled || ctx.Err() != nil || processCtx.Err() != nil
 	ll.mu.Unlock()
 	if err != nil || canceled {
-		lq.Cancel()
-		if canceled {
-			return nil, context.Canceled
+		// Preserve expiry before Cancel changes the attempt's context error.
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		} else if processCtx.Err() != nil {
+			err = processCtx.Err()
+		} else if canceled {
+			err = context.Canceled
 		}
+		lq.Cancel()
 		return nil, err
 	}
 	lq.client, lq.session, lq.qr = client, session, qr
@@ -101,6 +123,12 @@ func (lq *LineQRLogin) startPoll(check func(context.Context, string) error, retr
 }
 
 func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
+	// Overlapping provisioning calls must not consume each other's polling
+	// results or advance the PIN/token exchange twice. Cancel doesn't take this lock.
+	if !lq.operationMu.TryLock() {
+		return nil, fmt.Errorf("QR login operation already in progress")
+	}
+	defer lq.operationMu.Unlock()
 	if lq.poll == nil {
 		return nil, fmt.Errorf("QR login has not started")
 	}
