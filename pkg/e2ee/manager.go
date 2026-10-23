@@ -51,6 +51,8 @@ type Manager struct {
 	groupSessionChannels map[string]map[int]map[int]int
 
 	latestGroupKey map[string]int // chatMid -> latest groupKeyId
+	// groupSpecVersion maps chatMid -> specVersion of the latest group key
+	groupSpecVersion map[string]int
 
 	groupKeyLRU        []groupKeyRef
 	groupNativeObjects int
@@ -83,6 +85,7 @@ func NewManagerWithRunner(r *gen.Runner) *Manager {
 		groupKeys:            make(map[string]map[int]int),
 		groupSessionChannels: make(map[string]map[int]map[int]int),
 		latestGroupKey:       make(map[string]int),
+		groupSpecVersion:     make(map[string]int),
 	}
 }
 
@@ -104,6 +107,7 @@ func (m *Manager) Close() {
 	m.groupKeys = nil
 	m.groupSessionChannels = nil
 	m.latestGroupKey = nil
+	m.groupSpecVersion = nil
 	m.groupKeyLRU = nil
 	m.groupNativeObjects = 0
 }
@@ -540,6 +544,18 @@ func assembleCipherV1(chunks []string) ([]byte, error) {
 	return append(append(b0, b1...), b2...), nil
 }
 
+// ChunksVersion returns the Letter Sealing version (1 or 2) of encrypted message chunks.
+func ChunksVersion(chunks []string) int {
+	if len(chunks) == 0 {
+		return 2
+	}
+	ver, err := cipherVersion(chunks)
+	if err != nil {
+		return 2
+	}
+	return ver
+}
+
 func cipherVersion(chunks []string) (int, error) {
 	first, err := base64.StdEncoding.DecodeString(strings.TrimSpace(chunks[0]))
 	if err != nil {
@@ -561,6 +577,7 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 	ref := groupKeyRef{chatMid, sharedKey.GroupKeyID}
 	if id := m.groupKeys[chatMid][sharedKey.GroupKeyID]; id != 0 {
 		m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
+		m.groupSpecVersion[chatMid] = sharedKey.SpecVersion
 		m.touchGroupKeyLocked(ref)
 		return id, nil
 	}
@@ -599,6 +616,7 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 	m.groupKeys[chatMid][sharedKey.GroupKeyID] = unwrappedKeyID
 
 	m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
+	m.groupSpecVersion[chatMid] = sharedKey.SpecVersion
 	m.groupNativeObjects++
 	m.touchGroupKeyLocked(ref)
 
@@ -631,6 +649,7 @@ func (m *Manager) evictGroupKeysLocked() error {
 		}
 		if m.latestGroupKey[ref.chatMid] == ref.groupKeyID {
 			delete(m.latestGroupKey, ref.chatMid)
+			delete(m.groupSpecVersion, ref.chatMid)
 		}
 		if err := m.runner.KeyDestroy(keyID); err != nil && isFatalLTSMError(err) {
 			return err
@@ -858,6 +877,10 @@ func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType in
 	chanID, err := m.ensureGroupChannelLocked(chatMid, groupKeyID, unwrappedKeyID, myKeyID)
 	if err != nil {
 		return nil, err
+	}
+
+	if m.groupSpecVersion[chatMid] == 1 {
+		return m.encryptV1Chunks(chanID, myKeyID, groupKeyID, payload)
 	}
 
 	ctB64, err := m.runner.ChannelEncryptV2(chanID, chatMid, fromMid, myKeyID, groupKeyID, contentType, seq, string(payload))

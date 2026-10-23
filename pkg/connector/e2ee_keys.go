@@ -73,6 +73,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 			Int("group_key_id", sharedKey.GroupKeyID).
 			Int("creator_key_id", sharedKey.CreatorKeyID).
 			Int("receiver_key_id", sharedKey.ReceiverKeyID).
+			Int("spec_version", sharedKey.SpecVersion).
 			Msg("Fetched group shared key")
 
 		if _, _, err := lc.ensurePeerKey(ctx, sharedKey.Creator); err != nil {
