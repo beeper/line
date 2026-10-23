@@ -46,7 +46,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_10_14",
+		ID:               "dev.highest.matrix.line.capabilities.2026_10_21",
 		MaxTextLength:    5000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
@@ -79,6 +79,16 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 					"image/heic":    event.CapLevelFullySupported,
 					"image/heif":    event.CapLevelFullySupported,
 					"image/jxl":     event.CapLevelFullySupported,
+				},
+			},
+			event.CapMsgSticker: {
+				Caption: event.CapLevelRejected,
+				MaxSize: handlers.BeeperMaxFileSize,
+				MimeTypes: map[string]event.CapabilitySupportLevel{
+					"image/png":  event.CapLevelFullySupported,
+					"image/gif":  event.CapLevelFullySupported,
+					"image/webp": event.CapLevelFullySupported,
+					"image/jpeg": event.CapLevelFullySupported,
 				},
 			},
 			event.MsgFile: {

@@ -128,7 +128,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
 	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
 	effectiveMsgType := msg.Content.MsgType
-	if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
+	if effectiveMsgType == event.CapMsgSticker {
+		effectiveMsgType = event.MsgImage
+	} else if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
 		mime := msg.Content.Info.MimeType
 		if strings.HasPrefix(mime, "audio/") {
 			effectiveMsgType = event.MsgAudio
