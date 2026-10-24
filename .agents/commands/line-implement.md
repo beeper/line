@@ -38,11 +38,16 @@ Support Matrix group avatar changes by matching LINE Chrome Extension traffic.
    - Use a fresh `/tmp/line-chrome-extension-capture/<timestamp>-<slug>` directory with `umask 077`.
    - Do not commit raw capture files, Chrome profiles, screenshots, QR codes, or parsed JSON.
    - Do not request, store, or automate the LINE password.
+   - Do not open DevTools on the LINE extension during a capture (LINE has `debugger;` traps); the recorder does not need it. The launcher opens `about:blank`; the user opens LINE from the extension's toolbar icon.
    - The user performs LINE login manually, including email/password, QR, PIN, 2FA, and mobile approval.
    - Do not run the bridge and LINE Chrome Extension simultaneously unless the user explicitly accepts session invalidation.
    - Prefer the persistent capture Chrome profile from `scripts/line-chrome-capture.sh`. Use the user's normal Chrome profile only after explicit approval.
 
 5. **Run the capture.**
+   - Run `bash scripts/line-capture-preflight.sh` (Git Bash on Windows). If
+     anything is `MISSING`, pick install commands that fit the reported OS and
+     the package managers present, show them to the user, install only after
+     they confirm, and re-run until it passes. See `line-capture.md` step 1.
    - Check for running Chrome and `matrix-line` processes; warn before closing or stopping anything.
    - Start capture:
      ```

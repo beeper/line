@@ -29,13 +29,55 @@
 # This is useful when installing LINE from the Chrome Web Store into the
 # persistent capture profile.
 #
-# When done, close Chrome (Cmd+Q). The capture files will be at:
+# The browser opens on about:blank; open LINE from the extension's toolbar icon
+# (LINE_CAPTURE_START_URL overrides the start URL). When done, quit Chrome
+# completely. The capture files will be at:
 #   <output_dir>/line-cdp-capture.json  — CDP capture (SSE + request bodies)
 #   <output_dir>/line-net-log.json      — Chrome net-log (low-level backup)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Without its dependencies the CDP listener dies silently and only the net-log
+# is saved, which lacks request bodies and SSE events.
+if ! "$SCRIPT_DIR/line-capture-preflight.sh" >/dev/null; then
+    "$SCRIPT_DIR/line-capture-preflight.sh"
+    echo ""
+    echo "==> Install the missing dependencies above, then run this again."
+    exit 1
+fi
+# Sets CHROME and PYTHON. PYTHON can be several words ("py -3"), so it is
+# expanded unquoted below.
+eval "$("$SCRIPT_DIR/line-capture-preflight.sh" --print-env)"
+
+warn() { echo "    WARNING: $*" >&2; }
+
+# Chrome on Windows needs native paths; Git Bash paths only convert implicitly
+# for some arguments.
+native_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+    else
+        echo "$1"
+    fi
+}
+
+# Directories that can hold the user's normal Chrome profiles, per OS.
+normal_chrome_dirs() {
+    case "$(uname -s)" in
+        Darwin)
+            echo "$HOME/Library/Application Support/Google/Chrome" ;;
+        MINGW* | MSYS* | CYGWIN*)
+            local local_appdata="${LOCALAPPDATA:-$HOME/AppData/Local}"
+            command -v cygpath >/dev/null 2>&1 && local_appdata="$(cygpath -u "$local_appdata")"
+            echo "$local_appdata/Google/Chrome/User Data" ;;
+        *)
+            echo "$HOME/.config/google-chrome"
+            echo "$HOME/.config/chromium" ;;
+    esac
+}
+
 OUTPUT_DIR="${1:-/tmp/line-chrome-extension-capture}"
 mkdir -p "$OUTPUT_DIR"
 NETLOG_FILE="$OUTPUT_DIR/line-net-log.json"
@@ -56,7 +98,7 @@ seed_chrome_capture_profile() {
     # below keep the choices explicit and readable for future maintainers.
     touch "$profile_dir/First Run"
 
-    python3 - "$profile_dir" <<'PY'
+    $PYTHON - "$profile_dir" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -139,10 +181,16 @@ PY
 
 find_latest_extension_dir() {
     local extension_id="$1"
-    local base="$HOME/Library/Application Support/Google/Chrome/Default/Extensions/$extension_id"
-    if [ -d "$base" ]; then
-        find "$base" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1
-    fi
+    local chrome_dir base
+    while IFS= read -r chrome_dir; do
+        base="$chrome_dir/Default/Extensions/$extension_id"
+        [ -d "$base" ] || continue
+        # Chrome's folders can be unreadable (macOS privacy protection answers
+        # "Operation not permitted"); skip those instead of aborting.
+        if ! find "$base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1 | grep .; then
+            warn "cannot read $base, skipping"
+        fi
+    done < <(normal_chrome_dirs)
 }
 
 find_latest_profile_extension_dir() {
@@ -150,14 +198,14 @@ find_latest_profile_extension_dir() {
     local extension_id="$2"
     local base="$profile_dir/Default/Extensions/$extension_id"
     if [ -d "$base" ]; then
-        find "$base" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1
+        find "$base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1 || true
     fi
 }
 
 read_manifest_version() {
     local extension_dir="$1"
     if [ -n "${extension_dir:-}" ] && [ -f "$extension_dir/manifest.json" ]; then
-        python3 - "$extension_dir/manifest.json" <<'PY'
+        $PYTHON - "$extension_dir/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -173,7 +221,7 @@ PY
 find_repo_extension_version() {
     local client_file="$SCRIPT_DIR/../pkg/line/client.go"
     if [ -f "$client_file" ]; then
-        python3 - "$client_file" <<'PY'
+        $PYTHON - "$client_file" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -193,7 +241,7 @@ stage_extension_dir() {
     fi
 
     local version
-    version="$(python3 - "$source_dir/manifest.json" <<'PY'
+    version="$($PYTHON - "$source_dir/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -211,13 +259,21 @@ PY
 
     # Chrome Web Store extension directories contain _metadata/, which Chrome
     # rejects when loading as unpacked. Stage a clean copy for capture runs.
+    # An unreadable source must not abort the capture; skip with a warning.
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete --exclude '_metadata' "$source_dir/" "$dest/"
+        rsync -a --delete --exclude '_metadata' "$source_dir/" "$dest/" 2>/dev/null || {
+            warn "could not copy $source_dir, skipping this extension"
+            return 0
+        }
     else
         local tmp="$dest.tmp"
         rm -rf "$tmp"
         mkdir -p "$tmp"
-        (cd "$source_dir" && tar --exclude './_metadata' -cf - .) | (cd "$tmp" && tar -xf -)
+        if ! { (cd "$source_dir" && tar --exclude './_metadata' -cf - .) | (cd "$tmp" && tar -xf -); } 2>/dev/null; then
+            rm -rf "$tmp"
+            warn "could not copy $source_dir, skipping this extension"
+            return 0
+        fi
         rm -rf "$dest"
         mv "$tmp" "$dest"
     fi
@@ -248,13 +304,6 @@ if [ -n "${LINE_EXTENSION_DIR:-}" ] && [ -f "$LINE_EXTENSION_DIR/manifest.json" 
 fi
 if [ -n "${CODEX_EXTENSION_DIR:-}" ] && [ -f "$CODEX_EXTENSION_DIR/manifest.json" ]; then
     EXTENSION_DIRS+=("$CODEX_EXTENSION_DIR")
-fi
-
-CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
-if [ ! -x "$CHROME" ]; then
-    echo "Chrome not found at $CHROME"
-    echo "Set CHROME env var to your Chrome binary path."
-    exit 1
 fi
 
 FIRST_RUN=false
@@ -298,8 +347,9 @@ if [ "$FIRST_RUN" = true ]; then
     echo "    The profile persists across capture dirs — you only need to do this once."
     echo ""
 fi
-echo "    1. Open the LINE Chrome Extension and do your flow"
-echo "    2. When done, close Chrome (Cmd+Q)"
+echo "    1. Click the LINE extension icon in the toolbar (puzzle-piece menu if not pinned) and do your flow"
+echo "       Do not open DevTools on the extension: LINE has debugger traps and the recorder does not need it."
+echo "    2. When done, quit Chrome completely (all windows, not just the tab)"
 echo ""
 
 # Chrome 146+ requires --user-data-dir for remote debugging.
@@ -310,14 +360,18 @@ CHROME_ARGS=(
     --disable-features=SignInPromo,SigninInterception,ChromeSigninIntercept,DiceWebSigninInterception
     --remote-debugging-port=9222
     --remote-allow-origins="*"
-    --user-data-dir="$DEBUG_PROFILE"
-    --log-net-log="$NETLOG_FILE"
+    --user-data-dir="$(native_path "$DEBUG_PROFILE")"
+    --log-net-log="$(native_path "$NETLOG_FILE")"
     --net-log-capture-mode=IncludeSensitive
 )
 
 if [ ${#EXTENSION_DIRS[@]} -gt 0 ]; then
+    NATIVE_EXTENSION_DIRS=()
+    for ext_dir in "${EXTENSION_DIRS[@]}"; do
+        NATIVE_EXTENSION_DIRS+=("$(native_path "$ext_dir")")
+    done
     IFS=,
-    EXTENSION_ARG="${EXTENSION_DIRS[*]}"
+    EXTENSION_ARG="${NATIVE_EXTENSION_DIRS[*]}"
     unset IFS
     if [ -z "${LINE_PROFILE_EXTENSION_DIR:-}" ]; then
         CHROME_ARGS+=(--disable-extensions-except="$EXTENSION_ARG")
@@ -325,22 +379,15 @@ if [ ${#EXTENSION_DIRS[@]} -gt 0 ]; then
     CHROME_ARGS+=(--load-extension="$EXTENSION_ARG")
 fi
 
-START_URL="${LINE_CAPTURE_START_URL:-}"
-if [ -z "$START_URL" ] && [ -n "${LINE_PROFILE_EXTENSION_DIR:-}" ] && [ -f "$LINE_PROFILE_EXTENSION_DIR/manifest.json" ]; then
-    START_URL="chrome-extension://ophjlpahpchlmihnnnihgmmeilfjmjjc/index.html"
-fi
-if [ -z "$START_URL" ] && [ -n "${LINE_EXTENSION_DIR:-}" ] && [ -f "$LINE_EXTENSION_DIR/manifest.json" ]; then
-    START_URL="chrome-extension://ophjlpahpchlmihnnnihgmmeilfjmjjc/index.html"
-fi
-if [ -z "$START_URL" ]; then
-    START_URL="about:blank"
-fi
+# about:blank on purpose: opening the extension's index.html as a tab behaves
+# differently from the real popup, so the user opens LINE from the toolbar icon.
+START_URL="${LINE_CAPTURE_START_URL:-about:blank}"
 
 "$CHROME" "${CHROME_ARGS[@]}" "$START_URL" 2>/dev/null &
 CHROME_PID=$!
 
 # Start the CDP capture (it waits for Chrome to be ready)
-python3 "$SCRIPT_DIR/line-cdp-capture.py" "$CDP_FILE" &
+$PYTHON "$SCRIPT_DIR/line-cdp-capture.py" "$CDP_FILE" &
 CDP_PID=$!
 
 # Wait for Chrome to exit
