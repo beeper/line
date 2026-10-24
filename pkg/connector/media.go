@@ -13,7 +13,7 @@ import (
 	"image"
 	_ "image/gif"
 	"image/jpeg"
-	_ "image/png"
+	"image/png"
 	"io"
 	"os"
 	"os/exec"
@@ -53,17 +53,41 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 	defer os.RemoveAll(dir)
 
 	inputPath := filepath.Join(dir, "input.heic")
-	outputPath := filepath.Join(dir, "output.jpg")
 	if err = os.WriteFile(inputPath, imageData, 0o600); err != nil {
 		return nil, fmt.Errorf("failed to write temporary HEIC file: %w", err)
 	}
 
 	// iPhone photos are HEIF grids of tiles. The ffmpeg CLI only decodes the
 	// first tile, while libheif assembles the full image.
+	jpegData, err := runHEIFDec(ctx, dir, inputPath, "jpg")
+	if err == nil {
+		return stripJPEGMetadata(jpegData), nil
+	} else if ctx.Err() != nil {
+		return nil, err
+	}
+
+	// libheif's JPEG writer gives up on a broken EXIF block, while its PNG
+	// writer skips the block and writes the image.
+	pngData, pngErr := runHEIFDec(ctx, dir, inputPath, "png")
+	if pngErr != nil {
+		return nil, err
+	}
+	img, imgErr := png.Decode(bytes.NewReader(pngData))
+	if imgErr != nil {
+		return nil, fmt.Errorf("failed to decode converted PNG: %w", imgErr)
+	}
+	var buf bytes.Buffer
+	if err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+		return nil, fmt.Errorf("failed to encode converted image: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func runHEIFDec(ctx context.Context, dir, inputPath, extension string) ([]byte, error) {
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "heif-dec", "--quiet", inputPath, outputPath)
+	cmd := exec.CommandContext(ctx, "heif-dec", "--quiet", inputPath, filepath.Join(dir, "output."+extension))
 	cmd.Stderr = &stderr
-	if err = cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("heif-dec failed: %w", ctxErr)
 		}
@@ -72,22 +96,20 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 
 	// heif-dec writes output-1.jpg, output-2.jpg, ... instead of output.jpg
 	// when the file holds several top-level images. Use the first one.
-	outputs, err := filepath.Glob(filepath.Join(dir, "output*.jpg"))
+	outputs, err := filepath.Glob(filepath.Join(dir, "output*."+extension))
 	if err != nil || len(outputs) == 0 {
-		return nil, fmt.Errorf("heif-dec produced no output")
+		return nil, fmt.Errorf("heif-dec produced no output: %s", strings.TrimSpace(stderr.String()))
 	}
-	jpegData, err := os.ReadFile(outputs[0])
+	data, err := os.ReadFile(outputs[0])
 	if err != nil {
-		return nil, fmt.Errorf("failed to read converted JPEG: %w", err)
+		return nil, fmt.Errorf("failed to read converted image: %w", err)
 	}
-	config, format, err := image.DecodeConfig(bytes.NewReader(jpegData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate converted JPEG: %w", err)
+	// heif-dec exits 0 even when its writer fails, leaving an empty file.
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || config.Width <= 0 || config.Height <= 0 {
+		return nil, fmt.Errorf("heif-dec produced invalid %s output: %s", extension, strings.TrimSpace(stderr.String()))
 	}
-	if format != "jpeg" || config.Width <= 0 || config.Height <= 0 {
-		return nil, fmt.Errorf("heif-dec produced invalid JPEG output")
-	}
-	return stripJPEGMetadata(jpegData), nil
+	return data, nil
 }
 
 // stripJPEGMetadata drops every APP1 segment. heif-dec copies the HEIC's EXIF
