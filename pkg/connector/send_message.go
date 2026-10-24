@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"go.mau.fi/util/ffmpeg"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -529,6 +530,17 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
 
+		var mimeType string
+		if msg.Content.Info != nil {
+			mimeType = msg.Content.Info.MimeType
+		}
+		if !isLineAudioFormat(mimeType) && ffmpeg.Supported() {
+			data, err = ffmpeg.ConvertBytes(ctx, data, ".m4a", []string{}, []string{"-c:a", "aac"}, mimeType)
+			if err != nil {
+				return nil, fmt.Errorf("%w audio to m4a: %w", bridgev2.ErrMediaConvertFailed, err)
+			}
+		}
+
 		contentType = int(ContentAudio)
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 		contentMetadata["contentType"] = fmt.Sprintf("%d", ContentAudio)
@@ -896,6 +908,15 @@ func wrapInZip(fileName string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func isLineAudioFormat(mimeType string) bool {
+	mimeType, _, _ = strings.Cut(mimeType, ";")
+	switch strings.TrimSpace(mimeType) {
+	case "audio/mp4", "audio/x-m4a", "audio/m4a", "audio/mpeg", "audio/mp3":
+		return true
+	}
+	return false
 }
 
 func contentTypeForMsgType(msgType event.MessageType) int {
