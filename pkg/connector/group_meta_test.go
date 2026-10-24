@@ -3,6 +3,7 @@ package connector
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -396,6 +397,50 @@ func TestConvertAvatarToJPEGFallsBackWhenGoCannotDecode(t *testing.T) {
 		t.Fatal("ffmpeg fallback was not used")
 	}
 	assertColorNear(t, decodeJPEG(t, out).At(8, 8), blue)
+}
+
+// Two-frame animated WebPs (4x4, red then blue) made with Pillow, one for
+// each way a frame can be stored.
+var animatedWebPs = map[string]string{
+	"lossless":     "UklGRoQAAABXRUJQVlA4WAoAAAACAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GKAAAAAAAAAAAAAMAAAMAAGQAAAJWUDhMDwAAAC8DwAAABxD9j/4HIqL/AQBBTk1GKAAAAAAAAAAAAAMAAAMAAGQAAABWUDhMDwAAAC8DwAAABxDR//4HIqL/AQA=",
+	"lossy":        "UklGRsQAAABXRUJQVlA4WAoAAAACAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GSgAAAAAAAAAAAAMAAAMAAGQAAAJWUDggMgAAADABAJ0BKgQABAABQCYloAADcAD+8ut///mwP/bz/wR6Af//0uD//pcH//S4P/SkAAAAQU5NRkYAAAAAAAAAAAADAAADAABkAAAAVlA4IC4AAAA0AQCdASoEAAQAAAAmJaAAA3AA/vtV4///S4P/+lwf/9Lg/9Lg//rV5Vesq6AA",
+	"lossy, alpha": "UklGRtYAAABXRUJQVlA4WAoAAAASAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GXAAAAAAAAAAAAAMAAAMAAGQAAAJBTFBICgAAAAEHUMCICERE/wNWUDggMgAAADABAJ0BKgQABAABQCYloAADcAD+8ut///mwP/bz/wR6Af//0uD//pcH//S4P/SkAAAAQU5NRkYAAAAAAAAAAAADAAADAABkAAAAVlA4IC4AAAA0AQCdASoEAAQAAAAmJaAAA3AA/vtV4///S4P/+lwf/9Lg/9Lg//rV5Vesq6AA",
+}
+
+func TestConvertAvatarToJPEGUsesFirstAnimatedWebPFrame(t *testing.T) {
+	oldConvert := convertFirstFrameWithFFmpeg
+	t.Cleanup(func() { convertFirstFrameWithFFmpeg = oldConvert })
+	convertFirstFrameWithFFmpeg = func(context.Context, []byte) ([]byte, error) {
+		return nil, errors.New("ffmpeg must not be needed")
+	}
+	for name, encoded := range animatedWebPs {
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err = image.Decode(bytes.NewReader(data)); err == nil {
+			t.Fatalf("%s: Go decoded the animated WebP directly, so the frame path wasn't tested", name)
+		}
+		out, err := convertAvatarToJPEG(context.Background(), data)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		img := decodeJPEG(t, out)
+		if img.Bounds().Dx() != 4 || img.Bounds().Dy() != 4 {
+			t.Fatalf("%s: size = %v, want 4x4", name, img.Bounds())
+		}
+		// Lossy frames shift colors a little, so only check which frame came out.
+		r, g, bl, _ := img.At(2, 2).RGBA()
+		r, g, bl = r>>8, g>>8, bl>>8
+		if name == "lossy, alpha" {
+			// Half-transparent red on white.
+			if r < 200 || g < 80 || g > 180 || bl < 80 || bl > 180 {
+				t.Errorf("%s: color = %d,%d,%d, want pink", name, r, g, bl)
+			}
+		} else if r < 200 || g > 60 || bl > 60 {
+			t.Errorf("%s: color = %d,%d,%d, want the red first frame", name, r, g, bl)
+		}
+	}
 }
 
 func TestConvertAvatarToJPEGRejectsNonImage(t *testing.T) {

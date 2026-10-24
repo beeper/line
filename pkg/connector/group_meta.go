@@ -20,7 +20,7 @@ import (
 	"github.com/rs/zerolog"
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
-	_ "golang.org/x/image/webp"
+	"golang.org/x/image/webp"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
@@ -210,7 +210,13 @@ func convertAvatarToJPEG(ctx context.Context, data []byte) ([]byte, error) {
 			}
 			return encodeAvatarJPEG(img, orientation)
 		}
-		// Animated WebP gets here: Go reads its header but not its frames.
+		// Go reads the header of an animated WebP but not its frames, and
+		// ffmpeg before 9.0 can't decode it either.
+		if format == "webp" {
+			if img, err := firstWebPFrame(data); err == nil {
+				return encodeAvatarJPEG(img, 1)
+			}
+		}
 	}
 	// HEIC, AVIF, TIFF and animated WebP have no Go decoder here. ffmpeg
 	// applies their rotation and scales its output to fit maxAvatarSide.
@@ -347,6 +353,107 @@ func tiffOrientation(tiff []byte) int {
 		}
 	}
 	return 1
+}
+
+type webpChunk struct {
+	id   string
+	data []byte
+}
+
+// readWebPChunks splits RIFF chunk data into chunks. Each chunk is a fourCC,
+// a little-endian size and the data, padded to an even length.
+func readWebPChunks(data []byte) ([]webpChunk, error) {
+	var chunks []webpChunk
+	for len(data) >= 8 {
+		size := int(binary.LittleEndian.Uint32(data[4:8]))
+		if size < 0 || size > len(data)-8 {
+			return nil, errors.New("truncated WebP chunk")
+		}
+		chunks = append(chunks, webpChunk{id: string(data[:4]), data: data[8 : 8+size]})
+		data = data[min(8+size+size%2, len(data)):]
+	}
+	return chunks, nil
+}
+
+func uint24(b []byte) int {
+	return int(b[0]) | int(b[1])<<8 | int(b[2])<<16
+}
+
+// firstWebPFrame decodes the first frame of an animated WebP. Each frame
+// (ANMF chunk) holds the chunks of a still image, so the first one is wrapped
+// as a still WebP for Go's decoder and drawn at its offset on the canvas.
+func firstWebPFrame(data []byte) (image.Image, error) {
+	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+		return nil, errors.New("not a WebP file")
+	}
+	chunks, err := readWebPChunks(data[12:])
+	if err != nil {
+		return nil, err
+	}
+	var canvasWidth, canvasHeight int
+	for _, chunk := range chunks {
+		switch chunk.id {
+		case "VP8X":
+			if len(chunk.data) < 10 {
+				return nil, errors.New("invalid VP8X chunk")
+			}
+			canvasWidth, canvasHeight = uint24(chunk.data[4:])+1, uint24(chunk.data[7:])+1
+		case "ANMF":
+			if len(chunk.data) < 16 || canvasWidth == 0 {
+				return nil, errors.New("invalid ANMF chunk")
+			}
+			x, y := 2*uint24(chunk.data[0:]), 2*uint24(chunk.data[3:])
+			width, height := uint24(chunk.data[6:])+1, uint24(chunk.data[9:])+1
+			frameChunks, err := readWebPChunks(chunk.data[16:])
+			if err != nil {
+				return nil, err
+			}
+			frame, err := webp.Decode(bytes.NewReader(stillWebP(frameChunks, width, height)))
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode first WebP frame: %w", err)
+			}
+			if x == 0 && y == 0 && width == canvasWidth && height == canvasHeight {
+				return frame, nil
+			}
+			canvas := image.NewNRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
+			draw.Draw(canvas, image.Rect(x, y, x+width, y+height), frame, frame.Bounds().Min, draw.Src)
+			return canvas, nil
+		}
+	}
+	return nil, errors.New("no WebP animation frame")
+}
+
+func stillWebP(frameChunks []webpChunk, width, height int) []byte {
+	var body bytes.Buffer
+	body.WriteString("WEBP")
+	writeChunk := func(id string, data []byte) {
+		body.WriteString(id)
+		_ = binary.Write(&body, binary.LittleEndian, uint32(len(data)))
+		body.Write(data)
+		if len(data)%2 == 1 {
+			body.WriteByte(0)
+		}
+	}
+	for _, chunk := range frameChunks {
+		if chunk.id == "ALPH" {
+			// Lossy frames keep their alpha in a separate chunk, which needs a VP8X header.
+			vp8x := make([]byte, 10)
+			vp8x[0] = 0x10 // alpha
+			vp8x[4], vp8x[5], vp8x[6] = byte(width-1), byte((width-1)>>8), byte((width-1)>>16)
+			vp8x[7], vp8x[8], vp8x[9] = byte(height-1), byte((height-1)>>8), byte((height-1)>>16)
+			writeChunk("VP8X", vp8x)
+			break
+		}
+	}
+	for _, chunk := range frameChunks {
+		switch chunk.id {
+		case "ALPH", "VP8 ", "VP8L":
+			writeChunk(chunk.id, chunk.data)
+		}
+	}
+	out := []byte("RIFF")
+	out = binary.LittleEndian.AppendUint32(out, uint32(body.Len()))
+	return append(out, body.Bytes()...)
 }
 
 // cappedBuffer fails writes past max bytes, so a misbehaving ffmpeg can't fill memory.
