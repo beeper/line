@@ -535,7 +535,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			mimeType = msg.Content.Info.MimeType
 		}
 		if !isLineAudioFormat(mimeType) && ffmpeg.Supported() {
-			data, err = ffmpeg.ConvertBytes(ctx, data, ".m4a", []string{}, []string{"-c:a", "aac"}, mimeType)
+			data, err = ffmpeg.ConvertBytes(ctx, data, ".m4a", []string{}, []string{"-vn", "-c:a", "aac"}, mimeType)
 			if err != nil {
 				return nil, fmt.Errorf("%w audio to m4a: %w", bridgev2.ErrMediaConvertFailed, err)
 			}
