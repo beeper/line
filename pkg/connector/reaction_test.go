@@ -20,8 +20,8 @@ import (
 
 func TestCapabilitiesAdvertiseSupportedReactions(t *testing.T) {
 	infoVersion, capabilityVersion := (&LineConnector{}).GetBridgeInfoVersion()
-	if infoVersion != 1 || capabilityVersion != 7 {
-		t.Fatalf("bridge info/capability versions = %d/%d, want 1/7", infoVersion, capabilityVersion)
+	if infoVersion != 1 || capabilityVersion != 8 {
+		t.Fatalf("bridge info/capability versions = %d/%d, want 1/8", infoVersion, capabilityVersion)
 	}
 
 	caps := (&LineClient{}).GetCapabilities(context.Background(), nil)
