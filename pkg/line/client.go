@@ -527,12 +527,16 @@ func (c *Client) ConfirmE2EELogin(verifier, serverPublicKeyB64, encryptedKeyChai
 // postWithHMAC is a small helper for non-standard RPC endpoints that still expect
 // the same headers and HMAC signature as the Talk endpoints.
 func (c *Client) postWithHMAC(fullURL string, body []byte) ([]byte, error) {
-	req, err := http.NewRequestWithContext(c.requestContext(), "POST", fullURL, bytes.NewBuffer(body))
+	return c.postWithHMACContext(c.requestContext(), fullURL, body, "application/json")
+}
+
+func (c *Client) postWithHMACContext(ctx context.Context, fullURL string, body []byte, contentType string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", fullURL, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("x-line-chrome-version", ExtensionVersion)
 	req.Header.Set("x-line-application", "CHROMEOS\t3.7.2\tChrome_OS")
@@ -566,6 +570,26 @@ func (c *Client) postWithHMAC(fullURL string, body []byte) ([]byte, error) {
 	}
 
 	return io.ReadAll(resp.Body)
+}
+
+// UploadChatPicture sets a group's picture. The Chrome extension posts the raw
+// image bytes to obs/uploadProfile with the group MID and always sends JPEG.
+func (c *Client) UploadChatPicture(ctx context.Context, chatMid string, jpegData []byte) error {
+	fullURL := "https://line-chrome-gw.line-apps.com/api/obs/uploadProfile?mid=" + url.QueryEscape(chatMid)
+	resp, err := c.postWithHMACContext(ctx, fullURL, jpegData, "image/jpeg")
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse uploadProfile response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("uploadProfile failed: %s", resp)
+	}
+	return nil
 }
 
 func (c *Client) RefreshAccessToken(refreshToken string) (*TokenV3IssueResult, error) {
