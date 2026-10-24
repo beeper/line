@@ -89,18 +89,6 @@ func TestCopyLoginE2EEKeyMetadataClonesExportedKeyMap(t *testing.T) {
 	}
 }
 
-func TestLoginSecureDataIDPrefersLineMID(t *testing.T) {
-	meta := &UserLoginMetadata{Mid: "u-line-mid"}
-	if got := loginSecureDataID(meta, "@user:example.com"); got != "u-line-mid" {
-		t.Fatalf("loginSecureDataID = %q, want LINE MID", got)
-	}
-
-	meta.Mid = ""
-	if got := loginSecureDataID(meta, "@user:example.com"); got != "@user:example.com" {
-		t.Fatalf("loginSecureDataID fallback = %q, want Matrix fallback", got)
-	}
-}
-
 func TestStartWithOverrideForcesFullReconnectWithoutStoredE2EEKeys(t *testing.T) {
 	oldLogin := loginWithCredentials
 	var gotCertificate string

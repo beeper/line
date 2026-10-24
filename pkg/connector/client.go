@@ -906,12 +906,6 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	if mgr != nil {
 		lc.missingE2EEKeyMarked = false
 	}
-	if mgr != nil {
-		if err := mgr.SaveSecureDataToFile(loginSecureDataID(&staged, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")
-		}
-	}
-
 	lc.UserLogin.Bridge.Log.Info().Msg("Login successful!")
 	return nil
 }
@@ -965,9 +959,6 @@ func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLogi
 		return errLineClientSuperseded
 	}
 	lc.applyRefreshedLoginE2EEKeys(meta, res, exported)
-	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-		return fmt.Errorf("save E2EE secure data after re-login: %w", err)
-	}
 	lc.UserLogin.Bridge.Log.Info().Int("keys", len(exported)).Msg("Refreshed E2EE keys after re-login")
 	return nil
 }

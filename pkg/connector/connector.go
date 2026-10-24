@@ -828,12 +828,6 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		retireLineLogin(ll.ExistingLogin)
 	}
 
-	if loginManager != nil {
-		if err := loginManager.SaveSecureDataToFile(loginSecureDataID(meta, string(ll.User.MXID)), map[string]any{"exportedKeyMap": meta.ExportedKeyMap}); err != nil {
-			ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save E2EE secure data")
-		}
-	}
-
 	go newClient.Connect(context.Background())
 
 	return &bridgev2.LoginStep{
@@ -944,13 +938,6 @@ func copyLoginE2EEKeyMetadata(dst, src *UserLoginMetadata) {
 
 func shouldPreserveExistingE2EEKeys(exportedKeys bool, existing *UserLoginMetadata) bool {
 	return !exportedKeys && existing != nil && len(existing.ExportedKeyMap) > 0 && !existing.ForceFullE2EELogin
-}
-
-func loginSecureDataID(meta *UserLoginMetadata, fallback string) string {
-	if meta.Mid != "" {
-		return meta.Mid
-	}
-	return fallback
 }
 
 func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginMetadata, client *line.Client) (*e2ee.Manager, error) {
