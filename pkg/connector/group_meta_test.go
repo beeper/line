@@ -278,6 +278,126 @@ func TestConvertAvatarToJPEGScalesFFmpegOutput(t *testing.T) {
 	}
 }
 
+// withEXIFOrientation inserts an EXIF segment with the orientation tag right
+// after the JPEG start marker.
+func withEXIFOrientation(jpegData []byte, order binary.ByteOrder, orientation uint16) []byte {
+	tiff := make([]byte, 8+2+12+4)
+	if order == binary.LittleEndian {
+		copy(tiff, "II")
+	} else {
+		copy(tiff, "MM")
+	}
+	order.PutUint16(tiff[2:], 42)
+	order.PutUint32(tiff[4:], 8)
+	order.PutUint16(tiff[8:], 1)
+	order.PutUint16(tiff[10:], 0x0112)
+	order.PutUint16(tiff[12:], 3) // SHORT
+	order.PutUint32(tiff[14:], 1)
+	order.PutUint16(tiff[18:], orientation)
+	payload := append([]byte("Exif\x00\x00"), tiff...)
+	segment := []byte{0xff, 0xe1, 0, 0}
+	binary.BigEndian.PutUint16(segment[2:], uint16(len(payload)+2))
+	out := append([]byte{}, jpegData[:2]...)
+	out = append(out, segment...)
+	out = append(out, payload...)
+	return append(out, jpegData[2:]...)
+}
+
+func encodeTestJPEG(t *testing.T, img image.Image) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestJPEGOrientation(t *testing.T) {
+	plain := encodeTestJPEG(t, solidImage(red))
+	for name, tc := range map[string]struct {
+		data []byte
+		want int
+	}{
+		"no EXIF":       {plain, 1},
+		"little endian": {withEXIFOrientation(plain, binary.LittleEndian, 6), 6},
+		"big endian":    {withEXIFOrientation(plain, binary.BigEndian, 8), 8},
+		"invalid value": {withEXIFOrientation(plain, binary.BigEndian, 9), 1},
+		"not a JPEG":    {[]byte("not a jpeg"), 1},
+		"truncated":     {withEXIFOrientation(plain, binary.BigEndian, 6)[:20], 1},
+	} {
+		if got := jpegOrientation(tc.data); got != tc.want {
+			t.Errorf("%s: orientation = %d, want %d", name, got, tc.want)
+		}
+	}
+}
+
+func TestOrientRGBA(t *testing.T) {
+	// A 2x1 image: red on the left, blue on the right.
+	src := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	src.Set(0, 0, red)
+	src.Set(1, 0, blue)
+	for orientation, want := range map[int][]color.RGBA{
+		1: {red, blue}, // left to right
+		2: {blue, red},
+		3: {blue, red},
+		4: {red, blue},
+		5: {red, blue}, // top to bottom
+		6: {red, blue},
+		7: {blue, red},
+		8: {blue, red},
+	} {
+		dst := orientRGBA(src, orientation)
+		var got []color.RGBA
+		if orientation >= 5 {
+			if dst.Rect.Dx() != 1 || dst.Rect.Dy() != 2 {
+				t.Fatalf("orientation %d: size = %v, want 1x2", orientation, dst.Rect)
+			}
+			got = []color.RGBA{dst.RGBAAt(0, 0), dst.RGBAAt(0, 1)}
+		} else {
+			got = []color.RGBA{dst.RGBAAt(0, 0), dst.RGBAAt(1, 0)}
+		}
+		if got[0] != want[0] || got[1] != want[1] {
+			t.Errorf("orientation %d: pixels = %v, want %v", orientation, got, want)
+		}
+	}
+}
+
+func TestConvertAvatarToJPEGRotatesLargeJPEG(t *testing.T) {
+	data := withEXIFOrientation(encodeTestJPEG(t, image.NewRGBA(image.Rect(0, 0, 5000, 100))), binary.BigEndian, 6)
+	out, err := convertAvatarToJPEG(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bounds := decodeJPEG(t, out).Bounds(); bounds.Dx() != 81 || bounds.Dy() != maxAvatarSide {
+		t.Fatalf("size = %dx%d, want 81x%d", bounds.Dx(), bounds.Dy(), maxAvatarSide)
+	}
+}
+
+func TestConvertAvatarToJPEGFallsBackWhenGoCannotDecode(t *testing.T) {
+	// Like animated WebP: the header reads fine, but the image data doesn't decode.
+	data := encodePNG(t, solidImage(red))
+	data = data[:len(data)-20]
+	if _, _, err := image.DecodeConfig(bytes.NewReader(data)); err != nil {
+		t.Fatalf("header should still read: %v", err)
+	}
+
+	oldConvert := convertFirstFrameWithFFmpeg
+	t.Cleanup(func() { convertFirstFrameWithFFmpeg = oldConvert })
+	var called bool
+	convertFirstFrameWithFFmpeg = func(ctx context.Context, data []byte) ([]byte, error) {
+		called = true
+		return encodePNG(t, solidImage(blue)), nil
+	}
+	out, err := convertAvatarToJPEG(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("ffmpeg fallback was not used")
+	}
+	assertColorNear(t, decodeJPEG(t, out).At(8, 8), blue)
+}
+
 func TestConvertAvatarToJPEGRejectsNonImage(t *testing.T) {
 	if _, err := convertAvatarToJPEG(context.Background(), []byte("not an image")); err == nil {
 		t.Fatal("expected an error")

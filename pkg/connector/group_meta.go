@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	_ "image/gif"
 	"image/jpeg"
-	_ "image/png"
+	"image/png"
 	"os"
 	"os/exec"
 	"strings"
@@ -195,29 +196,33 @@ var errAvatarTooLarge = errors.New("image is too large")
 // first frame, so the same is done here. JPEGs that fit are sent unchanged to
 // keep their quality and EXIF orientation.
 func convertAvatarToJPEG(ctx context.Context, data []byte) ([]byte, error) {
-	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil {
-		// HEIC, AVIF, TIFF and animated WebP have no Go decoder here.
-		data, err = convertFirstFrameWithFFmpeg(ctx, data)
-		if err != nil {
-			return nil, fmt.Errorf("unsupported avatar image: %w", err)
+	if cfg, format, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		if cfg.Width*cfg.Height > maxAvatarPixels {
+			return nil, fmt.Errorf("%w: %dx%d", errAvatarTooLarge, cfg.Width, cfg.Height)
 		}
-		cfg, format, err = image.DecodeConfig(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("failed to read ffmpeg output: %w", err)
+		if format == "jpeg" && cfg.Width <= maxAvatarSide && cfg.Height <= maxAvatarSide {
+			return data, nil
 		}
+		if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
+			orientation := 1
+			if format == "jpeg" {
+				orientation = jpegOrientation(data)
+			}
+			return encodeAvatarJPEG(img, orientation)
+		}
+		// Animated WebP gets here: Go reads its header but not its frames.
 	}
-	if cfg.Width*cfg.Height > maxAvatarPixels {
-		return nil, fmt.Errorf("%w: %dx%d", errAvatarTooLarge, cfg.Width, cfg.Height)
-	}
-	if format == "jpeg" && cfg.Width <= maxAvatarSide && cfg.Height <= maxAvatarSide {
-		return data, nil
-	}
-	img, _, err := image.Decode(bytes.NewReader(data))
+	// HEIC, AVIF, TIFF and animated WebP have no Go decoder here. ffmpeg
+	// applies their rotation and scales its output to fit maxAvatarSide.
+	pngData, err := convertFirstFrameWithFFmpeg(ctx, data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode avatar: %w", err)
+		return nil, fmt.Errorf("unsupported avatar image: %w", err)
 	}
-	return encodeAvatarJPEG(img)
+	img, err := png.Decode(bytes.NewReader(pngData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode ffmpeg output: %w", err)
+	}
+	return encodeAvatarJPEG(img, 1)
 }
 
 func fitAvatarSize(width, height int) (int, int) {
@@ -230,7 +235,9 @@ func fitAvatarSize(width, height int) (int, int) {
 	return max(1, width*maxAvatarSide/height), maxAvatarSide
 }
 
-func encodeAvatarJPEG(img image.Image) ([]byte, error) {
+// encodeAvatarJPEG scales the image to fit, applies the EXIF orientation
+// (re-encoding drops the EXIF data) and encodes it as JPEG.
+func encodeAvatarJPEG(img image.Image, orientation int) ([]byte, error) {
 	// JPEG has no alpha channel, so draw transparent images on white.
 	bounds := img.Bounds()
 	width, height := fitAvatarSize(bounds.Dx(), bounds.Dy())
@@ -242,10 +249,104 @@ func encodeAvatarJPEG(img image.Image) ([]byte, error) {
 		draw.CatmullRom.Scale(flat, flat.Bounds(), img, bounds, draw.Over, nil)
 	}
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, flat, &jpeg.Options{Quality: avatarJPEGQuality}); err != nil {
+	if err := jpeg.Encode(&buf, orientRGBA(flat, orientation), &jpeg.Options{Quality: avatarJPEGQuality}); err != nil {
 		return nil, fmt.Errorf("failed to encode avatar JPEG: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// orientRGBA turns an image stored with the given EXIF orientation (1-8)
+// upright.
+func orientRGBA(src *image.RGBA, orientation int) *image.RGBA {
+	if orientation < 2 || orientation > 8 {
+		return src
+	}
+	w, h := src.Rect.Dx(), src.Rect.Dy()
+	dw, dh := w, h
+	if orientation >= 5 {
+		dw, dh = h, w
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	for y := 0; y < dh; y++ {
+		for x := 0; x < dw; x++ {
+			var sx, sy int
+			switch orientation {
+			case 2: // mirrored
+				sx, sy = w-1-x, y
+			case 3: // rotated 180°
+				sx, sy = w-1-x, h-1-y
+			case 4: // mirrored vertically
+				sx, sy = x, h-1-y
+			case 5: // transposed
+				sx, sy = y, x
+			case 6: // needs a 90° clockwise turn
+				sx, sy = y, h-1-x
+			case 7: // transversed
+				sx, sy = w-1-y, h-1-x
+			case 8: // needs a 90° counter-clockwise turn
+				sx, sy = w-1-y, x
+			}
+			copy(dst.Pix[dst.PixOffset(x, y):][:4], src.Pix[src.PixOffset(sx, sy):][:4])
+		}
+	}
+	return dst
+}
+
+// jpegOrientation reads the EXIF orientation tag of a JPEG, or returns 1
+// when there is none.
+func jpegOrientation(data []byte) int {
+	if len(data) < 4 || data[0] != 0xff || data[1] != 0xd8 {
+		return 1
+	}
+	for pos := 2; pos+4 <= len(data) && data[pos] == 0xff; {
+		marker := data[pos+1]
+		if marker == 0xda { // start of scan: no more metadata
+			return 1
+		}
+		length := int(binary.BigEndian.Uint16(data[pos+2:]))
+		if length < 2 || pos+2+length > len(data) {
+			return 1
+		}
+		segment := data[pos+4 : pos+2+length]
+		if marker == 0xe1 && bytes.HasPrefix(segment, []byte("Exif\x00\x00")) {
+			return tiffOrientation(segment[6:])
+		}
+		pos += 2 + length
+	}
+	return 1
+}
+
+func tiffOrientation(tiff []byte) int {
+	if len(tiff) < 8 {
+		return 1
+	}
+	var order binary.ByteOrder
+	switch string(tiff[:2]) {
+	case "II":
+		order = binary.LittleEndian
+	case "MM":
+		order = binary.BigEndian
+	default:
+		return 1
+	}
+	ifd := int(order.Uint32(tiff[4:]))
+	if ifd < 8 || ifd+2 > len(tiff) {
+		return 1
+	}
+	count := int(order.Uint16(tiff[ifd:]))
+	for i := 0; i < count; i++ {
+		entry := ifd + 2 + i*12
+		if entry+12 > len(tiff) {
+			return 1
+		}
+		if order.Uint16(tiff[entry:]) == 0x0112 {
+			if value := int(order.Uint16(tiff[entry+8:])); value >= 1 && value <= 8 {
+				return value
+			}
+			return 1
+		}
+	}
+	return 1
 }
 
 // cappedBuffer fails writes past max bytes, so a misbehaving ffmpeg can't fill memory.
@@ -263,7 +364,7 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 
 // convertFirstFrameWithFFmpeg returns the first frame as a PNG that fits in
 // maxAvatarSide. PNG keeps transparency so encodeAvatarJPEG can flatten it.
-func convertFirstFrameWithFFmpeg(ctx context.Context, data []byte) ([]byte, error) {
+var convertFirstFrameWithFFmpeg = func(ctx context.Context, data []byte) ([]byte, error) {
 	input, err := os.CreateTemp("", "line-avatar-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temporary avatar file: %w", err)
