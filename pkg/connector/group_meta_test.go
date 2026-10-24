@@ -15,12 +15,12 @@ import (
 	"image/png"
 	"io"
 	"net/http"
-	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/image/bmp"
+	"golang.org/x/image/tiff"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -143,7 +143,7 @@ func TestConvertAvatarToJPEGKeepsJPEG(t *testing.T) {
 	if err := jpeg.Encode(&buf, solidImage(red), nil); err != nil {
 		t.Fatal(err)
 	}
-	out, err := convertAvatarToJPEG(context.Background(), buf.Bytes())
+	out, err := convertAvatarToJPEG(buf.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestConvertAvatarToJPEGFlattensTransparentPNG(t *testing.T) {
 	if err := png.Encode(&buf, solidImage(color.NRGBA{})); err != nil {
 		t.Fatal(err)
 	}
-	out, err := convertAvatarToJPEG(context.Background(), buf.Bytes())
+	out, err := convertAvatarToJPEG(buf.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestConvertAvatarToJPEGUsesFirstGIFFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := convertAvatarToJPEG(context.Background(), buf.Bytes())
+	out, err := convertAvatarToJPEG(buf.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,28 +190,7 @@ func TestConvertAvatarToJPEGConvertsBMP(t *testing.T) {
 	if err := bmp.Encode(&buf, solidImage(blue)); err != nil {
 		t.Fatal(err)
 	}
-	out, err := convertAvatarToJPEG(context.Background(), buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertColorNear(t, decodeJPEG(t, out).At(8, 8), blue)
-}
-
-func TestConvertAvatarToJPEGFallsBackToFFmpeg(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not installed")
-	}
-	// No TIFF decoder is registered in Go, so this takes the same path as HEIC and AVIF.
-	tiffData, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "color=c=blue:s=16x16", "-frames:v", "1",
-		"-f", "image2pipe", "-vcodec", "tiff", "pipe:1").Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err = image.Decode(bytes.NewReader(tiffData)); err == nil {
-		t.Fatal("TIFF decoded in Go, so ffmpeg wasn't tested")
-	}
-	out, err := convertAvatarToJPEG(context.Background(), tiffData)
+	out, err := convertAvatarToJPEG(buf.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +215,7 @@ func TestConvertAvatarToJPEGScalesDownLargeImages(t *testing.T) {
 		"png":  encodePNG(t, image.NewNRGBA(image.Rect(0, 0, 100, 5000))),
 		"jpeg": wide.Bytes(),
 	} {
-		out, err := convertAvatarToJPEG(context.Background(), data)
+		out, err := convertAvatarToJPEG(data)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -255,27 +234,8 @@ func TestConvertAvatarToJPEGRejectsHugeImagesBeforeDecoding(t *testing.T) {
 	binary.BigEndian.PutUint32(data[ihdr:], 20000)
 	binary.BigEndian.PutUint32(data[ihdr+4:], 20000)
 	binary.BigEndian.PutUint32(data[ihdr+13:], crc32.ChecksumIEEE(data[ihdr-4:ihdr+13]))
-	if _, err := convertAvatarToJPEG(context.Background(), data); !errors.Is(err, errAvatarTooLarge) {
+	if _, err := convertAvatarToJPEG(data); !errors.Is(err, errAvatarTooLarge) {
 		t.Fatalf("err = %v, want errAvatarTooLarge", err)
-	}
-}
-
-func TestConvertAvatarToJPEGScalesFFmpegOutput(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not installed")
-	}
-	tiffData, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "color=c=blue:s=5000x100", "-frames:v", "1",
-		"-f", "image2pipe", "-vcodec", "tiff", "pipe:1").Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := convertAvatarToJPEG(context.Background(), tiffData)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bounds := decodeJPEG(t, out).Bounds(); bounds.Dx() != maxAvatarSide {
-		t.Fatalf("width = %d, want %d", bounds.Dx(), maxAvatarSide)
 	}
 }
 
@@ -365,7 +325,7 @@ func TestOrientRGBA(t *testing.T) {
 
 func TestConvertAvatarToJPEGRotatesLargeJPEG(t *testing.T) {
 	data := withEXIFOrientation(encodeTestJPEG(t, image.NewRGBA(image.Rect(0, 0, 5000, 100))), binary.BigEndian, 6)
-	out, err := convertAvatarToJPEG(context.Background(), data)
+	out, err := convertAvatarToJPEG(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,78 +334,26 @@ func TestConvertAvatarToJPEGRotatesLargeJPEG(t *testing.T) {
 	}
 }
 
-func TestConvertAvatarToJPEGFallsBackWhenGoCannotDecode(t *testing.T) {
-	// Like animated WebP: the header reads fine, but the image data doesn't decode.
-	data := encodePNG(t, solidImage(red))
-	data = data[:len(data)-20]
-	if _, _, err := image.DecodeConfig(bytes.NewReader(data)); err != nil {
-		t.Fatalf("header should still read: %v", err)
-	}
+// An animated WebP (4x4, two frames) made with Pillow.
+const animatedWebP = "UklGRoQAAABXRUJQVlA4WAoAAAACAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GKAAAAAAAAAAAAAMAAAMAAGQAAAJWUDhMDwAAAC8DwAAABxD9j/4HIqL/AQBBTk1GKAAAAAAAAAAAAAMAAAMAAGQAAABWUDhMDwAAAC8DwAAABxDR//4HIqL/AQA="
 
-	oldConvert := convertFirstFrameWithFFmpeg
-	t.Cleanup(func() { convertFirstFrameWithFFmpeg = oldConvert })
-	var called bool
-	convertFirstFrameWithFFmpeg = func(ctx context.Context, data []byte) ([]byte, error) {
-		called = true
-		return encodePNG(t, solidImage(blue)), nil
-	}
-	out, err := convertAvatarToJPEG(context.Background(), data)
+func TestConvertAvatarToJPEGRejectsOtherFormats(t *testing.T) {
+	webpData, err := base64.StdEncoding.DecodeString(animatedWebP)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !called {
-		t.Fatal("ffmpeg fallback was not used")
+	var tiffData bytes.Buffer
+	if err = tiff.Encode(&tiffData, solidImage(blue), nil); err != nil {
+		t.Fatal(err)
 	}
-	assertColorNear(t, decodeJPEG(t, out).At(8, 8), blue)
-}
-
-// Two-frame animated WebPs (4x4, red then blue) made with Pillow, one for
-// each way a frame can be stored.
-var animatedWebPs = map[string]string{
-	"lossless":     "UklGRoQAAABXRUJQVlA4WAoAAAACAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GKAAAAAAAAAAAAAMAAAMAAGQAAAJWUDhMDwAAAC8DwAAABxD9j/4HIqL/AQBBTk1GKAAAAAAAAAAAAAMAAAMAAGQAAABWUDhMDwAAAC8DwAAABxDR//4HIqL/AQA=",
-	"lossy":        "UklGRsQAAABXRUJQVlA4WAoAAAACAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GSgAAAAAAAAAAAAMAAAMAAGQAAAJWUDggMgAAADABAJ0BKgQABAABQCYloAADcAD+8ut///mwP/bz/wR6Af//0uD//pcH//S4P/SkAAAAQU5NRkYAAAAAAAAAAAADAAADAABkAAAAVlA4IC4AAAA0AQCdASoEAAQAAAAmJaAAA3AA/vtV4///S4P/+lwf/9Lg/9Lg//rV5Vesq6AA",
-	"lossy, alpha": "UklGRtYAAABXRUJQVlA4WAoAAAASAAAAAwAAAwAAQU5JTQYAAAAAAAAAAABBTk1GXAAAAAAAAAAAAAMAAAMAAGQAAAJBTFBICgAAAAEHUMCICERE/wNWUDggMgAAADABAJ0BKgQABAABQCYloAADcAD+8ut///mwP/bz/wR6Af//0uD//pcH//S4P/SkAAAAQU5NRkYAAAAAAAAAAAADAAADAABkAAAAVlA4IC4AAAA0AQCdASoEAAQAAAAmJaAAA3AA/vtV4///S4P/+lwf/9Lg/9Lg//rV5Vesq6AA",
-}
-
-func TestConvertAvatarToJPEGUsesFirstAnimatedWebPFrame(t *testing.T) {
-	oldConvert := convertFirstFrameWithFFmpeg
-	t.Cleanup(func() { convertFirstFrameWithFFmpeg = oldConvert })
-	convertFirstFrameWithFFmpeg = func(context.Context, []byte) ([]byte, error) {
-		return nil, errors.New("ffmpeg must not be needed")
-	}
-	for name, encoded := range animatedWebPs {
-		data, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			t.Fatal(err)
+	for name, data := range map[string][]byte{
+		"webp":         webpData,
+		"tiff":         tiffData.Bytes(),
+		"not an image": []byte("not an image"),
+	} {
+		if _, err := convertAvatarToJPEG(data); !errors.Is(err, errAvatarFormat) {
+			t.Errorf("%s: err = %v, want errAvatarFormat", name, err)
 		}
-		if _, _, err = image.Decode(bytes.NewReader(data)); err == nil {
-			t.Fatalf("%s: Go decoded the animated WebP directly, so the frame path wasn't tested", name)
-		}
-		out, err := convertAvatarToJPEG(context.Background(), data)
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		img := decodeJPEG(t, out)
-		if img.Bounds().Dx() != 4 || img.Bounds().Dy() != 4 {
-			t.Fatalf("%s: size = %v, want 4x4", name, img.Bounds())
-		}
-		// Lossy frames shift colors a little, so only check which frame came out.
-		r, g, bl, _ := img.At(2, 2).RGBA()
-		r, g, bl = r>>8, g>>8, bl>>8
-		if name == "lossy, alpha" {
-			// Half-transparent red on white.
-			if r < 200 || g < 80 || g > 180 || bl < 80 || bl > 180 {
-				t.Errorf("%s: color = %d,%d,%d, want pink", name, r, g, bl)
-			}
-		} else if r < 200 || g > 60 || bl > 60 {
-			t.Errorf("%s: color = %d,%d,%d, want the red first frame", name, r, g, bl)
-		}
-	}
-}
-
-func TestConvertAvatarToJPEGRejectsNonImage(t *testing.T) {
-	if _, err := convertAvatarToJPEG(context.Background(), []byte("not an image")); err == nil {
-		t.Fatal("expected an error")
 	}
 }
 
