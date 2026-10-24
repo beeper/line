@@ -2,9 +2,21 @@ Launch Chrome with network capture enabled for LINE Chrome Extension analysis.
 
 ## What to do
 
-1. **Close any running Chrome instances first** (Chrome only supports one instance per profile with remote debugging). Warn the user if Chrome is running.
+1. **Check dependencies.** Run `bash scripts/line-capture-preflight.sh` (on
+   Windows, from Git Bash). It prints the detected OS and an `OK` or `MISSING`
+   line per dependency. It does not say how to install anything: choose the
+   install method that fits the detected OS and the package managers that are
+   actually available (for example Homebrew on macOS; apt, dnf or pacman on
+   Linux; winget, Chocolatey or Scoop on Windows; `<python> -m pip install
+   --user` for Python packages, using the Python the preflight reported).
+   Show the user the missing items with the exact commands you plan to run,
+   ask them to confirm, then install and re-run the preflight until it exits 0.
+   Never install without that confirmation. The launcher refuses to start while
+   dependencies are missing.
 
-2. Run the capture script:
+2. **Close any running Chrome instances first** (Chrome only supports one instance per profile with remote debugging). Warn the user if Chrome is running.
+
+3. Run the capture script:
    ```
    bash scripts/line-chrome-capture.sh /tmp/line-chrome-extension-capture
    ```
@@ -28,11 +40,16 @@ Launch Chrome with network capture enabled for LINE Chrome Extension analysis.
     for `ophjlpahpchlmihnnnihgmmeilfjmjjc`, verify LINE / LY Corporation, click
     Add to Chrome, and accept the standard "Add extension" confirmation
 
-3. Tell the user:
-   - Open the LINE Chrome Extension (browser toolbar icon)
+4. Tell the user:
+   - Chrome opens on `about:blank`. Open LINE from the extension's toolbar icon
+     (puzzle-piece menu if it is not pinned), not by opening the extension's
+     `index.html` as a tab: that behaves differently from the real popup.
+     `LINE_CAPTURE_START_URL` overrides the start URL.
    - Log in manually if the capture profile is not already logged in
    - Perform whatever flow they want to analyze
-   - When done, quit Chrome completely (Cmd+Q)
+   - Do not open DevTools on the extension: LINE has `debugger;` traps that
+     pause it, and the recorder does not need DevTools
+   - When done, quit Chrome completely (all windows, not only the tab)
 
-4. Once Chrome is closed, the net-log file is ready. Continue with the
+5. Once Chrome is closed, the net-log file is ready. Continue with the
    line-analyze workflow.

@@ -19,6 +19,10 @@ Chrome Extension behavior.
    `pkg/line/client.go` `ExtensionVersion` and hardcoded LINE application
    header versions against the installed extension `manifest.json`.
 5. First inspect code and `docs/protocol`; capture only unknown behavior.
+   Before capturing, run `scripts/line-capture-preflight.sh` (macOS, Linux, or
+   Git Bash on Windows). For anything `MISSING`, choose install commands for
+   the detected OS and available package managers, and install only after the
+   user confirms.
 6. Treat all raw captures as secrets and work from redacted outputs whenever possible.
 
 ## Required Loop
@@ -66,6 +70,18 @@ has asked to set it up, open the official Chrome Web Store listing for extension
 ID `ophjlpahpchlmihnnnihgmmeilfjmjjc` (LINE, offered by LY Corporation), click
 Add to Chrome, and accept the standard "Add extension" confirmation. Do not
 accept prompts for any other extension or publisher without a new user request.
+
+During a capture, never open DevTools on the LINE extension (popup, service
+worker or `popup.html` windows): LINE has `debugger;` traps that pause it and
+show "Debugger paused in another tab". The CDP recorder attaches by itself and
+does not need DevTools. The launcher starts Chrome on `about:blank`; the user
+opens LINE from the extension's toolbar icon, because opening `index.html` as
+a tab behaves differently from the real popup.
+
+The recorder stores request bodies (binary uploads included, as size + sha256
+plus base64 in the raw capture only) and the real on-the-wire request headers.
+Redact before quoting: `scripts/redact-line-capture.py` removes tokens, MIDs,
+`picturePath` and the raw body bytes.
 
 Do not request, store, or automate LINE credentials. If the extension is not
 logged in, pause and ask the user to complete login manually in the capture

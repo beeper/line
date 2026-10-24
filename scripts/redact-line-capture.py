@@ -39,6 +39,16 @@ SENSITIVE_KEYS = {
     "refresh_token",
     "session",
     "certificate",
+    # Identifiers that point at a person, group or uploaded object.
+    "mid",
+    "chatmid",
+    "contactmid",
+    "picturepath",
+    "picturestatus",
+    "oid",
+    "x-obs-oid",
+    # Raw request-body bytes from the CDP recorder (uploads, Thrift payloads).
+    "base64",
 }
 
 SENSITIVE_KEY_FRAGMENTS = (
@@ -53,7 +63,8 @@ SENSITIVE_KEY_FRAGMENTS = (
 
 EMAIL_RE = re.compile(r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}")
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
-MID_RE = re.compile(r"\b([ucr][0-9a-f]{20,})\b", re.IGNORECASE)
+# Not \b: "_" counts as a word character there, which hid MIDs after "_".
+MID_RE = re.compile(r"(?<![0-9A-Za-z])([ucr][0-9a-f]{20,})(?![0-9A-Za-z])", re.IGNORECASE)
 LONG_SECRET_RE = re.compile(r"^[A-Za-z0-9+/=_-]{96,}$")
 
 
