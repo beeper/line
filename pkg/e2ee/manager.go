@@ -258,14 +258,8 @@ func (m *Manager) DecryptSecureBlob(b64Cipher string) (map[string]any, error) {
 	return out, nil
 }
 
-func (m *Manager) EncryptSecureBlob(data map[string]any) (string, error) {
-	buf, err := json.Marshal(data)
-	if err != nil {
-		return "", err
-	}
-	return m.runner.StorageEncrypt(string(buf))
-}
-
+// LoadSecureDataFromFile reads key files written by older bridge versions.
+// New keys are only stored in the user login metadata.
 func (m *Manager) LoadSecureDataFromFile(id string) (map[string]any, error) {
 	path := filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
 	b, err := os.ReadFile(path)
@@ -273,15 +267,6 @@ func (m *Manager) LoadSecureDataFromFile(id string) (map[string]any, error) {
 		return nil, err
 	}
 	return m.DecryptSecureBlob(strings.TrimSpace(string(b)))
-}
-
-func (m *Manager) SaveSecureDataToFile(id string, data map[string]any) error {
-	ct, err := m.EncryptSecureBlob(data)
-	if err != nil {
-		return err
-	}
-	path := filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
-	return os.WriteFile(path, []byte(ct), 0o600)
 }
 
 func (m *Manager) InitFromLoginKeyChain(serverPubB64, encryptedKeyChainB64 string) (map[string]string, error) {
