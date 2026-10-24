@@ -47,9 +47,14 @@ if ! "$SCRIPT_DIR/line-capture-preflight.sh" >/dev/null; then
     echo "==> Install the missing dependencies above, then run this again."
     exit 1
 fi
-# Sets CHROME and PYTHON. PYTHON can be several words ("py -3"), so it is
-# expanded unquoted below.
+# Sets CHROME and the PYTHON array (it can be several words, like "py -3").
 eval "$("$SCRIPT_DIR/line-capture-preflight.sh" --print-env)"
+
+# Windows Chrome cannot use WSL paths or reach the recorder inside WSL.
+if grep -qi microsoft /proc/version 2>/dev/null && [[ "$CHROME" == *.exe ]]; then
+    echo "Windows chrome.exe does not work from WSL. Use a Linux Chrome or Chromium in WSL, or run this from Git Bash on Windows." >&2
+    exit 1
+fi
 
 warn() { echo "    WARNING: $*" >&2; }
 
@@ -98,7 +103,7 @@ seed_chrome_capture_profile() {
     # below keep the choices explicit and readable for future maintainers.
     touch "$profile_dir/First Run"
 
-    $PYTHON - "$profile_dir" <<'PY'
+    "${PYTHON[@]}" - "$profile_dir" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -181,15 +186,19 @@ PY
 
 find_latest_extension_dir() {
     local extension_id="$1"
-    local chrome_dir base
+    local chrome_dir base found
     while IFS= read -r chrome_dir; do
         base="$chrome_dir/Default/Extensions/$extension_id"
         [ -d "$base" ] || continue
         # Chrome's folders can be unreadable (macOS privacy protection answers
         # "Operation not permitted"); skip those instead of aborting.
-        if ! find "$base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1 | grep .; then
-            warn "cannot read $base, skipping"
+        found="$(find "$base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)"
+        if [ -n "$found" ]; then
+            # First usable match only: Chrome and Chromium can both have it.
+            echo "$found"
+            return 0
         fi
+        warn "cannot read $base, skipping"
     done < <(normal_chrome_dirs)
 }
 
@@ -205,7 +214,7 @@ find_latest_profile_extension_dir() {
 read_manifest_version() {
     local extension_dir="$1"
     if [ -n "${extension_dir:-}" ] && [ -f "$extension_dir/manifest.json" ]; then
-        $PYTHON - "$extension_dir/manifest.json" <<'PY'
+        "${PYTHON[@]}" - "$extension_dir/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -221,7 +230,7 @@ PY
 find_repo_extension_version() {
     local client_file="$SCRIPT_DIR/../pkg/line/client.go"
     if [ -f "$client_file" ]; then
-        $PYTHON - "$client_file" <<'PY'
+        "${PYTHON[@]}" - "$client_file" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -241,7 +250,7 @@ stage_extension_dir() {
     fi
 
     local version
-    version="$($PYTHON - "$source_dir/manifest.json" <<'PY'
+    version="$("${PYTHON[@]}" - "$source_dir/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -387,7 +396,7 @@ START_URL="${LINE_CAPTURE_START_URL:-about:blank}"
 CHROME_PID=$!
 
 # Start the CDP capture (it waits for Chrome to be ready)
-$PYTHON "$SCRIPT_DIR/line-cdp-capture.py" "$CDP_FILE" &
+"${PYTHON[@]}" "$SCRIPT_DIR/line-cdp-capture.py" "$CDP_FILE" &
 CDP_PID=$!
 
 # Wait for Chrome to exit
