@@ -656,7 +656,7 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 
 // GetRawChat fetches a chat as it came from getChats, so it can be sent back to
 // updateChat unchanged except for the edited field. Numbers are kept as
-// json.Number because member join times don't fit in a float64.
+// json.Number so none of them change on the way back.
 func (c *Client) GetRawChat(ctx context.Context, chatMid string) (map[string]any, error) {
 	req := GetChatsRequest{
 		ChatMids:     []string{chatMid},

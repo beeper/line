@@ -11,7 +11,7 @@ import (
 )
 
 func TestGetRawChatRoundTripsThroughUpdateChat(t *testing.T) {
-	// Member join times are larger than 2^53, so a float64 round trip would change them.
+	// A float64 round trip would change a number larger than 2^53.
 	const chatResponse = `{"code":0,"message":"ok","data":{"chats":[{"type":1,"chatMid":"c1","chatName":"Old","picturePath":"/old","extra":{"groupExtra":{"memberMids":{"u1":1729000000000123457}}}}]}}`
 	var updateBody []byte
 	client := NewClient("test-token")
