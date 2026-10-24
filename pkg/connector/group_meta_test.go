@@ -3,8 +3,10 @@ package connector
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/gif"
@@ -213,6 +215,67 @@ func TestConvertAvatarToJPEGFallsBackToFFmpeg(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertColorNear(t, decodeJPEG(t, out).At(8, 8), blue)
+}
+
+func encodePNG(t *testing.T, img image.Image) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestConvertAvatarToJPEGScalesDownLargeImages(t *testing.T) {
+	var wide bytes.Buffer
+	if err := jpeg.Encode(&wide, image.NewRGBA(image.Rect(0, 0, 5000, 100)), nil); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{
+		"png":  encodePNG(t, image.NewNRGBA(image.Rect(0, 0, 100, 5000))),
+		"jpeg": wide.Bytes(),
+	} {
+		out, err := convertAvatarToJPEG(context.Background(), data)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		bounds := decodeJPEG(t, out).Bounds()
+		if max(bounds.Dx(), bounds.Dy()) != maxAvatarSide || min(bounds.Dx(), bounds.Dy()) != 81 {
+			t.Errorf("%s: size = %dx%d, want 4096x81", name, bounds.Dx(), bounds.Dy())
+		}
+	}
+}
+
+func TestConvertAvatarToJPEGRejectsHugeImagesBeforeDecoding(t *testing.T) {
+	// A real 1x1 PNG with its header changed to 20000x20000. Decoding it would
+	// fail, so the error must come from the size check that runs first.
+	data := encodePNG(t, image.NewNRGBA(image.Rect(0, 0, 1, 1)))
+	const ihdr = 8 + 4 + 4 // PNG signature, chunk length, chunk type
+	binary.BigEndian.PutUint32(data[ihdr:], 20000)
+	binary.BigEndian.PutUint32(data[ihdr+4:], 20000)
+	binary.BigEndian.PutUint32(data[ihdr+13:], crc32.ChecksumIEEE(data[ihdr-4:ihdr+13]))
+	if _, err := convertAvatarToJPEG(context.Background(), data); !errors.Is(err, errAvatarTooLarge) {
+		t.Fatalf("err = %v, want errAvatarTooLarge", err)
+	}
+}
+
+func TestConvertAvatarToJPEGScalesFFmpegOutput(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	tiffData, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=blue:s=5000x100", "-frames:v", "1",
+		"-f", "image2pipe", "-vcodec", "tiff", "pipe:1").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := convertAvatarToJPEG(context.Background(), tiffData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bounds := decodeJPEG(t, out).Bounds(); bounds.Dx() != maxAvatarSide {
+		t.Fatalf("width = %d, want %d", bounds.Dx(), maxAvatarSide)
+	}
 }
 
 func TestConvertAvatarToJPEGRejectsNonImage(t *testing.T) {

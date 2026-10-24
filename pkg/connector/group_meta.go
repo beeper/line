@@ -179,30 +179,68 @@ func (lc *LineClient) updateGroupChat(ctx context.Context, chatMid string, attri
 	return err
 }
 
+// LINE accepted a 4096×4096 photo from the extension, so bigger photos are
+// scaled down to fit. Decoding needs about 4 bytes per pixel, so images over
+// maxAvatarPixels are refused before decoding (a 48 MP phone photo still fits).
+const (
+	maxAvatarSide        = 4096
+	maxAvatarPixels      = 50_000_000
+	maxFFmpegOutputBytes = 80 << 20
+)
+
+var errAvatarTooLarge = errors.New("image is too large")
+
 // convertAvatarToJPEG turns any image into the JPEG LINE expects for group
 // photos. The extension only uploads JPEG and flattens animated GIFs to their
-// first frame, so the same is done here. JPEGs are sent unchanged to keep their
-// quality and EXIF orientation.
+// first frame, so the same is done here. JPEGs that fit are sent unchanged to
+// keep their quality and EXIF orientation.
 func convertAvatarToJPEG(ctx context.Context, data []byte) ([]byte, error) {
-	img, format, err := image.Decode(bytes.NewReader(data))
-	if err == nil && format == "jpeg" {
-		return data, nil
-	} else if err != nil {
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
 		// HEIC, AVIF, TIFF and animated WebP have no Go decoder here.
-		img, err = decodeFirstFrameWithFFmpeg(ctx, data)
+		data, err = convertFirstFrameWithFFmpeg(ctx, data)
 		if err != nil {
 			return nil, fmt.Errorf("unsupported avatar image: %w", err)
 		}
+		cfg, format, err = image.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read ffmpeg output: %w", err)
+		}
+	}
+	if cfg.Width*cfg.Height > maxAvatarPixels {
+		return nil, fmt.Errorf("%w: %dx%d", errAvatarTooLarge, cfg.Width, cfg.Height)
+	}
+	if format == "jpeg" && cfg.Width <= maxAvatarSide && cfg.Height <= maxAvatarSide {
+		return data, nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode avatar: %w", err)
 	}
 	return encodeAvatarJPEG(img)
+}
+
+func fitAvatarSize(width, height int) (int, int) {
+	if width <= maxAvatarSide && height <= maxAvatarSide {
+		return width, height
+	}
+	if width >= height {
+		return maxAvatarSide, max(1, height*maxAvatarSide/width)
+	}
+	return max(1, width*maxAvatarSide/height), maxAvatarSide
 }
 
 func encodeAvatarJPEG(img image.Image) ([]byte, error) {
 	// JPEG has no alpha channel, so draw transparent images on white.
 	bounds := img.Bounds()
-	flat := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	width, height := fitAvatarSize(bounds.Dx(), bounds.Dy())
+	flat := image.NewRGBA(image.Rect(0, 0, width, height))
 	draw.Draw(flat, flat.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
-	draw.Draw(flat, flat.Bounds(), img, bounds.Min, draw.Over)
+	if width == bounds.Dx() && height == bounds.Dy() {
+		draw.Draw(flat, flat.Bounds(), img, bounds.Min, draw.Over)
+	} else {
+		draw.CatmullRom.Scale(flat, flat.Bounds(), img, bounds, draw.Over, nil)
+	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, flat, &jpeg.Options{Quality: avatarJPEGQuality}); err != nil {
 		return nil, fmt.Errorf("failed to encode avatar JPEG: %w", err)
@@ -210,7 +248,22 @@ func encodeAvatarJPEG(img image.Image) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func decodeFirstFrameWithFFmpeg(ctx context.Context, data []byte) (image.Image, error) {
+// cappedBuffer fails writes past max bytes, so a misbehaving ffmpeg can't fill memory.
+type cappedBuffer struct {
+	bytes.Buffer
+	max int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.Len()+len(p) > b.max {
+		return 0, errAvatarTooLarge
+	}
+	return b.Buffer.Write(p)
+}
+
+// convertFirstFrameWithFFmpeg returns the first frame as a PNG that fits in
+// maxAvatarSide. PNG keeps transparency so encodeAvatarJPEG can flatten it.
+func convertFirstFrameWithFFmpeg(ctx context.Context, data []byte) ([]byte, error) {
 	input, err := os.CreateTemp("", "line-avatar-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temporary avatar file: %w", err)
@@ -225,24 +278,20 @@ func decodeFirstFrameWithFFmpeg(ctx context.Context, data []byte) (image.Image, 
 		return nil, fmt.Errorf("failed to close temporary avatar file: %w", err)
 	}
 
-	// PNG output keeps transparency so encodeAvatarJPEG can flatten it.
-	var output bytes.Buffer
+	output := &cappedBuffer{max: maxFFmpegOutputBytes}
+	scale := fmt.Sprintf("scale='min(%[1]d,iw)':'min(%[1]d,ih)':force_original_aspect_ratio=decrease", maxAvatarSide)
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-hide_banner", "-loglevel", "error",
 		"-i", inputPath,
-		"-frames:v", "1",
+		"-frames:v", "1", "-vf", scale,
 		"-f", "image2pipe", "-vcodec", "png", "pipe:1",
 	)
-	cmd.Stdout = &output
+	cmd.Stdout = output
 	if err = cmd.Run(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("ffmpeg failed: %w", ctxErr)
 		}
 		return nil, fmt.Errorf("ffmpeg failed: %w", err)
 	}
-	img, _, err := image.Decode(&output)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode ffmpeg output: %w", err)
-	}
-	return img, nil
+	return output.Bytes(), nil
 }
