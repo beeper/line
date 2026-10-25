@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"maps"
 	"regexp"
 	"strconv"
 	"strings"
@@ -142,6 +143,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
+	// GIF pickers in Matrix clients send GIFs as short videos flagged fi.mau.gif.
+	// LINE only receives GIFs as images, so convert those and send them as one.
+	videoGIF := effectiveMsgType == event.MsgVideo && msg.Content.Info != nil && msg.Content.Info.MauGIF
+	if videoGIF {
+		effectiveMsgType = event.MsgImage
+	}
+
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
 	// This must happen before media processing since it affects the upload path.
 	useE2EEMedia := !plainText
@@ -193,18 +201,29 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
 
-		mimeType := msg.Content.Info.MimeType
+		mimeType := ""
+		if msg.Content.Info != nil {
+			mimeType = msg.Content.Info.MimeType
+		}
 		fileName := msg.Content.GetFileName()
+		if videoGIF {
+			data, err = convertVideoToGIF(ctx, data)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaConvertFailed, err)
+			}
+			mimeType = "image/gif"
+		}
 		if isHEICImage(mimeType, fileName) {
 			data, err = convertHEICToJPEG(ctx, data)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaConvertFailed, err)
 			}
 			mimeType = "image/jpeg"
-			fileName = jpegFileName(fileName)
 		}
 		isGif := mimeType == "image/gif"
-		isAnimated := isGif && isAnimatedGif(data)
+		if isGif && len(data) > maxGIFSize {
+			return nil, fmt.Errorf("%w: %.1f MB is larger than LINE's %d MB limit for GIFs", bridgev2.ErrMediaTooLarge, float64(len(data))/1000/1000, maxGIFSize/1000/1000)
+		}
 
 		extension := "jpg"
 		if isGif {
@@ -216,50 +235,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentType = int(ContentImage)
 
 		if plainText {
-			// Plain media: save data for post-send upload to r/talk/m/{msgId}
+			// Plain media: send MEDIA_CONTENT_INFO only, then upload the file to
+			// r/talk/m/{msgId}. The LINE Chrome Extension uploads no thumbnail here.
 			plainMediaData = data
-
-			thumbnailData, thumbWidth, thumbHeight, err := generateThumbnail(data)
-			if err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to generate thumbnail, continuing without it")
-			} else {
-				plainThumbData = thumbnailData
-				mediaThumbInfo := map[string]interface{}{
-					"width":  thumbWidth,
-					"height": thumbHeight,
-				}
-				if thumbInfoJSON, err := json.Marshal(mediaThumbInfo); err == nil {
-					contentMetadata["MEDIA_THUMB_INFO"] = string(thumbInfoJSON)
-				}
-			}
-
-			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
-			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
-
-			if fileName == "" {
-				fileName = "image." + extension
-			}
-			contentMetadata["FILE_NAME"] = fileName
-
-			mediaContentInfo := map[string]interface{}{
-				"category":  "original",
-				"fileSize":  len(data),
-				"extension": extension,
-			}
-			if isAnimated {
-				mediaContentInfo["animated"] = true
-			}
-			if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
-				contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
-			}
+			maps.Copy(contentMetadata, imageMediaMetadata(data, extension, true))
 		} else {
 			// E2EE: encrypt, upload to OBS first, send with OID
 			// Save original data for potential group E2EE fallback
 			if isGroup {
 				originalMediaData = data
-				if thumbData, _, _, tErr := generateThumbnail(data); tErr == nil {
-					originalThumbData = thumbData
-				}
 			}
 
 			uploadData, keyMaterialB64, err := lc.encryptFileData(data)
@@ -305,26 +289,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 			contentMetadata["OID"] = oid
 			contentMetadata["SID"] = "emi"
-			contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(uploadData))
-			contentMetadata["contentType"] = fmt.Sprintf("%d", ContentImage)
 			contentMetadata["ENC_KM"] = keyMaterialB64
-
-			if fileName == "" {
-				fileName = "image." + extension
-			}
-			contentMetadata["FILE_NAME"] = fileName
-
-			mediaContentInfo := map[string]interface{}{
-				"category":  "original",
-				"fileSize":  len(uploadData),
-				"extension": extension,
-			}
-			if isAnimated {
-				mediaContentInfo["animated"] = true
-			}
-			if mediaInfoJSON, err := json.Marshal(mediaContentInfo); err == nil {
-				contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
-			}
+			// Sizes describe the original file, not the encrypted upload.
+			maps.Copy(contentMetadata, imageMediaMetadata(data, extension, false))
 
 			imgPayload := map[string]string{"keyMaterial": keyMaterialB64}
 			payload, _ = json.Marshal(imgPayload)
@@ -656,6 +623,11 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 						delete(contentMetadata, "ENC_KM")
 						plainMediaData = originalMediaData
 						plainThumbData = originalThumbData
+						if contentType == int(ContentImage) {
+							// Plain images carry MEDIA_CONTENT_INFO only, like the LINE Chrome Extension.
+							delete(contentMetadata, "FILE_SIZE")
+							delete(contentMetadata, "MEDIA_THUMB_INFO")
+						}
 					}
 				}
 			}

@@ -46,7 +46,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_10_21",
+		ID:               "dev.highest.matrix.line.capabilities.2026_10_25",
 		MaxTextLength:    5000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
@@ -89,6 +89,17 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 					"image/gif":  event.CapLevelFullySupported,
 					"image/webp": event.CapLevelFullySupported,
 					"image/jpeg": event.CapLevelFullySupported,
+				},
+			},
+			// GIF pickers send fi.mau.gif. LINE receives every GIF as an image up to
+			// 20 MB, so videos are converted to GIF before sending.
+			event.CapMsgGIF: {
+				Caption: event.CapLevelRejected,
+				MaxSize: maxGIFSize,
+				MimeTypes: map[string]event.CapabilitySupportLevel{
+					"image/gif":  event.CapLevelFullySupported,
+					"video/mp4":  event.CapLevelPartialSupport,
+					"video/webm": event.CapLevelPartialSupport,
 				},
 			},
 			event.MsgFile: {
