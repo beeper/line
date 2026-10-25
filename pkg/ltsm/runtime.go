@@ -6,17 +6,18 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"sync"
+	"sync/atomic"
 )
 
 // Runtime wraps the transpiled Module and embind Imports to provide
 // the same high-level API as wasm.Runtime.
 type Runtime struct {
-	mod         *Module
-	imp         *Imports
-	crypto      *Runtime
-	cryptoCalls int
-	cryptoDirty bool
-	isCrypto    bool
+	mod        *Module
+	imp        *Imports
+	generation uint64
+	calls      int
+	isCrypto   bool
 }
 
 // NewRuntime creates and initializes a new transpiled LTSM runtime.
@@ -31,6 +32,7 @@ func NewRuntime() (*Runtime, error) {
 	mod.fT()
 
 	rt := &Runtime{mod: mod, imp: imp}
+	rt.markChanged()
 	imp.owner = rt
 	return rt, nil
 }
@@ -47,49 +49,52 @@ func (rt *Runtime) Close() {}
 // disposable copy so their allocator cannot exhaust the authoritative module.
 const cryptoRefreshCalls = 128
 
-func (rt *Runtime) refreshCrypto() error {
-	if rt.crypto == nil {
-		crypto, err := NewRuntime()
-		if err != nil {
-			return err
-		}
-		crypto.isCrypto = true
-		rt.crypto = crypto
-	}
-	copy(rt.crypto.mod.mem, rt.mod.mem)
-	rt.crypto.mod.g0 = rt.mod.g0
-	values, refCnts, free := rt.imp.emval.snapshot()
-	rt.crypto.imp.emval.restore(values, refCnts, free)
-	rt.crypto.imp.urandomFD, rt.crypto.imp.nextFD = rt.imp.urandomFD, rt.imp.nextFD
-	rt.cryptoCalls = 0
-	rt.cryptoDirty = false
-	return nil
+var (
+	scratchRuntimes    sync.Pool
+	runtimeGenerations atomic.Uint64
+)
+
+func (rt *Runtime) markChanged() {
+	rt.generation = runtimeGenerations.Add(1)
 }
 
-func (rt *Runtime) channelCrypto(call func(*Runtime) ([]byte, error)) (data []byte, err error) {
+func (rt *Runtime) scratch() (*Runtime, error) {
+	crypto, _ := scratchRuntimes.Get().(*Runtime)
+	if crypto == nil {
+		var err error
+		if crypto, err = NewRuntime(); err != nil {
+			return nil, err
+		}
+		crypto.isCrypto = true
+	}
+	if crypto.generation != rt.generation || crypto.calls >= cryptoRefreshCalls {
+		copy(crypto.mod.mem, rt.mod.mem)
+		crypto.mod.g0 = rt.mod.g0
+		values, refCnts, free := rt.imp.emval.snapshot()
+		crypto.imp.emval.restore(values, refCnts, free)
+		crypto.imp.urandomFD, crypto.imp.nextFD = rt.imp.urandomFD, rt.imp.nextFD
+		crypto.generation, crypto.calls = rt.generation, 0
+	}
+	return crypto, nil
+}
+
+func (rt *Runtime) channelCrypto(call func(*Runtime) ([]byte, error)) ([]byte, error) {
 	if rt.isCrypto {
 		return call(rt)
 	}
-	if rt.crypto == nil || rt.cryptoDirty || rt.cryptoCalls >= cryptoRefreshCalls {
-		if err := rt.refreshCrypto(); err != nil {
-			return nil, err
-		}
-	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			rt.cryptoDirty = true
-			panic(recovered)
-		}
-		if err != nil {
-			rt.cryptoDirty = true
-		}
-	}()
-	data, err = call(rt.crypto)
+	crypto, err := rt.scratch()
 	if err != nil {
 		return nil, err
 	}
+	data, err := call(crypto)
+	if err != nil {
+		crypto.markChanged()
+		scratchRuntimes.Put(crypto)
+		return nil, err
+	}
 	data = append([]byte(nil), data...)
-	rt.cryptoCalls++
+	crypto.calls++
+	scratchRuntimes.Put(crypto)
 	return data, nil
 }
 
@@ -381,7 +386,7 @@ func (rt *Runtime) E2EEChannelUnwrapGroupSharedKey(chanPtr uint32, encKey []byte
 
 func (rt *Runtime) WrapRegistrationGroupKey(chanPtrs []uint32) ([][]byte, error) {
 	var wrapped [][]byte
-	defer func() { rt.cryptoDirty = true }()
+	defer rt.markChanged()
 	_, err := rt.channelCrypto(func(crypto *Runtime) ([]byte, error) {
 		keyPtr, err := crypto.Curve25519KeyGenerate()
 		if err != nil {

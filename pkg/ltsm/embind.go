@@ -960,7 +960,7 @@ func (imp *Imports) noteChannelState(className string) {
 	}
 	switch className {
 	case "Curve25519Key", "E2EEKey", "E2EEChannel", "E2EEKeychain":
-		imp.owner.cryptoDirty = true
+		imp.owner.markChanged()
 	}
 }
 
