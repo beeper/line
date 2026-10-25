@@ -94,13 +94,9 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			// GIF pickers send fi.mau.gif. LINE receives every GIF as an image up to
 			// 20 MB, so videos are converted to GIF before sending.
 			event.CapMsgGIF: {
-				Caption: event.CapLevelRejected,
-				MaxSize: maxGIFSize,
-				MimeTypes: map[string]event.CapabilitySupportLevel{
-					"image/gif":  event.CapLevelFullySupported,
-					"video/mp4":  event.CapLevelPartialSupport,
-					"video/webm": event.CapLevelPartialSupport,
-				},
+				Caption:   event.CapLevelRejected,
+				MaxSize:   maxGIFSize,
+				MimeTypes: gifMimeTypes(),
 			},
 			event.MsgFile: {
 				Caption: event.CapLevelRejected,
@@ -161,6 +157,9 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 				},
 			},
 		},
+	}
+	if !canConvertVideoToGIF() {
+		caps.ID += "+no_gif_video"
 	}
 	if portal != nil && portal.RoomType == database.RoomTypeDM && !lc.isOwnMID(string(portal.ID)) {
 		caps.ID += "+dm"

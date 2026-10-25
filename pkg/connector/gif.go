@@ -13,6 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.mau.fi/util/ffmpeg"
+
+	"maunium.net/go/mautrix/event"
 )
 
 // maxGIFSize is the largest GIF LINE sends as an image. The LINE Chrome
@@ -61,6 +65,25 @@ func imageMediaMetadata(data []byte, extension string, plain bool) map[string]st
 		metadata["FILE_SIZE"] = strconv.Itoa(len(data))
 	}
 	return metadata
+}
+
+// canConvertVideoToGIF reports whether the ffprobe and ffmpeg programs that
+// convertVideoToGIF runs are installed.
+func canConvertVideoToGIF() bool {
+	return ffmpeg.Supported() && ffmpeg.ProbeSupported()
+}
+
+// gifMimeTypes lists the fi.mau.gif types the bridge can send. Picker videos
+// are offered only when they can be converted to GIF.
+func gifMimeTypes() map[string]event.CapabilitySupportLevel {
+	mimeTypes := map[string]event.CapabilitySupportLevel{
+		"image/gif": event.CapLevelFullySupported,
+	}
+	if canConvertVideoToGIF() {
+		mimeTypes["video/mp4"] = event.CapLevelPartialSupport
+		mimeTypes["video/webm"] = event.CapLevelPartialSupport
+	}
+	return mimeTypes
 }
 
 const maxConvertedGIFSize = 100 * 1024 * 1024
