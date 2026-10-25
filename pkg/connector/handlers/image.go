@@ -42,7 +42,14 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		if err != nil {
 			return nil, err
 		}
+		// Keep the type that LINE reports (for example GIF) in the event and in
+		// the saved metadata that the download response uses.
 		info, body := lineImageInfo(data.ContentMetadata, nil)
+		directMedia.ContentType = info.MimeType
+		directMedia.FileName = body
+		if directMedia.Size == 0 {
+			directMedia.Size = info.Size
+		}
 		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
 			MsgType: event.MsgImage, Body: body, Info: info, RelatesTo: relatesTo,
 		}); converted != nil || err != nil {

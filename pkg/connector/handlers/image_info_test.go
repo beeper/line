@@ -1,6 +1,43 @@
 package handlers
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/line/pkg/line"
+)
+
+// With direct media, the event and the saved metadata (which sets the
+// download's Content-Type) must keep the GIF type too.
+func TestConvertImageDirectMediaKeepsGIFType(t *testing.T) {
+	var saved *DirectMedia
+	h := &Handler{GenerateDirectMediaURI: func(_ context.Context, _ string, dm *DirectMedia) (id.ContentURIString, any, error) {
+		saved = dm
+		return "mxc://example.com/gif", nil, nil
+	}}
+	converted, err := h.ConvertImage(context.Background(), nil, nil, line.Message{
+		ID: "1",
+		ContentMetadata: map[string]string{
+			"OID":                "oid",
+			"MEDIA_CONTENT_INFO": `{"width":480,"height":400,"animated":true,"category":"original","fileSize":3151649,"extension":"gif"}`,
+		},
+	}, "", nil)
+	if err != nil || converted == nil {
+		t.Fatalf("ConvertImage = %v, %v", converted, err)
+	}
+	content := converted.Parts[0].Content
+	if content.Body != "image.gif" || content.Info.MimeType != "image/gif" || !content.Info.MauGIF {
+		t.Errorf("event = %q %q mauGIF=%v, want image.gif image/gif fi.mau.gif", content.Body, content.Info.MimeType, content.Info.MauGIF)
+	}
+	if content.Info.Size != 3151649 {
+		t.Errorf("event size = %d, want 3151649", content.Info.Size)
+	}
+	if saved == nil || saved.ContentType != "image/gif" || saved.FileName != "image.gif" {
+		t.Errorf("saved metadata = %+v, want image/gif image.gif", saved)
+	}
+}
 
 // GIFs from LINE arrive with MEDIA_CONTENT_INFO (capture F1–F3); Matrix should
 // get them as animated GIFs, not as image.jpg (test C1, C6).
