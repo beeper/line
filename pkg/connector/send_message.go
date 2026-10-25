@@ -10,6 +10,7 @@ import (
 	"image"
 	"image/jpeg"
 	"maps"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -173,6 +174,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// For plain media: we send the message first, then upload media to r/talk/m/{msgId}.
 	var plainMediaData []byte // raw media data to upload after sending
 	var plainThumbData []byte // raw thumbnail data to upload after sending
+	var plainImageName string // file name for plain image uploads (cat=original)
 
 	// For group chats, save original data in case E2EE encryption fails and we fall back to plain.
 	var originalMediaData []byte
@@ -233,6 +235,10 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		contentType = int(ContentImage)
+		plainImageName = "image." + extension
+		if fileName != "" {
+			plainImageName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + "." + extension
+		}
 
 		if plainText {
 			// Plain media: send MEDIA_CONTENT_INFO only, then upload the file to
@@ -836,6 +842,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 		if err := callLineErr(func(client *line.Client) error {
+			if contentType == int(ContentImage) {
+				return client.UploadOBSPlainOriginalImage(plainMediaData, sentMsg.ID, plainImageName)
+			}
 			return client.UploadOBSPlain(plainMediaData, sentMsg.ID, obsType)
 		}); err != nil {
 			return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("failed to upload plain media to OBS: %w", err)).
