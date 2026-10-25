@@ -33,8 +33,9 @@ one.
 
 ## Sender versus receiver
 
-- A setting applies to what the device **receives**. A test that only looks at
-  your own sent message can miss it.
+- Playback and auto-download settings apply to what the device **receives**.
+  A test that only looks at your own sent message can miss them. Photo quality
+  and Send Live Photos apply on the sending device.
 - LINE iOS autoplays a GIF only if it was sent from that phone. A GIF sent from
   another device of the same account, whether the Chrome extension or the
   bridge, needs a tap there. So a bridge-sent GIF that does not autoplay on your
@@ -46,13 +47,14 @@ one.
 
 ## Testing without a second account
 
-- Use the Chrome extension as a second view of your own chat. It receives
-  messages with no cached file.
+- Use the Chrome extension as a separate view of your own chat. It receives
+  messages with no cached file. LINE allows only one Chrome extension session,
+  so logging into the extension logs the bridge out. Quit Chrome and reconnect
+  the bridge in Beeper when you finish.
 - Record each LINE setting before you start and put it back afterwards.
 - Do not use a LINE Official Account bot that relays messages through the
   Messaging API as a receiver for media tests. It re-sends with its own
-  metadata, flattens GIFs to one frame, and the bridge currently drops images
-  from business accounts.
+  metadata and flattens GIFs to one frame.
 
 ## Always capture what the Chrome extension does first
 
