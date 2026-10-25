@@ -336,3 +336,16 @@ automatically.
 
 For details on how the bridge handles different Letter Sealing
 combinations, see [readme/LETTER_SEALING.md](readme/LETTER_SEALING.md).
+
+## Optional: agent skills for reverse engineering
+
+This is completely optional. If you want help figuring out what the LINE Chrome
+Extension does (capturing and analyzing its traffic), and later an opinionated
+way to structure the evidence for that kind of work, you can try
+[clins1994/beeper-line-skills](https://github.com/clins1994/beeper-line-skills).
+Nothing in this repo needs it. It is maintained separately by
+[@clins1994](https://github.com/clins1994) and will change on its own schedule.
+
+```bash
+npx skills add clins1994/beeper-line-skills
+```

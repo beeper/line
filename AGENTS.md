@@ -80,3 +80,13 @@ Message encryption is hybrid:
 ## Logging
 
 Uses `zerolog`. Pre-commit hooks enforce: no `Msgf` (use `Msg` with structured fields), use `Stringer` interface where applicable.
+
+## Optional Agent Skills
+
+Not required for anything in this repo. If you want agent help reverse
+engineering the LINE Chrome Extension (capturing and analyzing its traffic, and
+later structuring the evidence), there is an optional set of skills in
+https://github.com/clins1994/beeper-line-skills. It is maintained separately by
+@clins1994 and may change independently. Install with
+`npx skills add clins1994/beeper-line-skills`, then run the skills from inside
+this checkout.
