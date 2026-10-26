@@ -120,6 +120,9 @@ func obsTalkMetaMessageID(messageID string, isPlainMedia bool) string {
 }
 
 func mediaDownloadFailure(kind string, err error, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	if errors.Is(err, line.ErrOBSObjectTooLarge) {
+		return oversizedFileNotice(relatesTo), nil
+	}
 	if !errors.Is(err, line.ErrOBSObjectNotFound) {
 		// Keep ambiguous OBS failures retryable. Returning ErrIgnoringRemoteEvent
 		// prevents bridgev2 from posting a generic error notice, while omitting a

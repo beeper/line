@@ -39,6 +39,7 @@ var (
 	ErrOBSObjectNotFound     = errors.New("LINE OBS object not found")
 	ErrOBSEncodingIncomplete = errors.New("LINE OBS object encoding incomplete")
 	ErrOBSObjectValidation   = errors.New("LINE OBS object validation failed")
+	ErrOBSObjectTooLarge     = errors.New("LINE OBS object exceeds the size limit")
 )
 
 type Client struct {
@@ -845,7 +846,7 @@ func (c *Client) DownloadOBSPublicResource(ctx context.Context, resource string)
 		return nil, fmt.Errorf("failed to read public OBS resource response: %w", readErr)
 	}
 	if int64(len(body)) > publicMediaMaxBytes {
-		return nil, errPublicMediaTooLarge
+		return nil, ErrOBSObjectTooLarge
 	}
 	switch resp.StatusCode {
 	case http.StatusOK:

@@ -33,6 +33,10 @@ func (h *Handler) oversizedMediaNotice(size int64, sizeSource string, relatesTo 
 		Int("limit_bytes", BeeperMaxFileSize).
 		Str("size_source", sizeSource).
 		Msg("Skipping oversized LINE media upload")
+	return oversizedFileNotice(relatesTo)
+}
+
+func oversizedFileNotice(relatesTo *event.RelatesTo) *bridgev2.ConvertedMessage {
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{
 			{

@@ -17,10 +17,7 @@ const (
 	publicMediaTimeout  = 45 * time.Second
 )
 
-var (
-	errPublicMediaPolicy   = errors.New("unsupported LINE public media URL")
-	errPublicMediaTooLarge = errors.New("LINE public media exceeds the size limit")
-)
+var errPublicMediaPolicy = errors.New("unsupported LINE public media URL")
 
 type publicMediaTransport struct {
 	base *http.Transport
