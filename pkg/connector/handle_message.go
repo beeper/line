@@ -164,7 +164,11 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 		Data: *msg,
 		ID:   networkid.MessageID(msg.ID),
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message) (*bridgev2.ConvertedMessage, error) {
-			return lc.convertLineMessage(ctx, portal, intent, data, bodyText, unwrappedText, decryptionFailed)
+			converted, err := lc.convertLineMessage(ctx, portal, intent, data, bodyText, unwrappedText, decryptionFailed)
+			if converted == nil && err == nil {
+				return nil, bridgev2.ErrIgnoringRemoteEvent
+			}
+			return converted, err
 		},
 	}
 
