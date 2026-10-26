@@ -855,7 +855,7 @@ func (c *Client) DownloadOBSPublicResource(ctx context.Context, resource string)
 	case http.StatusNotFound:
 		return nil, ErrOBSObjectNotFound
 	default:
-		return nil, newHTTPError(resp.StatusCode, "public OBS resource download failed (%d): %s", resp.StatusCode, string(body))
+		return nil, newHTTPError(resp.StatusCode, "public OBS resource download failed (%d): %s", resp.StatusCode, string(body[:min(len(body), 512)]))
 	}
 }
 
