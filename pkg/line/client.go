@@ -835,10 +835,17 @@ func (c *Client) DownloadOBSPublicResource(ctx context.Context, resource string)
 	if err != nil {
 		return nil, fmt.Errorf("public OBS resource request failed: %w", err)
 	}
-	body, readErr := io.ReadAll(resp.Body)
+	reader := io.Reader(resp.Body)
+	if parsed.IsAbs() {
+		reader = io.LimitReader(resp.Body, publicMediaMaxBytes+1)
+	}
+	body, readErr := io.ReadAll(reader)
 	resp.Body.Close()
 	if readErr != nil {
 		return nil, fmt.Errorf("failed to read public OBS resource response: %w", readErr)
+	}
+	if int64(len(body)) > publicMediaMaxBytes {
+		return nil, errPublicMediaTooLarge
 	}
 	switch resp.StatusCode {
 	case http.StatusOK:

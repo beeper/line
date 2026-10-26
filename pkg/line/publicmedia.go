@@ -7,11 +7,20 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"golang.org/x/net/idna"
 )
 
-var errPublicMediaPolicy = errors.New("unsupported LINE public media URL")
+const (
+	publicMediaMaxBytes = 100*1024*1024 + 32
+	publicMediaTimeout  = 45 * time.Second
+)
+
+var (
+	errPublicMediaPolicy   = errors.New("unsupported LINE public media URL")
+	errPublicMediaTooLarge = errors.New("LINE public media exceeds the size limit")
+)
 
 type publicMediaTransport struct {
 	base *http.Transport
@@ -120,6 +129,7 @@ func (c *Client) publicMediaHTTPClient() *http.Client {
 		base = &http.Transport{}
 	}
 	return &http.Client{
+		Timeout:   publicMediaTimeout,
 		Transport: publicMediaTransport{base: base},
 		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
