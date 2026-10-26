@@ -66,7 +66,7 @@ func (transport publicMediaTransport) RoundTrip(request *http.Request) (*http.Re
 			return nil, err
 		}
 		client.Proxy = http.ProxyURL(proxy)
-		if proxy != nil && proxy.Scheme == "https" && client.DialTLSContext == nil && client.DialTLS == nil {
+		if proxy != nil && proxy.Scheme == "https" && client.DialTLSContext == nil {
 			dial := client.DialContext
 			if dial == nil {
 				dial = (&net.Dialer{}).DialContext
