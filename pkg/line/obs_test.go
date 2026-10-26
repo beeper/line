@@ -116,10 +116,10 @@ func TestDownloadOBSPublicResourceMatchesChromeRequestFlow(t *testing.T) {
 	}
 }
 
-func TestDownloadOBSPublicResourceRejectsExternalURL(t *testing.T) {
+func TestDownloadOBSPublicResourceRejectsUnsafeURL(t *testing.T) {
 	client := NewClient("line-token")
 	for _, resourcePath := range []string{
-		"https://example.com/image",
+		"http://127.0.0.1/image",
 		"//example.com/image",
 		"relative/image",
 	} {
