@@ -5,9 +5,7 @@
 Start with:
 
 - `AGENTS.md` / `CLAUDE.md`
-- `.agents/skills/line-capture/SKILL.md`
-- `.agents/skills/line-analyze/SKILL.md`
-- `.agents/commands/line-implement.md`
+- the `line-capture` and `line-analyze` skills (siblings of this one)
 - `docs/protocol/README.md`
 - `docs/protocol/endpoints/README.md`
 - `docs/protocol/gap-analysis.md`
@@ -15,8 +13,9 @@ Start with:
 - likely `pkg/connector/*` files for the Matrix-facing feature
 
 Do not capture if the current protocol docs already provide enough evidence.
-Use `.agents` as the repo-local source of truth. `.claude/commands` is a
-compatibility symlink for Claude-style command discovery when present.
+All commands below run from the repository root. The capture scripts are in
+`.agents/skills/line-capture/scripts/` and the parse/redact scripts in
+`.agents/skills/line-analyze/scripts/`.
 
 ## Capture Contract
 
@@ -61,7 +60,7 @@ IDs, MIDs, contacts, message bodies, media object IDs, QR/login artifacts, and
 E2EE metadata.
 
 - Use `/tmp/line-chrome-extension-capture/<timestamp>-<slug>` with `umask 077`.
-- Prefer the persistent dedicated Chrome profile created by `.agents/skills/line-capture/scripts/line-chrome-capture.sh`
+- Prefer the persistent dedicated Chrome profile created by the `line-chrome-capture.sh` launcher
   at `~/.cache/line-chrome-extension-capture/chrome-debug-profile`.
 - Ask before using the user's normal Chrome profile.
 - Ask before stopping a running bridge or invalidating an active LINE session.
