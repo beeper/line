@@ -51,13 +51,13 @@ func wrapSendError(err error) error {
 			WithIsCertain(false).
 			WithSendNotice(true).
 			WithMessage("timed out waiting for LINE")
-	case statusCode == http.StatusTooManyRequests:
+	case statusCode == http.StatusTooManyRequests, line.IsTalkExceptionRateLimited(err):
 		return bridgev2.WrapErrorInStatus(err).
 			WithIsCertain(true).
 			WithSendNotice(true).
 			WithErrorReason(event.MessageStatusNetworkError).
 			WithMessage("LINE is rate limiting requests, try again later")
-	case statusCode >= 500:
+	case statusCode >= 500, line.IsTalkExceptionServerError(err):
 		return bridgev2.WrapErrorInStatus(err).
 			WithIsCertain(false).
 			WithSendNotice(true).
@@ -68,6 +68,7 @@ func wrapSendError(err error) error {
 			WithIsCertain(true).
 			WithSendNotice(true).
 			WithErrorReason(event.MessageStatusNetworkError).
+			WithStatus(event.MessageStatusFail).
 			WithMessage("LINE rejected the request")
 	default:
 		return bridgev2.WrapErrorInStatus(err).
