@@ -163,9 +163,6 @@ func (lc *LineClient) recoverClientAfterAuthError(ctx context.Context, failedCli
 			// case another serialized recovery rotated that token first.
 			return lc.recoverClientAfterAuthError(ctx, newLineAPIClient(recoveryToken), errRecover)
 		}
-		if ctx.Err() == nil && isRecoveryRejected(errRecover) {
-			lc.markRecoveryRejected(ctx, recoveryToken, errRecover)
-		}
 		return nil, errRecover
 	}
 	if ctx.Err() != nil {
@@ -178,6 +175,15 @@ func (lc *LineClient) recoverClientAfterAuthError(ctx context.Context, failedCli
 		return nil, errLineSessionInvalidated
 	}
 	return lc.newClient(), nil
+}
+
+func (lc *LineClient) recoverSessionAfterAuthError(ctx context.Context, failedClient *line.Client, err error) (*line.Client, error) {
+	recoveryToken := lc.getAccessToken()
+	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+	if errRecover != nil && ctx.Err() == nil && isRecoveryRejected(errRecover) {
+		lc.markRecoveryRejected(ctx, recoveryToken, errRecover)
+	}
+	return recoveredClient, errRecover
 }
 
 func (lc *LineClient) callLine(ctx context.Context, call func(*line.Client) error) (*line.Client, error) {

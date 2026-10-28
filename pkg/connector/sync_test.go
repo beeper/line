@@ -601,7 +601,7 @@ func TestPollLoopRebuildsSSEClientAfterReconnect(t *testing.T) {
 	}
 
 	lc.wg.Add(1)
-	lc.pollLoop(ctx, false)
+	lc.pollLoop(ctx)
 
 	if len(tokens) != 2 {
 		t.Fatalf("SSE attempts = %d, want 2", len(tokens))
@@ -649,7 +649,7 @@ func TestPollLoopMarksLoggedOutWhenReceiveAuthFails(t *testing.T) {
 	}
 
 	lc.wg.Add(1)
-	lc.pollLoop(context.Background(), false)
+	lc.pollLoop(context.Background())
 
 	if profileCalls != 1 {
 		t.Fatalf("profile calls = %d, want 1", profileCalls)
@@ -700,7 +700,7 @@ func TestPollLoopMarksLoggedOutWhenReceiveIdleProbeFailsLoggedOut(t *testing.T) 
 	}
 
 	lc.wg.Add(1)
-	lc.pollLoop(context.Background(), false)
+	lc.pollLoop(context.Background())
 
 	if revisionCalls != 2 {
 		t.Fatalf("revision calls = %d, want 2", revisionCalls)
@@ -765,7 +765,7 @@ func TestPollLoopReconnectsWhenReceiveIdleProbeSucceeds(t *testing.T) {
 	}
 
 	lc.wg.Add(1)
-	lc.pollLoop(ctx, false)
+	lc.pollLoop(ctx)
 
 	if revisionCalls != 2 {
 		t.Fatalf("revision calls = %d, want 2", revisionCalls)
@@ -824,7 +824,7 @@ func TestPollLoopReceiveAuthDeadlineIgnoresHeartbeats(t *testing.T) {
 		},
 	}
 	lc.wg.Add(1)
-	lc.pollLoop(context.Background(), false)
+	lc.pollLoop(context.Background())
 
 	if heartbeatCalls != 5 {
 		t.Fatalf("heartbeat batches = %d, want 5", heartbeatCalls)
@@ -880,7 +880,7 @@ func TestPollLoopReceiveAuthDeadlineSurvivesEOFReconnects(t *testing.T) {
 		},
 	}
 	lc.wg.Add(1)
-	lc.pollLoop(context.Background(), false)
+	lc.pollLoop(context.Background())
 
 	if listenCalls != 3 {
 		t.Fatalf("SSE attempts = %d, want 3", listenCalls)
@@ -933,7 +933,7 @@ func TestPollLoopSuccessfulReceiveAuthProbePreservesLocalRev(t *testing.T) {
 		},
 	}
 	lc.wg.Add(1)
-	lc.pollLoop(ctx, false)
+	lc.pollLoop(ctx)
 
 	if revisionCalls != 2 {
 		t.Fatalf("revision calls = %d, want startup plus one successful probe", revisionCalls)
@@ -974,7 +974,7 @@ func TestPollLoopParentCancellationDoesNotProbeAuth(t *testing.T) {
 		},
 	}
 	lc.wg.Add(1)
-	lc.pollLoop(ctx, false)
+	lc.pollLoop(ctx)
 
 	if revisionCalls != 1 {
 		t.Fatalf("revision calls = %d, want startup only", revisionCalls)

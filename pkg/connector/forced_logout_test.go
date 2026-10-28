@@ -70,7 +70,7 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 				lc.missingE2EEKeyMu.Lock()
 			}
 			go func() {
-				_, err := lc.recoverClientAfterAuthError(ctx, line.NewClient("token"), failure)
+				_, err := lc.recoverSessionAfterAuthError(ctx, line.NewClient("token"), failure)
 				recovered <- err
 			}()
 			if mode == "invalid-key" {

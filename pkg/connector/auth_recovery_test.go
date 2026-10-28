@@ -69,9 +69,9 @@ func TestRecoveryFailureInvalidatesOnlyRejectedSessions(t *testing.T) {
 				return tt.recoverErr
 			}
 			lc := &LineClient{AccessToken: "current-token"}
-			retryClient, err := lc.recoverClientAfterAuthError(context.Background(), line.NewClient("current-token"), errAuthRequired)
+			retryClient, err := lc.recoverSessionAfterAuthError(context.Background(), line.NewClient("current-token"), errAuthRequired)
 			if !errors.Is(err, tt.recoverErr) {
-				t.Fatalf("recoverClientAfterAuthError error = %v, want %v", err, tt.recoverErr)
+				t.Fatalf("recoverSessionAfterAuthError error = %v, want %v", err, tt.recoverErr)
 			}
 			if retryClient != nil {
 				t.Fatalf("retry client = %#v, want nil", retryClient)

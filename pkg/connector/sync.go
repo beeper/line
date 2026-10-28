@@ -1619,7 +1619,7 @@ func waitForSSEReconnect(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (lc *LineClient) pollLoop(ctx context.Context, sseDisconnected bool) {
+func (lc *LineClient) pollLoop(ctx context.Context) {
 	defer lc.wg.Done()
 
 	var localRev int64 = 0
@@ -1653,6 +1653,7 @@ func (lc *LineClient) pollLoop(ctx context.Context, sseDisconnected bool) {
 		return false
 	}
 
+	sseDisconnected := false
 	var backoff reconnectBackoff
 	handler := func(eventType, data string) {
 		backoff.reset()
@@ -1784,7 +1785,7 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 		return lc.handleReceiveAuthError(ctx, probeClient, probeErr)
 	}
 
-	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, probeClient, probeErr)
+	recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, probeClient, probeErr)
 	if errRecover != nil {
 		if errors.Is(errRecover, errLineSessionInvalidated) || errors.Is(errRecover, errLineClientSuperseded) || ctx.Err() != nil {
 			return true
@@ -1812,7 +1813,7 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 // the detailed forced-logout envelope before deciding whether recovery is safe.
 func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *line.Client, err error) bool {
 	if lc.isLoggedOut(err) {
-		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+		recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, failedClient, err)
 		if errRecover != nil {
 			return true
 		}
@@ -1829,7 +1830,7 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *
 		return true
 	}
 	if lc.isLoggedOut(profileErr) {
-		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, profileClient, profileErr)
+		recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, profileClient, profileErr)
 		if errRecover != nil {
 			return true
 		}
@@ -1839,7 +1840,7 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *
 		return false
 	}
 
-	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+	recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, failedClient, err)
 	if recoveredClient != nil {
 		return false
 	}
