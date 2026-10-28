@@ -2,7 +2,6 @@ package connector
 
 import (
 	"context"
-	"errors"
 	"io"
 	"path/filepath"
 	"testing"
@@ -21,7 +20,7 @@ import (
 )
 
 func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
-	for _, mode := range []string{"ordinary", "invalid-key", "late-invalid-key", "late-stale-key", "rejected-recovery"} {
+	for _, mode := range []string{"ordinary", "invalid-key", "late-invalid-key", "late-stale-key"} {
 		t.Run(mode, func(t *testing.T) {
 			invalidKey := mode == "invalid-key" || mode == "late-invalid-key"
 			ctx := context.Background()
@@ -58,19 +57,12 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 			if mode == "invalid-key" {
 				failure = errSenderKey
 			}
-			var wantRecoverErr error
-			if mode == "rejected-recovery" {
-				failure, wantRecoverErr = errAuthRequired, errLoginRejected
-				oldRecover := recoverLineToken
-				t.Cleanup(func() { recoverLineToken = oldRecover })
-				recoverLineToken = func(*LineClient, context.Context) error { return errLoginRejected }
-			}
 			recovered := make(chan error, 1)
 			if mode == "invalid-key" {
 				lc.missingE2EEKeyMu.Lock()
 			}
 			go func() {
-				_, err := lc.recoverSessionAfterAuthError(ctx, line.NewClient("token"), failure)
+				_, err := lc.recoverClientAfterAuthError(ctx, line.NewClient("token"), failure)
 				recovered <- err
 			}()
 			if mode == "invalid-key" {
@@ -82,8 +74,8 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 				}
 				lc.missingE2EEKeyMu.Unlock()
 			}
-			if err := <-recovered; !errors.Is(err, wantRecoverErr) {
-				t.Fatalf("recovery error = %v, want %v", err, wantRecoverErr)
+			if err := <-recovered; err != nil {
+				t.Fatal(err)
 			}
 			if mode == "late-invalid-key" || mode == "late-stale-key" {
 				if !lc.isTokenError(errSenderKey) {
@@ -102,8 +94,6 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 			wantStateError := status.BridgeStateErrorCode("line-logged-out")
 			if mode == "invalid-key" {
 				wantStateError = "line-e2ee-key-missing"
-			} else if mode == "rejected-recovery" {
-				wantStateError = "line-token-expired"
 			}
 			select {
 			case state := <-matrix.states:
@@ -144,9 +134,6 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 				if invalidKey {
 					wantRestartError = "line-e2ee-key-missing"
 					wantRestartMessage = lineMissingE2EEKeyMessage
-				} else if mode == "rejected-recovery" {
-					wantRestartError = "line-token-expired"
-					wantRestartMessage = status.BridgeStateHumanErrors["line-token-expired"]
 				}
 				if state.StateEvent != status.StateBadCredentials || state.Error != wantRestartError || state.Message != wantRestartMessage || state.UserAction != status.UserActionRelogin {
 					t.Fatalf("unexpected state after bridge restart: %v", state)

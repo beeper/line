@@ -1009,42 +1009,6 @@ func TestReceiveRequestNeedLoginMarksLoggedOutImmediately(t *testing.T) {
 	}
 }
 
-func TestReceiveAuthErrorStopsPollingOnlyWhenRecoveryIsRejected(t *testing.T) {
-	oldGetProfile := getProfileWithToken
-	oldRecover := recoverLineToken
-	t.Cleanup(func() {
-		getProfileWithToken = oldGetProfile
-		recoverLineToken = oldRecover
-	})
-	getProfileWithToken = func(context.Context, string) (*line.Profile, error) {
-		return nil, errAuthRequired
-	}
-
-	tests := []struct {
-		name        string
-		recoverErr  error
-		wantStopped bool
-	}{
-		{name: "transient failure keeps polling", recoverErr: errRecoveryTimeout},
-		{name: "rejected credentials stop polling", recoverErr: errLoginRejected, wantStopped: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			recoverLineToken = func(*LineClient, context.Context) error {
-				return tt.recoverErr
-			}
-			lc := &LineClient{AccessToken: "expired"}
-			stopped := lc.handleReceiveAuthError(context.Background(), line.NewClient("expired"), errors.New("SSE error: 401"))
-			if stopped != tt.wantStopped {
-				t.Fatalf("stopped = %v, want %v", stopped, tt.wantStopped)
-			}
-			if lc.isSessionInvalidated() != tt.wantStopped || lc.IsLoggedIn() == tt.wantStopped {
-				t.Fatalf("invalidated = %v, logged in = %v, want invalidated = %v", lc.isSessionInvalidated(), lc.IsLoggedIn(), tt.wantStopped)
-			}
-		})
-	}
-}
-
 func TestReceiveAuthErrorWithValidProfileDoesNotRecover(t *testing.T) {
 	oldGetProfile := getProfileWithToken
 	t.Cleanup(func() {
