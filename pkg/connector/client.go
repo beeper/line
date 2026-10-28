@@ -687,20 +687,30 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		if ctx.Err() == nil && lc.isLoggedOut(tokenErr) {
 			lc.markLoggedOutByOtherClient(ctx, tokenErr)
 		}
-		if ctx.Err() != nil || lc.isSessionInvalidated() || !lc.sendSSEDisconnectedIfCurrent(ctx, tokenErr) {
+		if ctx.Err() != nil || lc.isSessionInvalidated() {
 			return
 		}
-		lc.UserLogin.Bridge.Log.Warn().Err(tokenErr).Msg("Failed to verify LINE token, retrying before starting the session")
-		// Startup work below runs once per connection, so it waits for a working
-		// token instead of running against a failing one. Connect itself returns so
-		// other logins aren't held up.
-		handedOff = true
-		go func() {
-			lc.finishStartup(run, lc.waitForValidToken(ctx) && lc.startSession(ctx))
-		}()
-		return
+		if lc.shouldWaitForToken(tokenErr) {
+			if !lc.sendSSEDisconnectedIfCurrent(ctx, tokenErr) {
+				return
+			}
+			lc.UserLogin.Bridge.Log.Warn().Err(tokenErr).Msg("Failed to verify LINE token, retrying before starting the session")
+			// Startup work below runs once per connection, so it waits for a working
+			// token instead of running against a failing one. Connect itself returns so
+			// other logins aren't held up.
+			handedOff = true
+			go func() {
+				lc.finishStartup(run, lc.waitForValidToken(ctx) && lc.startSession(ctx))
+			}()
+			return
+		}
+		lc.UserLogin.Bridge.Log.Warn().Err(tokenErr).Msg("Failed to verify LINE token, starting anyway")
 	}
 	workersStarted = lc.startSession(ctx)
+}
+
+func (lc *LineClient) shouldWaitForToken(err error) bool {
+	return lc.isTokenError(err) || isTransientLineError(err)
 }
 
 func (lc *LineClient) finishStartup(run *lineClientRun, workersStarted bool) {
@@ -727,6 +737,9 @@ func (lc *LineClient) waitForValidToken(ctx context.Context) bool {
 			return false
 		case lc.isSessionInvalidated():
 			return false
+		case !lc.shouldWaitForToken(err):
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to verify LINE token, starting anyway")
+			return true
 		}
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Still failing to verify LINE token, retrying")
 	}
