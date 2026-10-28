@@ -3,15 +3,18 @@ package connector
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/mediaproxy"
 
 	"github.com/beeper/line/pkg/connector/handlers"
+	"github.com/beeper/line/pkg/line"
 )
 
 const (
@@ -91,7 +94,7 @@ func (lc *LineConnector) Download(ctx context.Context, mediaID networkid.MediaID
 	}
 	data, err := client.newMessageHandler().DownloadDirectMedia(ctx, string(parsed.MessageID), metadata.DirectMedia)
 	if err != nil {
-		return nil, err
+		return nil, wrapDirectMediaError(err)
 	}
 	if len(data) > handlers.BeeperMaxFileSize {
 		return nil, fmt.Errorf("%w: LINE %s is %.2f MiB", bridgev2.ErrMediaTooLarge, metadata.DirectMedia.Kind, float64(len(data))/(1024*1024))
@@ -103,4 +106,25 @@ func (lc *LineConnector) Download(ctx context.Context, mediaID networkid.MediaID
 	return &mediaproxy.GetMediaResponseData{
 		Reader: io.NopCloser(bytes.NewReader(data)), ContentType: contentType, ContentLength: int64(len(data)),
 	}, nil
+}
+
+// wrapDirectMediaError gives the media proxy a status for a failed LINE media
+// download, keeping the original error in the chain.
+func wrapDirectMediaError(err error) error {
+	var mapped mautrix.RespError
+	switch statusCode := line.HTTPStatusCode(err); {
+	case errors.Is(err, line.ErrOBSObjectNotFound), statusCode == http.StatusNotFound, statusCode == http.StatusGone:
+		mapped = mautrix.MNotFound.WithMessage("This media is no longer available on LINE")
+	case errors.Is(err, line.ErrOBSEncodingIncomplete):
+		mapped = mautrix.MUnknown.WithMessage("LINE is still processing this media").WithStatus(http.StatusGatewayTimeout).WithCanRetry(true)
+	case statusCode == http.StatusUnauthorized, statusCode == http.StatusForbidden:
+		mapped = mautrix.MForbidden.WithMessage("LINE refused access to this media")
+	case statusCode == http.StatusTooManyRequests:
+		mapped = mautrix.MLimitExceeded.WithMessage("LINE is rate limiting media downloads").WithCanRetry(true)
+	case statusCode != 0, errors.Is(err, line.ErrOBSObjectValidation):
+		mapped = mautrix.MUnknown.WithMessage("LINE couldn't return this media").WithStatus(http.StatusBadGateway).WithCanRetry(true)
+	default:
+		return err
+	}
+	return fmt.Errorf("%w: %w", mapped, err)
 }
