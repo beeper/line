@@ -136,11 +136,10 @@ func TestConfigurePhoneNotificationsTreatsAuthRecoveryFailureAsBestEffort(t *tes
 	) error {
 		return errAuthRequired
 	}
-	recoveryErr := errors.New("stored credentials rejected")
 	var recoveries int
 	recoverLineToken = func(*LineClient, context.Context) error {
 		recoveries++
-		return recoveryErr
+		return errRecoveryTimeout
 	}
 
 	ctx := context.Background()

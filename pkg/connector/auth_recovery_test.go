@@ -3,6 +3,9 @@ package connector
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,12 +16,125 @@ import (
 )
 
 var (
-	errAuthRequired = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":119,"reason":"Access token refresh required"}}`)
-	errLoggedOut    = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":8,"reason":"V3_TOKEN_CLIENT_LOGGED_OUT"}}`)
-	errSenderKey    = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":83,"reason":"invalid sender key"}}`)
-	errNotMember    = errors.New(`API error 400: {"code":10051,"data":{"name":"TalkException","code":10,"reason":"not a member"}}`)
-	errNetwork      = errors.New("request failed: dial tcp: i/o timeout")
+	errAuthRequired    = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":119,"reason":"Access token refresh required"}}`)
+	errLoggedOut       = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":8,"reason":"V3_TOKEN_CLIENT_LOGGED_OUT"}}`)
+	errSenderKey       = errors.New(`API error 400: {"code":10051,"message":"RESPONSE_ERROR","data":{"name":"TalkException","code":83,"reason":"invalid sender key"}}`)
+	errNotMember       = errors.New(`API error 400: {"code":10051,"data":{"name":"TalkException","code":10,"reason":"not a member"}}`)
+	errNetwork         = errors.New("request failed: dial tcp: i/o timeout")
+	errRecoveryTimeout = fmt.Errorf("request failed: %w", &url.Error{Op: "Post", URL: "https://line-chrome-gw.line-apps.com/api/auth/tokenRefresh", Err: os.ErrDeadlineExceeded})
+	errLoginRejected   = errors.New("login failed: loginV2 failed: invalid password (code 1)")
 )
+
+func TestIsTransientLineError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "network timeout", err: errRecoveryTimeout, want: true},
+		{name: "server error", err: &line.HTTPError{StatusCode: 503}, want: true},
+		{name: "rate limited", err: &line.HTTPError{StatusCode: 429}, want: true},
+		{name: "backed off network failure", err: fmt.Errorf("waiting to retry LINE token recovery: %w", errRecoveryTimeout), want: true},
+		{name: "unauthorized", err: &line.HTTPError{StatusCode: 401}, want: false},
+		{name: "login rejected", err: errLoginRejected, want: false},
+		{name: "unanswered PIN prompt", err: fmt.Errorf("%w: %w", errLinePINNotVerified, errRecoveryTimeout), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTransientLineError(tt.err); got != tt.want {
+				t.Fatalf("isTransientLineError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRecoveryFailureInvalidatesOnlyRejectedSessions(t *testing.T) {
+	oldRecover := recoverLineToken
+	t.Cleanup(func() {
+		recoverLineToken = oldRecover
+	})
+
+	tests := []struct {
+		name            string
+		recoverErr      error
+		wantInvalidated bool
+	}{
+		{name: "transient failure keeps the session", recoverErr: errRecoveryTimeout},
+		{name: "rejected credentials invalidate the session", recoverErr: errLoginRejected, wantInvalidated: true},
+		{name: "unanswered PIN prompt invalidates the session", recoverErr: fmt.Errorf("%w: %w", errLinePINNotVerified, errRecoveryTimeout), wantInvalidated: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recoverLineToken = func(*LineClient, context.Context) error {
+				return tt.recoverErr
+			}
+			lc := &LineClient{AccessToken: "current-token"}
+			retryClient, err := lc.recoverClientAfterAuthError(context.Background(), line.NewClient("current-token"), errAuthRequired)
+			if !errors.Is(err, tt.recoverErr) {
+				t.Fatalf("recoverClientAfterAuthError error = %v, want %v", err, tt.recoverErr)
+			}
+			if retryClient != nil {
+				t.Fatalf("retry client = %#v, want nil", retryClient)
+			}
+			if lc.isSessionInvalidated() != tt.wantInvalidated || lc.IsLoggedIn() == tt.wantInvalidated {
+				t.Fatalf("invalidated = %v, logged in = %v, want invalidated = %v", lc.isSessionInvalidated(), lc.IsLoggedIn(), tt.wantInvalidated)
+			}
+		})
+	}
+}
+
+func TestRunTokenRecoveryBacksOffAfterFailure(t *testing.T) {
+	lc := &LineClient{}
+	var calls int
+	recover := func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return errRecoveryTimeout
+		}
+		return nil
+	}
+
+	if err := lc.runTokenRecovery(context.Background(), recover); !errors.Is(err, errRecoveryTimeout) {
+		t.Fatalf("first recovery error = %v, want %v", err, errRecoveryTimeout)
+	}
+	lc.recoverRetryAt = time.Now().Add(time.Minute)
+	if err := lc.runTokenRecovery(context.Background(), recover); !errors.Is(err, errRecoveryTimeout) {
+		t.Fatalf("backed off recovery error = %v, want %v", err, errRecoveryTimeout)
+	}
+	if calls != 1 {
+		t.Fatalf("recovery calls during backoff = %d, want 1", calls)
+	}
+
+	lc.recoverRetryAt = time.Now()
+	if err := lc.runTokenRecovery(context.Background(), recover); err != nil {
+		t.Fatalf("recovery after backoff returned error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("recovery calls after backoff = %d, want 2", calls)
+	}
+	if lc.recoverBackoff.delay != 0 || !lc.recoverRetryAt.IsZero() {
+		t.Fatal("successful recovery did not reset the backoff")
+	}
+}
+
+func TestRecoverTokenDoesNotReloginAfterTransientRefreshFailure(t *testing.T) {
+	lc := &LineClient{}
+	var reloginCalls int
+	err := lc.recoverTokenWith(
+		context.Background(),
+		func(context.Context) error { return errRecoveryTimeout },
+		func(context.Context) error {
+			reloginCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, errRecoveryTimeout) {
+		t.Fatalf("recoverTokenWith error = %v, want %v", err, errRecoveryTimeout)
+	}
+	if reloginCalls != 0 {
+		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
+	}
+}
 
 func TestCallLineWithRecovery(t *testing.T) {
 	tests := []struct {
