@@ -142,6 +142,8 @@ jobs:
       TEST_TIMEOUT: 10m
       TEST_JSON: "1"
       TEST_OUTPUT_DIR: ${{ github.workspace }}/.opencode-work/test-ci-${{ matrix.mode }}
+      GOPATH: ${{ github.workspace }}/.opencode-work/gopath
+      GOCACHE: ${{ github.workspace }}/.opencode-work/go-build-cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -157,12 +159,12 @@ jobs:
       - name: Cache Go modules
         uses: actions/cache@v4
         with:
-          path: ~/go/pkg/mod
+          path: ${{ env.GOPATH }}/pkg/mod
           key: test-modules-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
       - name: Cache compiled tests by instrumentation mode
         uses: actions/cache@v4
         with:
-          path: ~/.cache/go-build
+          path: ${{ env.GOCACHE }}
           key: test-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.native.outputs.abi }}-${{ matrix.mode }}-${{ hashFiles('go.sum') }}-${{ hashFiles('**/*.go', 'pkg/ltsm/data/*') }}
           restore-keys: |
             test-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.native.outputs.abi }}-${{ matrix.mode }}-${{ hashFiles('go.sum') }}-

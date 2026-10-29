@@ -5,7 +5,9 @@ cd "$root"
 mode=${1:-normal}; if (($#)); then shift; fi
 parallel=${TEST_PACKAGE_PARALLELISM:-2}; timeout=${TEST_TIMEOUT:-10m}
 out=${TEST_OUTPUT_DIR:-"$root/.opencode-work/test-optimization/validation"}
-mkdir -p "$out/tmp"; export TMPDIR="$out/tmp" GOTMPDIR="$out/tmp"
+export GOPATH=${GOPATH:-"$root/.opencode-work/gopath"}
+export GOCACHE=${GOCACHE:-"$root/.opencode-work/go-build-cache"}
+mkdir -p "$out/tmp" "$GOPATH" "$GOCACHE"; export TMPDIR="$out/tmp" GOTMPDIR="$out/tmp"
 export GOMAXPROCS=${GOMAXPROCS:-4}
 json=(); [[ ${TEST_JSON:-0} == 1 ]] && json=(-json)
 format_check() {
