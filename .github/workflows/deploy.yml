@@ -170,6 +170,9 @@ jobs:
           key: test-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.native.outputs.abi }}-${{ matrix.mode }}-${{ hashFiles('go.sum') }}-${{ hashFiles('**/*.go', 'pkg/ltsm/data/*') }}
           restore-keys: |
             test-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.native.outputs.abi }}-${{ matrix.mode }}-${{ hashFiles('go.sum') }}-
+      - name: Verify LINE login aliases for release
+        if: matrix.mode == 'normal'
+        run: TEST_RUN='^TestRegisteredLineLoginCommandDispatch$' bash scripts/test.sh fast ./pkg/connector
       - name: Run validation
         run: bash scripts/test.sh "${{ matrix.mode }}"
       - name: Upload test reports

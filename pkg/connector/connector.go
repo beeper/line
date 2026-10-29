@@ -44,6 +44,7 @@ func (lc *LineConnector) Init(bridge *bridgev2.Bridge) {
 	// user doesn't already have one.
 	bridge.Config.BridgeStatusNotices = "none"
 	lc.br = bridge
+	lc.registerLoginCommand()
 }
 
 func (lc *LineConnector) Start(ctx context.Context) error {

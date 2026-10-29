@@ -1,5 +1,13 @@
 # Direct chats, synchronization, outbound messages and QR login
 
+## Choosing a login method
+
+In the bot management room, use `login` or `login help` to list available
+methods. `login email` starts email/password login; `login qr` starts QR login
+when `network.qr_login` is enabled. Method names are case-insensitive. In other
+rooms, prefix the command (for example, `!line login qr`). Fully qualified
+mautrix-go flow IDs remain accepted for provisioning and existing clients.
+
 ## Starting a direct chat
 
 In the bot management room:
