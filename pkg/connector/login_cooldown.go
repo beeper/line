@@ -158,19 +158,24 @@ func classifyLoginRateLimit(err error) loginRateLimitKind {
 	if isVerificationTemporarilyUnavailableText(details.ErrorReason) || isVerificationTemporarilyUnavailableText(details.ErrorMessage) {
 		return loginRateLimitVerificationUnavailable
 	}
+	if isRetryLaterText(details.ErrorReason) || isRetryLaterText(details.ErrorMessage) {
+		return loginRateLimitRetryLater
+	}
 	return loginRateLimitNone
 }
 
 func isVerificationTemporarilyUnavailableText(text string) bool {
-	return strings.EqualFold(strings.TrimSpace(text), "verification is temporarily unavailable")
+	return line.SanitizeProviderAlert(text) == "verification_temporarily_unavailable"
 }
 
 func isLoginRateLimitText(text string) bool {
-	switch strings.ToLower(strings.TrimSpace(text)) {
-	case "too many login attempts", "blocked user":
-		return true
-	}
-	return false
+	category := line.SanitizeProviderAlert(text)
+	return category == "too_many_login_attempts" || category == "blocked_user"
+}
+
+func isRetryLaterText(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.EqualFold(text, "retry later") || strings.EqualFold(text, "RETRY_LATER")
 }
 
 // noteLoginRateLimit records a rate limit rejection so the next attempt waits

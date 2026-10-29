@@ -187,7 +187,7 @@ func classifyEmailError(details loginErrorDetails, reason string) line.AuthError
 		return line.AuthErrorTooManyAttempts
 	case safeCategory == "too_many_login_attempts":
 		return line.AuthErrorTooManyAttempts
-	case strings.EqualFold(strings.TrimSpace(reason), "retry later"):
+	case strings.EqualFold(strings.TrimSpace(reason), "retry later"), strings.EqualFold(strings.TrimSpace(reason), "RETRY_LATER"):
 		return line.AuthErrorRetryLater
 	case details.HTTPStatus == http.StatusTooManyRequests:
 		return line.AuthErrorTooManyAttempts

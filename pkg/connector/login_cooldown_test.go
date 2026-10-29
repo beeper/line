@@ -157,7 +157,7 @@ func TestVerificationTemporarilyUnavailableBlocksRetry(t *testing.T) {
 	oldLogin := loginWithCredentials
 	t.Cleanup(func() { loginWithCredentials = oldLogin })
 	loginWithCredentials = func(_, _, _ string) (*line.LoginResult, error) {
-		return nil, errors.New(`login failed: API error 400: {"code":10051,"data":{"name":"TalkException","reason":"Verification is temporarily unavailable"}}`)
+		return nil, errors.New("login failed: API error 400: {\"code\":10051,\"data\":{\"name\":\"TalkException\",\"reason\":\"Verification is temporarily unavailable.\\nPlease try again later.\"}}")
 	}
 	logger := zerolog.New(io.Discard)
 	var cooldown loginCooldown
@@ -233,6 +233,43 @@ func TestEmailLoginRateLimitBlocksNextAttempt(t *testing.T) {
 		t.Fatal("a new login was started inside the rate limit window")
 	} else if !strings.Contains(err.Error(), "try again in") {
 		t.Fatalf("unexpected cooldown error: %v", err)
+	}
+}
+
+func TestStoredCredentialRecoveryRespectsActiveCooldown(t *testing.T) {
+	client := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("stored-credential recovery bypassed cooldown: %s", req.URL.Path)
+		return nil, nil
+	})
+	meta := client.UserLogin.Metadata.(*UserLoginMetadata)
+	meta.Email, meta.Password = "user@example.com", "password"
+	connector := client.UserLogin.Bridge.Network.(*LineConnector)
+	connector.loginCooldown.block(string(client.UserLogin.User.MXID), time.Now().Add(15*time.Minute))
+	err := client.tryLogin(context.Background())
+	var respErr bridgev2.RespError
+	if !errors.As(err, &respErr) || respErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("stored reconnect cooldown = %v", err)
+	}
+}
+
+func TestStoredCredentialRecoveryStartsCooldownAfterProviderLimit(t *testing.T) {
+	oldLogin := loginWithCredentials
+	t.Cleanup(func() { loginWithCredentials = oldLogin })
+	loginWithCredentials = func(_, _, _ string) (*line.LoginResult, error) {
+		return nil, errors.New(`API error 429: {"code":10051,"data":{"name":"TalkException","reason":"Too many login attempts"}}`)
+	}
+	client := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("mocked login made an unexpected API request: %s", req.URL.Path)
+		return nil, nil
+	})
+	meta := client.UserLogin.Metadata.(*UserLoginMetadata)
+	meta.Email, meta.Password = "user@example.com", "password"
+	connector := client.UserLogin.Bridge.Network.(*LineConnector)
+	if err := client.tryLogin(context.Background()); err == nil {
+		t.Fatal("rate-limited stored-credential recovery succeeded")
+	}
+	if connector.loginCooldown.remaining(string(client.UserLogin.User.MXID)) <= 0 {
+		t.Fatal("background reconnect did not activate cooldown")
 	}
 }
 

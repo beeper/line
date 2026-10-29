@@ -742,12 +742,21 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	workersStarted = true
 }
 
-func (lc *LineClient) tryLogin(ctx context.Context) error {
+func (lc *LineClient) tryLogin(ctx context.Context) (resultErr error) {
 	var email, password, certificate string
+	var loginProcess *LineEmailLogin
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
 		email = meta.Email
 		password = meta.Password
 		certificate = meta.Certificate
+	}
+	if lc.UserLogin.Bridge != nil {
+		if network, ok := lc.UserLogin.Bridge.Network.(*LineConnector); ok {
+			loginProcess = &LineEmailLogin{User: lc.UserLogin.User, cooldown: &network.loginCooldown}
+			if err := loginProcess.loginCooldownError(); err != nil {
+				return err
+			}
+		}
 	}
 
 	if email == "" || password == "" {
@@ -758,9 +767,19 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		}
 		return fmt.Errorf("no stored credentials available for re-login")
 	}
+	if loginProcess != nil {
+		if err := loginProcess.claimLogin(); err != nil {
+			return err
+		}
+		defer loginProcess.releaseLogin()
+		defer func() {
+			if resultErr != nil {
+				loginProcess.noteLoginRateLimit(resultErr)
+			}
+		}()
+	}
 
 	lc.UserLogin.Bridge.Log.Info().
-		Str("email", email).
 		Bool("has_certificate", certificate != "").
 		Msg("Attempting to login with email/password...")
 	res, err := loginWithCredentialsContext(ctx, email, password, certificate)
