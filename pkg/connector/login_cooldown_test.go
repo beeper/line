@@ -57,6 +57,42 @@ func runQRLoginToRejection(t *testing.T, body string, status int) (*LineConnecto
 	return lc.UserLogin.Bridge.Network.(*LineConnector), lc.UserLogin.User, err
 }
 
+func TestQRStartupRateLimitMapsAndStartsCooldown(t *testing.T) {
+	for _, method := range []string{"createSession", "createQrCode"} {
+		t.Run(method, func(t *testing.T) {
+			calls := 0
+			lc := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+				gotMethod := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+				if method == "createQrCode" && gotMethod == "createSession" {
+					return resolutionResponse(`{"code":0,"data":{"authSessionId":"qr-session"}}`), nil
+				}
+				calls++
+				if gotMethod != method {
+					t.Fatalf("unexpected QR RPC %s, wanted %s", gotMethod, method)
+				}
+				resp := resolutionResponse(`{"code":10051,"data":{"name":"SecondaryQrCodeException","code":5}}`)
+				resp.StatusCode = http.StatusTooManyRequests
+				return resp, nil
+			})
+			connector := lc.UserLogin.Bridge.Network.(*LineConnector)
+			lq := &LineQRLogin{login: &LineEmailLogin{User: lc.UserLogin.User, cooldown: &connector.loginCooldown}}
+			defer lq.Cancel()
+			_, err := lq.Start(context.Background())
+			var respErr bridgev2.RespError
+			if !errors.As(err, &respErr) || respErr.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("startup failure was not mapped to a rate limit: %v", err)
+			}
+			if connector.loginCooldown.remaining(string(lc.UserLogin.User.MXID)) <= 0 {
+				t.Fatal("startup rate limit did not activate account cooldown")
+			}
+			_, again := lq.Start(context.Background())
+			if again == nil || calls != 1 {
+				t.Fatalf("startup cooldown did not prevent another provider call: calls=%d err=%v", calls, again)
+			}
+		})
+	}
+}
+
 func TestQRRateLimitIsReportedAndBlocksImmediateRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, wantMessage string
@@ -212,6 +248,17 @@ func TestLoginCooldownExpires(t *testing.T) {
 	}
 	if remaining := cooldown.remaining("@other:example.com"); remaining != 0 {
 		t.Fatalf("cooldown leaked to another account: %s", remaining)
+	}
+}
+
+func TestLoginCooldownUsesRetryAfter(t *testing.T) {
+	var cooldown loginCooldown
+	user := &bridgev2.User{User: &database.User{MXID: "@user:example.com"}}
+	ll := &LineEmailLogin{User: user, cooldown: &cooldown}
+	delay := 37 * time.Second
+	ll.noteLoginRateLimit(&line.AuthError{Category: line.AuthErrorTooManyAttempts, RetryAfter: &delay})
+	if remaining := cooldown.remaining(string(user.MXID)); remaining < delay-time.Second || remaining > delay {
+		t.Fatalf("cooldown=%s, want provider Retry-After %s", remaining, delay)
 	}
 }
 

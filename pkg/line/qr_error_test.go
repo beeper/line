@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	gen "github.com/beeper/line/pkg"
 )
@@ -18,9 +19,9 @@ func TestQRErrorDetailsAndRedaction(t *testing.T) {
 		expired          bool
 	}{
 		{"nested rejection", `{"code":10051,"message":"PRIVATE","data":{"name":"TalkException","code":35,"reason":"blocked user","accessToken":"PRIVATE","authSessionId":"PRIVATE"}}`, "exception code 35, exception type TalkException, reason blocked user", 400, false},
-		{"HTTP success API failure", `{"code":10051,"data":{"name":"SecondaryQrCodeLoginException","code":0,"reason":"PRIVATE"}}`, "exception code 0, exception type SecondaryQrCodeLoginException, reason redacted", 200, false},
-		{"unknown exception", `{"code":10051,"data":{"name":"PRIVATE","code":99,"reason":"PRIVATE"}}`, "exception code 99, exception type other, reason redacted", 400, false},
-		{"QR exception with private alert", `{"code":10051,"data":{"name":"SecondaryQrCodeException","code":100,"alertMessage":"PRIVATE"}}`, "exception code 100, exception type SecondaryQrCodeException, alert redacted", 400, false},
+		{"HTTP success API failure", `{"code":10051,"data":{"name":"SecondaryQrCodeLoginException","code":0,"reason":"PRIVATE"}}`, "exception code 0, exception type SecondaryQrCodeLoginException", 200, false},
+		{"unknown exception", `{"code":10051,"data":{"name":"PRIVATE","code":99,"reason":"PRIVATE"}}`, "exception code 99, exception type other", 400, false},
+		{"QR exception with private alert", `{"code":10051,"data":{"name":"SecondaryQrCodeException","code":100,"alertMessage":"PRIVATE"}}`, "exception code 100, exception type SecondaryQrCodeException", 400, false},
 		{"QR exception with allowlisted alert", `{"code":10051,"data":{"name":"SecondaryQrCodeException","code":5,"alertMessage":"Too many login attempts"}}`, "exception code 5, exception type SecondaryQrCodeException, alert Too many login attempts", 400, false},
 		{"poll expired", `{"code":10052,"data":{"statusCode":410}}`, "code 10052, status 410", 400, true},
 		{"missing detail", `{"code":10051,"data":{}}`, "QR qrCodeLoginV2 failed: HTTP 400, code 10051", 400, false},
@@ -67,6 +68,36 @@ func TestQRLoginFailureDetailIgnoresOtherErrors(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	if got := parseRetryAfter("17", now); got != 17*time.Second {
+		t.Fatalf("seconds Retry-After = %s", got)
+	}
+	if got := parseRetryAfter(now.Add(2*time.Minute).Format(http.TimeFormat), now); got != 2*time.Minute {
+		t.Fatalf("date Retry-After = %s", got)
+	}
+	if got := parseRetryAfter("invalid", now); got != 0 {
+		t.Fatalf("invalid Retry-After = %s", got)
+	}
+}
+
+func TestQRAuthErrorStage(t *testing.T) {
+	for method, want := range map[string]AuthErrorStage{
+		"createSession":        AuthStageQRCreate,
+		"createQrCode":         AuthStageQRCreate,
+		"verifyCertificate":    AuthStageQRVerify,
+		"checkQrCodeVerified":  AuthStageQRVerify,
+		"createPinCode":        AuthStageQRVerify,
+		"checkPinCodeVerified": AuthStageQRVerify,
+		"qrCodeLoginV2":        AuthStageQRTokenIssue,
+	} {
+		err := (&qrRPCError{method: method, httpStatus: http.StatusBadRequest}).buildAuthError("SecondaryQrCodeException", nil, "", "")
+		if err.Stage != want {
+			t.Errorf("method %s has stage %s, want %s", method, err.Stage, want)
+		}
+	}
+}
+
 func TestQRRPCErrorAuthError(t *testing.T) {
 	for _, tc := range []struct {
 		name                    string
@@ -77,6 +108,8 @@ func TestQRRPCErrorAuthError(t *testing.T) {
 		wantRetryRecommended    bool
 		wantProviderAlertStatus string
 		wantProviderReason      string
+		retryAfter              string
+		wantRetryAfter          time.Duration
 	}{
 		{
 			name:                    "HTTP 429",
@@ -85,8 +118,10 @@ func TestQRRPCErrorAuthError(t *testing.T) {
 			wantCategory:            AuthErrorTooManyAttempts,
 			wantCooldownTriggered:   true,
 			wantRetryRecommended:    true,
-			wantProviderAlertStatus: "unrecognized",
+			wantProviderAlertStatus: "absent",
 			wantProviderReason:      "absent",
+			retryAfter:              "17",
+			wantRetryAfter:          17 * time.Second,
 		},
 		{
 			name:                    "retry later",
@@ -95,7 +130,7 @@ func TestQRRPCErrorAuthError(t *testing.T) {
 			wantCategory:            AuthErrorRetryLater,
 			wantCooldownTriggered:   true,
 			wantRetryRecommended:    true,
-			wantProviderAlertStatus: "unrecognized",
+			wantProviderAlertStatus: "absent",
 			wantProviderReason:      "absent",
 		},
 		{
@@ -115,7 +150,7 @@ func TestQRRPCErrorAuthError(t *testing.T) {
 			wantCategory:            AuthErrorQRLoginNotAllowed,
 			wantCooldownTriggered:   true,
 			wantRetryRecommended:    false,
-			wantProviderAlertStatus: "unrecognized",
+			wantProviderAlertStatus: "absent",
 			wantProviderReason:      "absent",
 		},
 	} {
@@ -129,7 +164,11 @@ func TestQRRPCErrorAuthError(t *testing.T) {
 			client.LoginAttempt = &LoginAttempt{Runner: runner, Context: ctx, cancel: cancel}
 			defer client.LoginAttempt.Close()
 			client.HTTPClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+				headers := make(http.Header)
+				if tc.retryAfter != "" {
+					headers.Set("Retry-After", tc.retryAfter)
+				}
+				return &http.Response{StatusCode: tc.status, Header: headers, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
 			})
 			_, err = client.QRCodeLoginV2(ctx, "session")
 			cancel()
@@ -156,6 +195,9 @@ func TestQRRPCErrorAuthError(t *testing.T) {
 			}
 			if ae.ProviderReason != tc.wantProviderReason {
 				t.Fatalf("providerReason = %q, want %q", ae.ProviderReason, tc.wantProviderReason)
+			}
+			if ae.RetryAfter == nil && tc.wantRetryAfter > 0 || ae.RetryAfter != nil && *ae.RetryAfter != tc.wantRetryAfter {
+				t.Fatalf("retryAfter = %v, want %s", ae.RetryAfter, tc.wantRetryAfter)
 			}
 		})
 	}

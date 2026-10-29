@@ -3,8 +3,10 @@ package line
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // AuthErrorCategory is a normalized classification of an authentication failure.
@@ -85,6 +87,8 @@ const (
 	AuthStageQRTokenIssue
 	// AuthStageEmailLogin is the email/password login stage.
 	AuthStageEmailLogin
+	// AuthStageEmailVerification is PIN/email challenge completion after credentials were accepted.
+	AuthStageEmailVerification
 	// AuthStageSessionEstablish is the session establishment stage.
 	AuthStageSessionEstablish
 )
@@ -100,6 +104,8 @@ func (s AuthErrorStage) String() string {
 		return "qr_token_issue"
 	case AuthStageEmailLogin:
 		return "email_login"
+	case AuthStageEmailVerification:
+		return "email_verification"
 	case AuthStageSessionEstablish:
 		return "session_establish"
 	default:
@@ -130,6 +136,10 @@ type AuthError struct {
 	ProviderReason string
 	// ProviderAlertStatus describes whether the provider alert was recognized.
 	ProviderAlertStatus string
+	// ProviderMessage is safe provider wording for logs and user-facing copy.
+	ProviderMessage string
+	// ProviderMessageStatus distinguishes recognized, sanitized, redacted, and suppressed text.
+	ProviderMessageStatus string
 	// UserMessage is the concise user-facing explanation.
 	UserMessage string
 	// RetryRecommended indicates whether retrying is appropriate.
@@ -163,11 +173,64 @@ func (e *AuthError) Unwrap() error {
 
 // SafeAlertStatus returns a safe provider alert status string. Never returns
 // raw provider text.
-func SafeAlertStatus(recognized bool) string {
-	if recognized {
-		return "recognized"
+var (
+	providerCredentialPattern = regexp.MustCompile(`(?i)\b(access[_ -]?token|refresh[_ -]?token|id[_ -]?token|password|passwd|authorization|cookie|authsessionid|session[_ -]?id|qr[_ -]?(token|secret)|credential|secret)\b\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,;.!?]+)([.!?]?)`)
+	providerEmailPattern      = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	providerJWTpattern        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b`)
+	providerOpaqueMIDPattern  = regexp.MustCompile(`\bU[A-Za-z0-9_-]{43}\b`)
+)
+
+// SanitizeProviderMessage keeps useful provider wording while removing common
+// credentials and private identifiers. Unknown text is presented only when it
+// is short, printable, and not structured or credential-like.
+func SanitizeProviderMessage(message string) (safe, status string) {
+	if strings.TrimSpace(message) == "" {
+		return "", "absent"
 	}
-	return "unrecognized"
+	for _, r := range message {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' || unicode.Is(unicode.Cf, r) {
+			return "", "suppressed"
+		}
+	}
+	message = strings.ReplaceAll(strings.ReplaceAll(message, "\r\n", "\n"), "\r", "\n")
+	message = strings.ReplaceAll(message, "\t", " ")
+	message = strings.TrimSpace(message)
+	if len([]rune(message)) > 512 {
+		return "", "suppressed"
+	}
+	message = providerCredentialPattern.ReplaceAllString(message, "$1=[redacted]$4")
+	message = providerEmailPattern.ReplaceAllString(message, "[redacted email]")
+	message = providerJWTpattern.ReplaceAllString(message, "[redacted token]")
+	message = providerOpaqueMIDPattern.ReplaceAllString(message, "[redacted LINE ID]")
+	if strings.ContainsAny(message, "{}") || strings.Contains(strings.ToLower(message), "bearer ") || strings.Contains(message, "https://") || strings.Contains(message, "http://") {
+		return "", "suppressed"
+	}
+	if (strings.Contains(strings.ToLower(message), "token ") || strings.Contains(strings.ToLower(message), "password ")) && !strings.Contains(message, "[redacted") && !isRecognizedProviderMessage(message) {
+		return "", "suppressed"
+	}
+	if strings.Contains(message, "[redacted") {
+		return message, "partially_redacted"
+	}
+	if isRecognizedProviderMessage(message) {
+		return message, "recognized"
+	}
+	if len([]rune(message)) < 5 {
+		return "", "suppressed"
+	}
+	if !strings.ContainsAny(message, " \n") && !strings.Contains(message, "[redacted") {
+		return "", "suppressed"
+	}
+	return message, "safe_unrecognized"
+}
+
+func isRecognizedProviderMessage(message string) bool {
+	lower := strings.ToLower(strings.Join(strings.Fields(message), " "))
+	for _, phrase := range []string{"verification is temporarily unavailable", "too many login attempts", "retry later", "blocked user", "authentication failed", "account id or password is invalid", "qr code has expired", "qr login is not allowed"} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // SanitizeProviderAlert maps a raw LINE provider alert to a safe category
@@ -179,9 +242,9 @@ func SanitizeProviderAlert(alert string) string {
 	}
 	lower := strings.ToLower(trimmed)
 	switch {
-	case strings.EqualFold(lower, "verification is temporarily unavailable"):
+	case strings.Contains(lower, "verification is temporarily unavailable"):
 		return "verification_temporarily_unavailable"
-	case strings.EqualFold(lower, "too many login attempts"):
+	case strings.Contains(lower, "too many login attempts"):
 		return "too_many_login_attempts"
 	case strings.EqualFold(lower, "blocked user"):
 		return "blocked_user"

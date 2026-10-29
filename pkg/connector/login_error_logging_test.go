@@ -57,11 +57,11 @@ func TestSubmitUserInputLogsStructuredLoginErrorWithoutCredentials(t *testing.T)
 		"error_summary":         "API error 400",
 		"http_status":           float64(400),
 		"line_response_code":    float64(10051),
-		"line_response_message": "RESPONSE_ERROR",
+		"line_response_message": "redacted",
 		"line_error_name":       "TalkException",
 		"line_error_code":       float64(35),
-		"line_error_message":    "Blocked user",
-		"line_error_reason":     "blocked user",
+		"line_error_message":    "redacted",
+		"line_error_reason":     "blocked_user",
 	}
 	for key, want := range wantFields {
 		if got := event[key]; got != want {
@@ -102,12 +102,12 @@ func TestLoginErrorReasonDoesNotLeakUnknownProviderText(t *testing.T) {
 	}{
 		{"blocked user", loginTooManyAttemptsReason},
 		{"Too many login attempts", loginTooManyAttemptsReason},
-		{"Verification is temporarily unavailable", line.UserMessageForCategory(line.AuthErrorVerificationTemporarilyUnavailable)},
+		{"Verification is temporarily unavailable", "Verification is temporarily unavailable"},
 		{"Account ID or password is invalid", "Account ID or password is invalid"},
 		{"Authentication failed", "Authentication failed"},
 		{"", ""},
 		{"response-token secret", ""},
-		{"password: hunter2", ""},
+		{"password: hunter2", "password=[redacted]"},
 	} {
 		t.Run(tc.reason, func(t *testing.T) {
 			if got := safeEmailLoginReason(tc.reason); got != tc.want {

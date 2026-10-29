@@ -32,6 +32,7 @@ type LineConnector struct {
 	br              *bridgev2.Bridge
 	loginFinalizeMu sync.Mutex
 	directMedia     atomic.Bool
+	loginCooldown   loginCooldown
 }
 
 var _ bridgev2.NetworkConnector = (*LineConnector)(nil)
@@ -183,12 +184,12 @@ func (lc *LineConnector) GetLoginFlows() []bridgev2.LoginFlow {
 
 func (lc *LineConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
 	if flowID == LoginFlowIDQR && lc.Config.QRLogin {
-		return &LineQRLogin{login: &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu}}, nil
+		return &LineQRLogin{login: &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu, cooldown: &lc.loginCooldown}}, nil
 	}
 	if flowID != LoginFlowIDEmail {
 		return nil, bridgev2.ErrInvalidLoginFlowID
 	}
-	return &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu, qrEnabled: lc.Config.QRLogin}, nil
+	return &LineEmailLogin{User: user, finalizeMu: &lc.loginFinalizeMu, qrEnabled: lc.Config.QRLogin, cooldown: &lc.loginCooldown}, nil
 }
 
 type LineEmailLogin struct {
@@ -204,6 +205,7 @@ type LineEmailLogin struct {
 	ExistingLogin    *bridgev2.UserLogin
 	qrEnabled        bool
 	qrLogin          *LineQRLogin
+	cooldown         *loginCooldown
 
 	pollResult    chan *line.LoginResult
 	pollErr       chan error
@@ -221,6 +223,9 @@ var _ bridgev2.LoginProcessDisplayAndWait = (*LineEmailLogin)(nil)
 var _ bridgev2.LoginProcessWithOverride = (*LineEmailLogin)(nil)
 
 func (ll *LineEmailLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	if err := ll.loginCooldownError(); err != nil {
+		return nil, err
+	}
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeUserInput,
 		StepID:       "dev.highest.matrix.line.enter_creds",
@@ -274,11 +279,14 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 		}
 	}
 
+	if err := ll.loginCooldownError(); err != nil {
+		return nil, err
+	}
 	override.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
-
 	res, err := ll.loginCredentials(ctx, ll.Certificate)
 	if err != nil {
 		ll.logLoginFailure(err, "reconnect")
+		ll.noteLoginRateLimit(err)
 		reason := loginErrorReason(err)
 		if reason == "" {
 			reason = genericLoginFailureReason
@@ -303,9 +311,13 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 		return ll.loginErrorStep("Email and password are required"), nil
 	}
 
+	if err := ll.loginCooldownError(); err != nil {
+		return nil, err
+	}
 	res, err := ll.loginCredentials(ctx, "")
 	if err != nil {
 		ll.logLoginFailure(err, "credentials")
+		ll.noteLoginRateLimit(err)
 		reason := loginErrorReason(err)
 		if reason == "" {
 			reason = genericLoginFailureReason
@@ -435,16 +447,6 @@ func loginErrorSummary(err error, details loginErrorDetails) string {
 	return ""
 }
 
-func loginLogField(value string) string {
-	value = strings.TrimSpace(value)
-	const maxRunes = 512
-	runes := []rune(value)
-	if len(runes) > maxRunes {
-		return string(runes[:maxRunes]) + "…"
-	}
-	return value
-}
-
 func (ll *LineEmailLogin) logLoginFailure(err error, flow string) {
 	if err == nil || ll.User == nil {
 		return
@@ -464,19 +466,31 @@ func (ll *LineEmailLogin) logLoginFailure(err error, flow string) {
 		event.Int("line_response_code", details.ResponseCode)
 	}
 	if details.ResponseMessage != "" {
-		event.Str("line_response_message", loginLogField(details.ResponseMessage))
+		event.Str("line_response_message", "redacted")
 	}
 	if details.ErrorName != "" {
-		event.Str("line_error_name", loginLogField(details.ErrorName))
+		switch details.ErrorName {
+		case "TalkException", "LoginException", "SecondaryQrCodeException", "SecondaryQrCodeLoginException":
+			event.Str("line_error_name", details.ErrorName)
+		default:
+			event.Str("line_error_name", "other")
+		}
 	}
 	if details.HasErrorCode {
 		event.Int("line_error_code", details.ErrorCode)
 	}
 	if details.ErrorMessage != "" {
-		event.Str("line_error_message", loginLogField(details.ErrorMessage))
+		event.Str("line_error_message", "redacted")
 	}
 	if details.ErrorReason != "" {
-		event.Str("line_error_reason", loginLogField(details.ErrorReason))
+		event.Str("line_error_reason", line.SanitizeProviderAlert(details.ErrorReason))
+	}
+	var authErr *line.AuthError
+	if errors.As(wrapLineLoginError(err), &authErr) {
+		if authErr.ProviderMessage != "" {
+			event.Str("provider_message", authErr.ProviderMessage)
+		}
+		event.Str("provider_message_status", authErr.ProviderMessageStatus)
 	}
 	event.Msg("LINE login attempt failed")
 }
@@ -526,7 +540,11 @@ func (ll *LineEmailLogin) logQRFailure(err error, flow string) {
 		if ae.ProviderReason != "" {
 			event.Str("provider_reason", ae.ProviderReason)
 		}
-		event.Str("provider_alert_status", string(ae.ProviderAlertStatus)).
+		if ae.ProviderMessage != "" {
+			event.Str("provider_message", ae.ProviderMessage)
+		}
+		event.Str("provider_message_status", ae.ProviderMessageStatus).
+			Str("provider_alert_status", string(ae.ProviderAlertStatus)).
 			Bool("retry_recommended", ae.RetryRecommended).
 			Bool("temporary", ae.Temporary).
 			Bool("user_action_required", ae.UserActionRequired).
@@ -539,11 +557,7 @@ func (ll *LineEmailLogin) logQRFailure(err error, flow string) {
 
 func loginErrorReason(err error) string {
 	details := parseLoginErrorDetails(err)
-	reason := details.ErrorReason
-	if reason == "" {
-		reason = details.ErrorMessage
-	}
-	return safeEmailLoginReason(reason)
+	return safeEmailLoginReason(providerLoginMessage(details))
 }
 
 func isBlockedUserLoginError(message string) bool {
@@ -613,7 +627,8 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 			return nil, ErrLoginVerificationFailed
 		case err := <-errCh:
 			ll.logLoginFailure(err, "verification_poll")
-			return nil, wrapLineLoginError(err)
+			ll.noteLoginRateLimit(err)
+			return nil, wrapLineLoginErrorAt(err, line.AuthStageEmailVerification)
 		case <-done:
 			return nil, context.Canceled
 		case <-ctx.Done():
@@ -623,10 +638,14 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 	}
 
 	if awaitingPIN {
+		if err := ll.loginCooldownError(); err != nil {
+			return nil, err
+		}
 		res, err := ll.loginCredentials(ctx, ll.Certificate)
 		if err != nil {
 			ll.logLoginFailure(err, "pin_continuation")
-			return nil, wrapLineLoginError(err)
+			ll.noteLoginRateLimit(err)
+			return nil, wrapLineLoginErrorAt(err, line.AuthStageEmailVerification)
 		}
 		return ll.handleLoginResponse(ctx, res)
 	}
@@ -777,7 +796,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	client.LoginAttempt = res.Attempt
 	profile, err := client.GetProfileContext(ctx)
 	if err != nil {
-		return nil, wrapLineLoginError(fmt.Errorf("failed to verify token: %w", err))
+		return nil, fmt.Errorf("failed to verify token: %w", err)
 	}
 
 	displayName := profile.DisplayName

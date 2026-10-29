@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	gen "github.com/beeper/line/pkg"
@@ -89,6 +90,12 @@ func (c *Client) VerifyQRCertificate(ctx context.Context, session, certificate s
 	err := c.callQRRPC(ctx, "verifyCertificate", "", 0, map[string]string{"authSessionId": session, "certificate": certificate}, nil)
 	var response *qrRPCError
 	if errors.As(err, &response) && response.httpStatus == http.StatusBadRequest {
+		if authErr := response.AuthError(); authErr != nil {
+			switch authErr.Category {
+			case AuthErrorTooManyAttempts, AuthErrorRetryLater, AuthErrorVerificationTemporarilyUnavailable, AuthErrorServiceUnavailable:
+				return false, err
+			}
+		}
 		return false, nil
 	}
 	return err == nil, err
@@ -104,7 +111,9 @@ type qrRPCError struct {
 	exceptionLabel string
 	reason         string
 	alert          string
+	alertStatus    string
 	authError      *AuthError
+	retryAfter     time.Duration
 }
 
 // QRRPCError is the exported alias for qrRPCError, allowing callers to
@@ -152,23 +161,42 @@ func (e *qrRPCError) Error() string {
 // fields captured before sanitization. It never exposes raw provider text
 // through user-facing fields.
 func (e *qrRPCError) buildAuthError(rawName string, rawCode *int, rawReason, rawAlert string) *AuthError {
+	stage := AuthStageQRTokenIssue
+	switch e.method {
+	case "createSession", "createQrCode":
+		stage = AuthStageQRCreate
+	case "verifyCertificate", "createPinCode", "checkQrCodeVerified", "checkPinCodeVerified":
+		stage = AuthStageQRVerify
+	}
+	providerMessage := rawAlert
+	if strings.TrimSpace(providerMessage) == "" {
+		providerMessage = rawReason
+	}
+	safeProviderMessage, providerMessageStatus := SanitizeProviderMessage(providerMessage)
+	_, providerAlertStatus := SanitizeProviderMessage(rawAlert)
+	if e.alertStatus != "" {
+		providerAlertStatus = e.alertStatus
+	}
 	ae := &AuthError{
-		Flow:                "qr",
-		Stage:               AuthStageQRTokenIssue,
-		HTTPStatus:          e.httpStatus,
-		ResponseCode:        e.code,
-		ExceptionType:       e.exceptionType,
-		ExceptionCode:       e.exceptionCode,
-		Category:            AuthErrorUnknown,
-		ProviderReason:      SanitizeProviderAlert(rawReason),
-		ProviderAlertStatus: SafeAlertStatus(rawAlert != ""),
-		UserMessage:         UserMessageForCategory(AuthErrorUnknown),
-		RetryRecommended:    false,
-		Temporary:           false,
-		UserActionRequired:  true,
-		BridgeFailure:       false,
-		CooldownTriggered:   false,
-		Err:                 e,
+		Flow:                  "qr",
+		Stage:                 stage,
+		HTTPStatus:            e.httpStatus,
+		ResponseCode:          e.code,
+		ExceptionType:         e.exceptionType,
+		ExceptionCode:         e.exceptionCode,
+		Category:              AuthErrorUnknown,
+		ProviderReason:        SanitizeProviderAlert(rawReason),
+		ProviderAlertStatus:   providerAlertStatus,
+		ProviderMessage:       safeProviderMessage,
+		ProviderMessageStatus: providerMessageStatus,
+		UserMessage:           UserMessageForCategory(AuthErrorUnknown),
+		RetryRecommended:      false,
+		Temporary:             false,
+		UserActionRequired:    true,
+		BridgeFailure:         false,
+		CooldownTriggered:     false,
+		RetryAfter:            durationPtr(e.retryAfter),
+		Err:                   e,
 	}
 	if ae.ProviderReason == "absent" && rawAlert != "" {
 		ae.ProviderReason = SanitizeProviderAlert(rawAlert)
@@ -206,7 +234,34 @@ func (e *qrRPCError) buildAuthError(rawName string, rawCode *int, rawReason, raw
 	applyCategoryDefaults(&ae.RetryRecommended, &ae.Temporary, &ae.CooldownTriggered, ae.Category)
 
 	ae.UserMessage = userMessageForStageAndCategory(ae.Stage, ae.Category, rawAlert)
+	if providerMessageStatus == "recognized" || providerMessageStatus == "partially_redacted" || providerMessageStatus == "safe_unrecognized" {
+		ae.UserMessage = safeProviderMessage
+	}
 	return ae
+}
+
+func durationPtr(duration time.Duration) *time.Duration {
+	if duration <= 0 {
+		return nil
+	}
+	return &duration
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds > int64((24*time.Hour)/time.Second) {
+			return 24 * time.Hour
+		}
+		if seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+		return 0
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return min(at.Sub(now), 24*time.Hour)
+	}
+	return 0
 }
 
 // applyCategoryDefaults sets RetryRecommended, Temporary, and CooldownTriggered
@@ -458,7 +513,7 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 	}
 	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&wrapper)
 	if resp.StatusCode != http.StatusOK || (wrapper.Code != nil && *wrapper.Code != 0) {
-		response := &qrRPCError{method: method, httpStatus: resp.StatusCode, code: wrapper.Code}
+		response := &qrRPCError{method: method, httpStatus: resp.StatusCode, code: wrapper.Code, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 		var details struct {
 			StatusCode *int   `json:"statusCode"`
 			Code       *int   `json:"code"`
@@ -478,13 +533,10 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 			default:
 				response.exceptionType = "other"
 			}
-			response.reason = safeLoginPollingReason(details.Reason)
-			if details.Reason != "" && response.reason == "" {
-				response.reason = "redacted"
-			}
-			response.alert = safeLoginPollingReason(details.Alert)
-			if details.Alert != "" && response.alert == "" {
-				response.alert = "redacted"
+			response.reason, _ = SanitizeProviderMessage(details.Reason)
+			response.alert, response.alertStatus = SanitizeProviderMessage(details.Alert)
+			if details.Alert == "" {
+				response.alertStatus = ""
 			}
 			if details.Name == "SecondaryQrCodeException" && details.Code != nil {
 				response.exceptionLabel = secondaryQrCodeErrorLabels[*details.Code]

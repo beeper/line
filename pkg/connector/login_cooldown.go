@@ -51,8 +51,15 @@ func (c *loginCooldown) block(userID string, until time.Time) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
 	if c.until == nil {
 		c.until = make(map[string]time.Time)
+	} else {
+		for account, expiry := range c.until {
+			if !expiry.After(now) {
+				delete(c.until, account)
+			}
+		}
 	}
 	if current, ok := c.until[userID]; !ok || until.After(current) {
 		c.until[userID] = until
@@ -147,6 +154,11 @@ func (ll *LineEmailLogin) noteLoginRateLimit(err error) {
 		return
 	}
 	now := time.Now()
+	var authErr *line.AuthError
+	if errors.As(err, &authErr) && authErr.RetryAfter != nil {
+		ll.cooldown.block(string(ll.User.MXID), now.Add(*authErr.RetryAfter))
+		return
+	}
 	switch classifyLoginRateLimit(err) {
 	case loginRateLimitLocked:
 		ll.cooldown.block(string(ll.User.MXID), now.Add(loginRateLimitCooldown))

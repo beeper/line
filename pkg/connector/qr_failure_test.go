@@ -154,7 +154,7 @@ func TestQRVerificationTemporarilyUnavailable(t *testing.T) {
 		case "checkPinCodeVerified":
 			return resolutionResponse(`{"code":0,"data":{}}`), nil
 		case "qrCodeLoginV2":
-			resp := resolutionResponse(`{"code":10051,"data":{"name":"SecondaryQrCodeException","code":100,"alertMessage":"Verification is temporarily unavailable"}}`)
+			resp := resolutionResponse("{\"code\":10051,\"data\":{\"name\":\"SecondaryQrCodeException\",\"code\":100,\"alertMessage\":\"Verification is temporarily unavailable.\\nPlease try again later.\"}}")
 			resp.StatusCode = http.StatusBadRequest
 			return resp, nil
 		default:
@@ -180,6 +180,12 @@ func TestQRVerificationTemporarilyUnavailable(t *testing.T) {
 	if !errors.As(err, &respErr) {
 		t.Fatalf("QR rejection is not a user-facing error: %v", err)
 	}
+	if !strings.Contains(respErr.Err, "Verification is temporarily unavailable.\nPlease try again later.") {
+		t.Fatalf("meaningful LINE verification message was lost: %q", respErr.Err)
+	}
+	if strings.Contains(strings.ToLower(respErr.Err), "qr sign-in has expired") {
+		t.Fatalf("verification restriction was misclassified as QR expiration: %q", respErr.Err)
+	}
 
 	var event map[string]any
 	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &event); err != nil {
@@ -199,10 +205,5 @@ func TestQRVerificationTemporarilyUnavailable(t *testing.T) {
 	}
 	if event["temporary"] != true {
 		t.Fatalf("temporary = %v, want true", event["temporary"])
-	}
-	for _, secret := range []string{"Verification is temporarily unavailable"} {
-		if strings.Contains(respErr.Err, secret) || strings.Contains(err.Error(), secret) {
-			t.Fatalf("provider text leaked into the user-facing error: %v", err)
-		}
 	}
 }

@@ -33,7 +33,12 @@ var (
 	ErrLoginTooManyAttempts = bridgev2.RespError{
 		ErrCode:    "DEV.HIGHEST.LINE.TOO_MANY_ATTEMPTS",
 		Err:        loginTooManyAttemptsReason,
-		StatusCode: http.StatusBadRequest,
+		StatusCode: http.StatusTooManyRequests,
+	}
+	ErrLoginRateLimited = bridgev2.RespError{
+		ErrCode:    "DEV.HIGHEST.LINE.RATE_LIMITED",
+		Err:        "LINE is limiting how often this account can sign in. Please try again later.",
+		StatusCode: http.StatusTooManyRequests,
 	}
 	ErrLoginRejected = bridgev2.RespError{
 		ErrCode:    "DEV.HIGHEST.LINE.LOGIN_REJECTED",
@@ -65,10 +70,10 @@ func safeEmailLoginReason(reason string) string {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
 	case "blocked user", "too many login attempts":
 		return loginTooManyAttemptsReason
-	case "verification is temporarily unavailable":
-		return line.UserMessageForCategory(line.AuthErrorVerificationTemporarilyUnavailable)
-	case "authentication failed", "account id or password is invalid":
-		return reason
+	}
+	safe, status := line.SanitizeProviderMessage(reason)
+	if status == "recognized" || status == "partially_redacted" || status == "safe_unrecognized" {
+		return safe
 	}
 	return ""
 }
@@ -76,15 +81,20 @@ func safeEmailLoginReason(reason string) string {
 // wrapLineLoginError translates a LINE error into one the client can act on,
 // keeping the original in the chain with %w so logs are unaffected.
 func wrapLineLoginError(err error) error {
+	return wrapLineLoginErrorAt(err, line.AuthStageEmailLogin)
+}
+
+func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 	if err == nil {
 		return nil
 	}
 	details := parseLoginErrorDetails(err)
-	reason := details.ErrorReason
-	if reason == "" {
-		reason = details.ErrorMessage
-	}
+	reason := providerLoginMessage(details)
 	safeReason := safeEmailLoginReason(reason)
+	providerMessage, providerMessageStatus := line.SanitizeProviderMessage(reason)
+	if safeReason == "" {
+		safeReason = genericLoginFailureReason
+	}
 	cat := classifyEmailError(details, reason)
 
 	mapped := ErrLoginUnknown
@@ -96,7 +106,7 @@ func wrapLineLoginError(err error) error {
 	case cat == line.AuthErrorRetryLater:
 		mapped = ErrLoginRateLimited.WithMessage("%s", loginRetryLaterMessage)
 	case cat == line.AuthErrorVerificationTemporarilyUnavailable:
-		mapped = ErrLoginRejected.WithMessage("%s", line.UserMessageForCategory(line.AuthErrorVerificationTemporarilyUnavailable))
+		mapped = ErrLoginRejected.WithMessage("%s", safeReason)
 	case details.HTTPStatus == http.StatusUnauthorized, details.HTTPStatus == http.StatusForbidden:
 		mapped = ErrLoginRejected
 	case safeReason != "":
@@ -104,48 +114,62 @@ func wrapLineLoginError(err error) error {
 	}
 
 	ae := &line.AuthError{
-		Flow:                "email",
-		Stage:               line.AuthStageEmailLogin,
-		HTTPStatus:          details.HTTPStatus,
-		ResponseCode:        intPtr(details.ResponseCode),
-		ExceptionType:       details.ErrorName,
-		ExceptionCode:       intPtr(details.ErrorCode),
-		Category:            cat,
-		ProviderReason:      line.SanitizeProviderAlert(reason),
-		ProviderAlertStatus: line.SafeAlertStatus(details.ErrorReason != ""),
-		UserMessage:         mapped.Err,
-		RetryRecommended:    isRetryableCategory(cat),
-		Temporary:           isTemporaryCategory(cat),
-		UserActionRequired:  true,
-		BridgeFailure:       false,
-		CooldownTriggered:   cat == line.AuthErrorTooManyAttempts || cat == line.AuthErrorRetryLater || cat == line.AuthErrorVerificationTemporarilyUnavailable,
-		Err:                 err,
+		Flow:                  "email",
+		Stage:                 stage,
+		HTTPStatus:            details.HTTPStatus,
+		ResponseCode:          intPtr(details.ResponseCode),
+		ExceptionType:         details.ErrorName,
+		ExceptionCode:         intPtr(details.ErrorCode),
+		Category:              cat,
+		ProviderReason:        line.SanitizeProviderAlert(reason),
+		ProviderAlertStatus:   providerMessageStatus,
+		ProviderMessage:       providerMessage,
+		ProviderMessageStatus: providerMessageStatus,
+		UserMessage:           mapped.Err,
+		RetryRecommended:      isRetryableCategory(cat),
+		Temporary:             isTemporaryCategory(cat),
+		UserActionRequired:    true,
+		BridgeFailure:         false,
+		CooldownTriggered:     cat == line.AuthErrorTooManyAttempts || cat == line.AuthErrorRetryLater || cat == line.AuthErrorVerificationTemporarilyUnavailable,
+		Err:                   err,
+	}
+	if providerMessageStatus == "recognized" || providerMessageStatus == "partially_redacted" || providerMessageStatus == "safe_unrecognized" {
+		ae.UserMessage = providerMessage
 	}
 	return fmt.Errorf("%w: %w", ae, mapped)
 }
 
 // classifyEmailError classifies an email/login error into an AuthErrorCategory.
 func classifyEmailError(details loginErrorDetails, reason string) line.AuthErrorCategory {
+	safeCategory := line.SanitizeProviderAlert(reason)
 	switch {
-	case isBlockedUserLoginError(reason):
+	case safeCategory == "blocked_user":
 		return line.AuthErrorTooManyAttempts
-	case isLoginRateLimitText(reason):
+	case safeCategory == "too_many_login_attempts":
 		return line.AuthErrorTooManyAttempts
+	case strings.EqualFold(strings.TrimSpace(reason), "retry later"):
+		return line.AuthErrorRetryLater
 	case details.HTTPStatus == http.StatusTooManyRequests:
-		return line.AuthErrorTooManyAttempts
-	case strings.EqualFold(strings.TrimSpace(reason), "blocked user"):
 		return line.AuthErrorTooManyAttempts
 	case strings.EqualFold(strings.TrimSpace(reason), "authentication failed"):
 		return line.AuthErrorInvalidCredentials
 	case strings.EqualFold(strings.TrimSpace(reason), "account id or password is invalid"):
 		return line.AuthErrorInvalidCredentials
-	case strings.EqualFold(strings.TrimSpace(reason), "verification is temporarily unavailable"):
+	case safeCategory == "verification_temporarily_unavailable":
 		return line.AuthErrorVerificationTemporarilyUnavailable
 	case details.HTTPStatus == http.StatusUnauthorized, details.HTTPStatus == http.StatusForbidden:
 		return line.AuthErrorInvalidCredentials
 	default:
 		return line.AuthErrorUnknown
 	}
+}
+
+func providerLoginMessage(details loginErrorDetails) string {
+	reason := details.ErrorReason
+	if _, status := line.SanitizeProviderMessage(reason); status == "absent" || status == "suppressed" {
+		return details.ErrorMessage
+	}
+	return reason
 }
 
 // isRetryableCategory returns true if the category suggests a retry may succeed.
@@ -200,8 +224,8 @@ func wrapQRRPCError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var respErr bridgev2.RespError
-	if errors.As(err, &respErr) {
+	detail, ok := line.QRLoginFailureDetail(err)
+	if !ok {
 		return err
 	}
 
@@ -225,21 +249,13 @@ func wrapQRRPCError(err error) error {
 	}
 
 	var mapped bridgev2.RespError
-	switch statusCode := line.HTTPStatusCode(err); {
-	case errors.Is(err, errLineSessionInvalidated), errors.Is(err, errLineClientSuperseded), line.IsAuthError(err):
-		mapped = bridgev2.RespError(mautrix.MForbidden.WithMessage("Not logged in to LINE. Reconnect and try again."))
-	case line.IsNotAMemberError(err):
-		mapped = bridgev2.RespError(mautrix.MForbidden.WithMessage("You are not a member of this LINE chat"))
-	case line.IsTalkExceptionNotFound(err):
-		mapped = bridgev2.RespError(mautrix.MNotFound.WithMessage("Not found on LINE"))
-	case statusCode == http.StatusTooManyRequests:
-		mapped = bridgev2.RespError(mautrix.MLimitExceeded.WithMessage("LINE is rate limiting requests. Please wait a moment and try again.").WithStatus(http.StatusBadRequest))
-	case errors.Is(err, context.DeadlineExceeded):
-		mapped = bridgev2.RespError(mautrix.MUnknown.WithMessage("Timed out waiting for LINE"))
-	case line.IsTalkException(err), statusCode >= 400 && statusCode < 500:
-		mapped = bridgev2.RespError(mautrix.MForbidden.WithMessage("LINE rejected the request"))
+	switch classifyLoginRateLimit(err) {
+	case loginRateLimitLocked:
+		mapped = ErrLoginTooManyAttempts
+	case loginRateLimitRetryLater:
+		mapped = ErrLoginRateLimited.WithMessage("%s", loginRetryLaterMessage)
 	default:
-		mapped = bridgev2.RespError(mautrix.MUnknown.WithMessage("Request to LINE failed"))
+		mapped = ErrLoginRejected.WithMessage("%s", qrLoginFailureMessage(detail))
 	}
 	return fmt.Errorf("%w: %w", mapped, err)
 }
