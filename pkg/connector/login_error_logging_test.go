@@ -116,6 +116,28 @@ func TestLoginTransportErrorsUseNetworkCategory(t *testing.T) {
 	}
 }
 
+func TestReconnectErrorReasonKeepsNetworkAndProviderUnavailableMeaning(t *testing.T) {
+	if got := loginErrorReason(context.DeadlineExceeded); got != line.UserMessageForCategory(line.AuthErrorNetworkUnavailable) {
+		t.Fatalf("network reconnect reason = %q", got)
+	}
+	err := errors.New(`API error 503: {"code":10051,"data":{"name":"TalkException"}}`)
+	if got := loginErrorReason(err); got != line.UserMessageForCategory(line.AuthErrorServiceUnavailable) {
+		t.Fatalf("provider-unavailable reconnect reason = %q", got)
+	}
+}
+
+func TestUnknownHTTP400LoginRejectionHasSafeFallback(t *testing.T) {
+	err := wrapLineLoginError(errors.New(`API error 400: {"code":10051,"data":{"name":"LoginException","code":987}}`))
+	var authErr *line.AuthError
+	if !errors.As(err, &authErr) || authErr.Category != line.AuthErrorUnknown {
+		t.Fatalf("unknown rejection classification = %#v (%v)", authErr, err)
+	}
+	var respErr bridgev2.RespError
+	if !errors.As(err, &respErr) || respErr.Err != genericLoginFailureReason {
+		t.Fatalf("unknown rejection fallback = %v", err)
+	}
+}
+
 func TestLoginErrorSummaryDoesNotIncludeNonJSONResponseBody(t *testing.T) {
 	err := errors.New("login failed: API error 502: upstream secret response")
 	details := parseLoginErrorDetails(err)

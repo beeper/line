@@ -106,9 +106,6 @@ func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 	if retryAfter > 0 {
 		retryAfterPtr = &retryAfter
 	}
-	if safeReason == "" {
-		safeReason = genericLoginFailureReason
-	}
 	cat := classifyEmailError(details, reason)
 	var networkErr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkErr) {
@@ -131,6 +128,8 @@ func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 		mapped = ErrLoginRejected
 	case safeReason != "":
 		mapped = ErrLoginRejected.WithMessage("%s", safeReason)
+	case details.HTTPStatus >= http.StatusBadRequest && details.HTTPStatus < http.StatusInternalServerError:
+		mapped = ErrLoginRejected
 	}
 
 	ae := &line.AuthError{

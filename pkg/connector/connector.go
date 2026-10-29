@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -619,6 +620,13 @@ func (ll *LineEmailLogin) logQRFailure(err error, flow string) {
 
 func loginErrorReason(err error) string {
 	details := parseLoginErrorDetails(err)
+	var networkErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkErr) {
+		return line.UserMessageForCategory(line.AuthErrorNetworkUnavailable)
+	}
+	if details.HTTPStatus >= http.StatusInternalServerError {
+		return line.UserMessageForCategory(line.AuthErrorServiceUnavailable)
+	}
 	return safeEmailLoginReason(providerLoginMessage(details))
 }
 
