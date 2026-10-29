@@ -78,6 +78,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to registry
+        if: github.event_name == 'push' && github.repository == 'beeper/line'
         uses: docker/login-action@v3
         with:
           registry: ${{ secrets.CI_REGISTRY }}
@@ -88,13 +89,14 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          cache-from: ${{ env.CI_REGISTRY_IMAGE }}:latest
+          cache-from: type=gha,scope=line-linux-amd64
+          cache-to: type=gha,mode=max,scope=line-linux-amd64
           pull: true
           file: Dockerfile
           tags: |
-            ${{ env.CI_REGISTRY_IMAGE }}:${{ github.sha }}
-            ${{ env.CI_REGISTRY_IMAGE }}:${{ github.sha }}-amd64
-          push: true
+            ${{ github.event_name == 'push' && github.repository == 'beeper/line' && format('{0}:{1}', env.CI_REGISTRY_IMAGE, github.sha) || format('line-ci:{0}', github.sha) }}
+            ${{ github.event_name == 'push' && github.repository == 'beeper/line' && format('{0}:{1}-amd64', env.CI_REGISTRY_IMAGE, github.sha) || format('line-ci:{0}-amd64', github.sha) }}
+          push: ${{ github.event_name == 'push' && github.repository == 'beeper/line' }}
 
   deploy-docker:
     runs-on: ubuntu-latest
@@ -102,7 +104,7 @@ jobs:
       - lint
       - build
       - build-docker
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.repository == 'beeper/line'
     steps:
       - name: Login to Beeper Docker registry
         uses: docker/login-action@v3
