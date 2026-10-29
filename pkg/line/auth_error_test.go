@@ -12,6 +12,7 @@ func TestSanitizeProviderMessage(t *testing.T) {
 		{"opaque token redacted", "Login failed: abcdefghijklmnopqrstuvwxyz0123456789, please retry.", "Login failed: [redacted token], please retry.", "partially_redacted"},
 		{"bounded safe provider text", "LINE could not complete this sign-in. Try again later.", "LINE could not complete this sign-in. Try again later.", "safe_unrecognized"},
 		{"structured response suppressed", `{"token":"private"}`, "", "suppressed"},
+		{"markup suppressed", "<b>unsafe</b>", "", "suppressed"},
 		{"control sequence suppressed", "safe text\x1b[31mprivate", "", "suppressed"},
 		{"oversized message suppressed", string(make([]byte, 600)), "", "suppressed"},
 		{"short unknown suppressed", "no", "", "suppressed"},

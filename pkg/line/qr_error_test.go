@@ -81,6 +81,17 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+func TestHTTPErrorPreservesRetryAfter(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"45"}},
+	}
+	err := newHTTPResponseError(response, "API error %d", response.StatusCode)
+	if got := HTTPRetryAfter(err); got != 45*time.Second {
+		t.Fatalf("HTTP Retry-After = %s, want 45s", got)
+	}
+}
+
 func TestQRAuthErrorStage(t *testing.T) {
 	for method, want := range map[string]AuthErrorStage{
 		"createSession":        AuthStageQRCreate,

@@ -202,7 +202,7 @@ func SanitizeProviderMessage(message string) (safe, status string) {
 	message = providerJWTpattern.ReplaceAllString(message, "[redacted token]")
 	message = providerOpaqueMIDPattern.ReplaceAllString(message, "[redacted LINE ID]")
 	message = providerLongSecretPattern.ReplaceAllString(message, "[redacted token]")
-	if strings.ContainsAny(message, "{}") || strings.Contains(strings.ToLower(message), "bearer ") || strings.Contains(message, "https://") || strings.Contains(message, "http://") {
+	if strings.ContainsAny(message, "{}<>") || strings.Contains(strings.ToLower(message), "bearer ") || strings.Contains(message, "https://") || strings.Contains(message, "http://") {
 		return "", "suppressed"
 	}
 	if (strings.Contains(strings.ToLower(message), "token ") || strings.Contains(strings.ToLower(message), "password ")) && !strings.Contains(message, "[redacted") && !isRecognizedProviderMessage(message) {

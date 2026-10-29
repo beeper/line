@@ -135,6 +135,9 @@ func classifyLoginRateLimit(err error) loginRateLimitKind {
 			return loginRateLimitNone
 		}
 	}
+	if line.HTTPStatusCode(err) == http.StatusTooManyRequests {
+		return loginRateLimitLocked
+	}
 
 	if detail, ok := line.QRLoginFailureDetail(err); ok {
 		if detail.HTTPStatus == http.StatusTooManyRequests {
@@ -198,6 +201,9 @@ func (ll *LineEmailLogin) noteLoginRateLimit(err error) {
 	}
 	if authErr != nil && authErr.RetryAfter != nil && *authErr.RetryAfter > delay {
 		delay = *authErr.RetryAfter
+	}
+	if retryAfter := line.HTTPRetryAfter(err); retryAfter > delay && (line.HTTPStatusCode(err) == http.StatusTooManyRequests || line.HTTPStatusCode(err) >= http.StatusInternalServerError) {
+		delay = retryAfter
 	}
 	if delay > 0 {
 		ll.cooldown.block(string(ll.User.MXID), now.Add(delay))

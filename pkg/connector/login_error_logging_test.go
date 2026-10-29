@@ -104,6 +104,18 @@ func TestSessionEstablishmentErrorKeepsStageAndSafeMessage(t *testing.T) {
 	}
 }
 
+func TestLoginTransportErrorsUseNetworkCategory(t *testing.T) {
+	wrapped := wrapLineLoginError(context.DeadlineExceeded)
+	var authErr *line.AuthError
+	if !errors.As(wrapped, &authErr) || authErr.Category != line.AuthErrorNetworkUnavailable || authErr.Stage != line.AuthStageEmailLogin {
+		t.Fatalf("transport error classification = %#v (%v)", authErr, wrapped)
+	}
+	var respErr bridgev2.RespError
+	if !errors.As(wrapped, &respErr) || !strings.Contains(respErr.Err, "reach LINE") {
+		t.Fatalf("network error is not actionable: %v", wrapped)
+	}
+}
+
 func TestLoginErrorSummaryDoesNotIncludeNonJSONResponseBody(t *testing.T) {
 	err := errors.New("login failed: API error 502: upstream secret response")
 	details := parseLoginErrorDetails(err)

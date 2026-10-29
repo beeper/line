@@ -273,6 +273,26 @@ func TestStoredCredentialRecoveryStartsCooldownAfterProviderLimit(t *testing.T) 
 	}
 }
 
+func TestStoredCredentialRecoveryHonorsHTTPRetryAfter(t *testing.T) {
+	oldLogin := loginWithCredentials
+	t.Cleanup(func() { loginWithCredentials = oldLogin })
+	delay := 20 * time.Minute
+	loginWithCredentials = func(_, _, _ string) (*line.LoginResult, error) {
+		return nil, &line.HTTPError{StatusCode: http.StatusTooManyRequests, RetryAfter: delay}
+	}
+	client := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("mocked login made an unexpected API request: %s", req.URL.Path)
+		return nil, nil
+	})
+	meta := client.UserLogin.Metadata.(*UserLoginMetadata)
+	meta.Email, meta.Password = "user@example.com", "password"
+	connector := client.UserLogin.Bridge.Network.(*LineConnector)
+	_ = client.tryLogin(context.Background())
+	if remaining := connector.loginCooldown.remaining(string(client.UserLogin.User.MXID)); remaining < delay-time.Second {
+		t.Fatalf("background cooldown=%s, want Retry-After %s", remaining, delay)
+	}
+}
+
 func TestLoginCooldownExpires(t *testing.T) {
 	var cooldown loginCooldown
 	cooldown.block("@user:example.com", time.Now().Add(-time.Minute))
@@ -304,6 +324,27 @@ func TestLoginClaimSerializesSameAccount(t *testing.T) {
 		t.Fatalf("claim after release = %v", err)
 	}
 	second.releaseLogin()
+}
+
+func TestCanceledEmailVerificationReleasesLoginClaim(t *testing.T) {
+	var cooldown loginCooldown
+	user := &bridgev2.User{User: &database.User{MXID: "@cancelled:example.com"}}
+	login := &LineEmailLogin{User: user, cooldown: &cooldown, Verifier: "verification"}
+	ctx, cancel := context.WithCancel(context.Background())
+	login.attemptCtx = ctx
+	login.pollResult = make(chan *line.LoginResult)
+	login.pollErr = make(chan error)
+	if err := login.claimLogin(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := login.Wait(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait after cancellation = %v", err)
+	}
+	if !cooldown.acquire(string(user.MXID)) {
+		t.Fatal("canceled verification retained the per-account login lock")
+	}
+	cooldown.release(string(user.MXID))
 }
 
 func TestLoginCooldownUsesRetryAfter(t *testing.T) {

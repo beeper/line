@@ -547,6 +547,9 @@ func (ll *LineEmailLogin) logLoginFailure(err error, flow string) {
 			event.Str("provider_message", authErr.ProviderMessage)
 		}
 		event.Str("provider_message_status", authErr.ProviderMessageStatus)
+		if authErr.RetryAfter != nil {
+			event.Dur("retry_after", *authErr.RetryAfter)
+		}
 	}
 	event.Msg("LINE login attempt failed")
 }
@@ -606,6 +609,9 @@ func (ll *LineEmailLogin) logQRFailure(err error, flow string) {
 			Bool("user_action_required", ae.UserActionRequired).
 			Bool("bridge_failure", ae.BridgeFailure).
 			Bool("cooldown_triggered", ae.CooldownTriggered)
+		if ae.RetryAfter != nil {
+			event.Dur("retry_after", *ae.RetryAfter)
+		}
 	}
 
 	event.Msg("LINE QR login attempt failed")
@@ -688,6 +694,7 @@ func (ll *LineEmailLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 			ll.releaseLogin()
 			return nil, wrapLineLoginErrorAt(err, line.AuthStageEmailVerification)
 		case <-done:
+			ll.Cancel()
 			return nil, context.Canceled
 		case <-ctx.Done():
 			ll.Cancel()

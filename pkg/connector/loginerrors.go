@@ -95,13 +95,25 @@ func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 		return nil
 	}
 	details := parseLoginErrorDetails(err)
+	if details.HTTPStatus == 0 {
+		details.HTTPStatus = line.HTTPStatusCode(err)
+	}
 	reason := providerLoginMessage(details)
 	safeReason := safeEmailLoginReason(reason)
 	providerMessage, providerMessageStatus := line.SanitizeProviderMessage(reason)
+	retryAfter := line.HTTPRetryAfter(err)
+	var retryAfterPtr *time.Duration
+	if retryAfter > 0 {
+		retryAfterPtr = &retryAfter
+	}
 	if safeReason == "" {
 		safeReason = genericLoginFailureReason
 	}
 	cat := classifyEmailError(details, reason)
+	var networkErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkErr) {
+		cat = line.AuthErrorNetworkUnavailable
+	}
 
 	mapped := ErrLoginUnknown
 	switch {
@@ -113,6 +125,8 @@ func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 		mapped = ErrLoginRateLimited.WithMessage("%s", loginRetryLaterMessage)
 	case cat == line.AuthErrorVerificationTemporarilyUnavailable:
 		mapped = ErrLoginRejected.WithMessage("%s", safeReason)
+	case cat == line.AuthErrorNetworkUnavailable, cat == line.AuthErrorServiceUnavailable:
+		mapped = ErrLoginRejected.WithMessage("%s", line.UserMessageForCategory(cat))
 	case details.HTTPStatus == http.StatusUnauthorized, details.HTTPStatus == http.StatusForbidden:
 		mapped = ErrLoginRejected
 	case safeReason != "":
@@ -131,6 +145,7 @@ func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 		ProviderAlertStatus:   "absent",
 		ProviderMessage:       providerMessage,
 		ProviderMessageStatus: providerMessageStatus,
+		RetryAfter:            retryAfterPtr,
 		UserMessage:           mapped.Err,
 		RetryRecommended:      isRetryableCategory(cat),
 		Temporary:             isTemporaryCategory(cat),
@@ -199,6 +214,8 @@ func classifyEmailError(details loginErrorDetails, reason string) line.AuthError
 		return line.AuthErrorVerificationTemporarilyUnavailable
 	case details.HTTPStatus == http.StatusUnauthorized, details.HTTPStatus == http.StatusForbidden:
 		return line.AuthErrorInvalidCredentials
+	case details.HTTPStatus >= http.StatusInternalServerError:
+		return line.AuthErrorServiceUnavailable
 	default:
 		return line.AuthErrorUnknown
 	}

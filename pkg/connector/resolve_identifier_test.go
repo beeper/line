@@ -44,6 +44,9 @@ type resolutionMatrix struct {
 }
 
 func (*resolutionMatrix) Init(*bridgev2.Bridge) {}
+func (m *resolutionMatrix) NewUserIntent(_ context.Context, userID id.UserID, accessToken string) (bridgev2.MatrixAPI, string, error) {
+	return &resolutionIntent{mxid: userID, matrix: m}, accessToken, nil
+}
 func (m *resolutionMatrix) BotIntent() bridgev2.MatrixAPI {
 	return &resolutionIntent{mxid: "@bot:example.com", matrix: m}
 }
