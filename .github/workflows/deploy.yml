@@ -125,3 +125,55 @@ jobs:
           BEEPER_DEV_ADMIN_NIGHTLY_PASS: "${{ secrets.BEEPER_DEV_ADMIN_NIGHTLY_PASS }}"
           BEEPER_STAGING_ADMIN_NIGHTLY_PASS: "${{ secrets.BEEPER_STAGING_ADMIN_NIGHTLY_PASS }}"
           BEEPER_PROD_ADMIN_NIGHTLY_PASS: "${{ secrets.BEEPER_PROD_ADMIN_NIGHTLY_PASS }}"
+
+  test:
+    name: Test (${{ matrix.mode }})
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [normal, race, coverage]
+    env:
+      GOMAXPROCS: "4"
+      TEST_PACKAGE_PARALLELISM: "2"
+      TEST_TIMEOUT: 10m
+      TEST_JSON: "1"
+      TEST_OUTPUT_DIR: ${{ github.workspace }}/.opencode-work/test-ci-${{ matrix.mode }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        id: go
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Install libolm
+        run: sudo apt-get update && sudo apt-get install -y libolm-dev
+      - name: Identify native test ABI
+        id: native
+        run: echo "abi=$(gcc -dumpfullversion)-$(pkg-config --modversion olm)" >> "$GITHUB_OUTPUT"
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: test-modules-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+      - name: Cache compiled tests by instrumentation mode
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: test-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.native.outputs.abi }}-${{ matrix.mode }}-${{ hashFiles('go.sum') }}-${{ hashFiles('**/*.go', 'pkg/ltsm/data/*') }}
+          restore-keys: |
+            test-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.native.outputs.abi }}-${{ matrix.mode }}-${{ hashFiles('go.sum') }}-
+      - name: Run validation
+        run: bash scripts/test.sh "${{ matrix.mode }}"
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.mode }}
+          path: |
+            ${{ env.TEST_OUTPUT_DIR }}/coverage.out
+          if-no-files-found: warn
+          retention-days: 7

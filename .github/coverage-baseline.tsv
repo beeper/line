@@ -1,0 +1,11 @@
+# Max of historical development baseline and measured upstream baseline at 913362278cb8d7b39b90e04be3d54b43e3aba843.
+# package covered total non_generated_covered non_generated_total
+github.com/beeper/line/cmd/matrix-line	0	3	0	3
+github.com/beeper/line/pkg	235	736	235	736
+github.com/beeper/line/pkg/connector	1537	4433	1537	4433
+github.com/beeper/line/pkg/connector/handlers	368	985	368	985
+github.com/beeper/line/pkg/e2ee	223	608	223	608
+github.com/beeper/line/pkg/line	419	1567	419	1567
+github.com/beeper/line/pkg/line/password	0	26	0	26
+github.com/beeper/line/pkg/line/secret	0	7	0	7
+github.com/beeper/line/pkg/ltsm	171289	404716	545	1061
