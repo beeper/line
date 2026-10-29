@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
+	errLineSessionInvalidated = errors.New("LINE session invalidated")
 	errLineClientSuperseded   = errors.New("LINE client was superseded")
 	errLineQRLoginRequired    = errors.New("LINE requires a new QR scan. Reconnect in Beeper to continue")
 )
@@ -379,7 +379,7 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 	lc.invalidateAccessToken()
 	lc.obsTokenCache.Invalidate()
 	stateError := status.BridgeStateErrorCode("line-logged-out")
-	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
+	stateMessage := "LINE invalidated this Chrome Extension session. Click Reconnect in Beeper to reconnect LINE."
 	invalidSenderKey := line.IsInvalidSenderKey(err)
 	needsFullE2EELogin := invalidSenderKey
 	lc.missingE2EEKeyMu.Lock()
@@ -730,6 +730,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	// deliver messages. Otherwise an existing LINE group whose Matrix room
 	// doesn't exist yet may be created by the first message, which makes the
 	// sender's existing membership look like a fresh join.
+	lc.UserLogin.Bridge.Log.Info().Str("sync_trigger", "connect").Msg("Starting LINE conversation synchronization")
 	lc.syncChatsNow(ctx)
 	if ctx.Err() != nil {
 		return
@@ -742,12 +743,21 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	workersStarted = true
 }
 
-func (lc *LineClient) tryLogin(ctx context.Context) error {
+func (lc *LineClient) tryLogin(ctx context.Context) (resultErr error) {
 	var email, password, certificate string
+	var loginProcess *LineEmailLogin
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
 		email = meta.Email
 		password = meta.Password
 		certificate = meta.Certificate
+	}
+	if lc.UserLogin.Bridge != nil {
+		if network, ok := lc.UserLogin.Bridge.Network.(*LineConnector); ok {
+			loginProcess = &LineEmailLogin{User: lc.UserLogin.User, cooldown: &network.loginCooldown}
+			if err := loginProcess.loginCooldownError(); err != nil {
+				return err
+			}
+		}
 	}
 
 	if email == "" || password == "" {
@@ -758,9 +768,19 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		}
 		return fmt.Errorf("no stored credentials available for re-login")
 	}
+	if loginProcess != nil {
+		if err := loginProcess.claimLogin(); err != nil {
+			return err
+		}
+		defer loginProcess.releaseLogin()
+		defer func() {
+			if resultErr != nil {
+				loginProcess.noteLoginRateLimit(resultErr)
+			}
+		}()
+	}
 
 	lc.UserLogin.Bridge.Log.Info().
-		Str("email", email).
 		Bool("has_certificate", certificate != "").
 		Msg("Attempting to login with email/password...")
 	res, err := loginWithCredentialsContext(ctx, email, password, certificate)

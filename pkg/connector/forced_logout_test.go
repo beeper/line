@@ -130,7 +130,7 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 			select {
 			case state := <-matrix.states:
 				wantRestartError := status.BridgeStateErrorCode("line-logged-out")
-				wantRestartMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
+				wantRestartMessage := "LINE invalidated this Chrome Extension session. Click Reconnect in Beeper to reconnect LINE."
 				if invalidKey {
 					wantRestartError = "line-e2ee-key-missing"
 					wantRestartMessage = lineMissingE2EEKeyMessage

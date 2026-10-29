@@ -88,7 +88,7 @@ func TestDecryptDownloadedMediaFailsClosed(t *testing.T) {
 	ciphertext := []byte("ciphertext")
 	decryptErr := errors.New("invalid media key")
 	var calls int
-	h := &Handler{DecryptMedia: func([]byte, string) ([]byte, error) {
+	h := &Handler{DecryptVideoMedia: func([]byte, string) ([]byte, error) {
 		calls++
 		return nil, decryptErr
 	}}
