@@ -477,7 +477,7 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 		}
 
 		// Default to text
-		converted, err = h.ConvertText(unwrappedText, replyRelatesTo)
+		converted, err = h.ConvertText(ctx, portal, intent, unwrappedText, replyRelatesTo)
 	}
 	if err != nil {
 		return nil, err

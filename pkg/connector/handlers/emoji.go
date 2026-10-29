@@ -185,7 +185,7 @@ func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Porta
 		if msg := h.tryDownloadSticon(ctx, portal, intent, stkPkgID, stkID, relatesTo); msg != nil {
 			return msg, nil
 		}
-		return h.ConvertText(cleanInlineSticonPlaceholders(stkTxt), relatesTo)
+		return h.ConvertText(ctx, portal, intent, cleanInlineSticonPlaceholders(stkTxt), relatesTo)
 	}
 
 	// Try parsing the text body for inline sticon references ($STK:productId:emojiId$).
@@ -233,7 +233,7 @@ func (h *Handler) ConvertInlineEmoji(ctx context.Context, portal *bridgev2.Porta
 		Int("raw_body_length", len(bodyText)).
 		Int("metadata_count", len(data.ContentMetadata)).
 		Msg("Falling back to text for inline emoji")
-	return h.ConvertText(cleanInlineSticonPlaceholders(stkTxt), relatesTo)
+	return h.ConvertText(ctx, portal, intent, cleanInlineSticonPlaceholders(stkTxt), relatesTo)
 }
 
 type sticonReplacement struct {

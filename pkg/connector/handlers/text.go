@@ -1,16 +1,20 @@
 package handlers
 
 import (
+	"context"
+	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/id"
+
+	"github.com/beeper/line/pkg/line"
 )
 
 // ConvertText converts a LINE text message to a Matrix text message, including link previews.
-func (h *Handler) ConvertText(unwrappedText string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+func (h *Handler) ConvertText(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, unwrappedText string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
 	client := h.NewClient()
 
 	content := &event.MessageEventContent{
@@ -36,7 +40,9 @@ func (h *Handler) ConvertText(unwrappedText string, relatesTo *event.RelatesTo) 
 				},
 			}
 			if info.Image != "" && info.Obs.CDN != "" {
-				preview.ImageURL = id.ContentURIString(info.Obs.CDN + info.Image)
+				if err := h.uploadPreviewImage(ctx, client, portal, intent, info.Obs.CDN+info.Image, preview); err != nil {
+					h.Log.Warn().Err(err).Str("url", requestURL).Msg("Failed to bridge link preview image")
+				}
 			}
 			content.BeeperLinkPreviews = []*event.BeeperLinkPreview{preview}
 		}
@@ -50,4 +56,22 @@ func (h *Handler) ConvertText(unwrappedText string, relatesTo *event.RelatesTo) 
 			},
 		},
 	}, nil
+}
+
+func (h *Handler) uploadPreviewImage(ctx context.Context, client *line.Client, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, imageURL string, preview *event.BeeperLinkPreview) error {
+	data, err := client.DownloadOBSPublicResource(ctx, imageURL)
+	if err != nil {
+		return err
+	}
+	mimeType := http.DetectContentType(data)
+	if !strings.HasPrefix(mimeType, "image/") {
+		return fmt.Errorf("unexpected content type %q", mimeType)
+	}
+	preview.ImageURL, preview.ImageEncryption, err = intent.UploadMedia(ctx, portal.MXID, data, "", mimeType)
+	if err != nil {
+		return err
+	}
+	preview.ImageSize = event.IntOrString(len(data))
+	preview.ImageType = mimeType
+	return nil
 }
