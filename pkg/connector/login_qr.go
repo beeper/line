@@ -56,10 +56,14 @@ func (lq *LineQRLogin) start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	if err := lq.login.loginCooldownError(); err != nil {
 		return nil, err
 	}
+	if err := lq.login.claimLogin(); err != nil {
+		return nil, err
+	}
 	ll := lq.login
 	ll.mu.Lock()
 	if ll.canceled || ll.attemptCtx != nil {
 		ll.mu.Unlock()
+		ll.releaseLogin()
 		return nil, fmt.Errorf("QR login is already started or canceled")
 	}
 	ll.attemptCtx, ll.attemptCancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)

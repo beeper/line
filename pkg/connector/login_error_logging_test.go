@@ -88,6 +88,22 @@ func TestParseLoginErrorDetailsWithoutJSON(t *testing.T) {
 	}
 }
 
+func TestSessionEstablishmentErrorKeepsStageAndSafeMessage(t *testing.T) {
+	err := errors.New(`API error 503: {"code":10051,"data":{"name":"LoginException","message":"LINE could not verify this session. Please try again."}}`)
+	wrapped := wrapSessionEstablishError(&LineEmailLogin{authFlow: "qr"}, err)
+	var authErr *line.AuthError
+	if !errors.As(wrapped, &authErr) {
+		t.Fatalf("session failure lacks AuthError: %v", wrapped)
+	}
+	if authErr.Flow != "qr" || authErr.Stage != line.AuthStageSessionEstablish || authErr.Category != line.AuthErrorServiceUnavailable {
+		t.Fatalf("incorrect session classification: %+v", authErr)
+	}
+	var respErr bridgev2.RespError
+	if !errors.As(wrapped, &respErr) || !strings.Contains(respErr.Err, "LINE could not verify this session") {
+		t.Fatalf("safe provider message did not reach Matrix: %v", wrapped)
+	}
+}
+
 func TestLoginErrorSummaryDoesNotIncludeNonJSONResponseBody(t *testing.T) {
 	err := errors.New("login failed: API error 502: upstream secret response")
 	details := parseLoginErrorDetails(err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -38,6 +39,11 @@ var (
 	ErrLoginRateLimited = bridgev2.RespError{
 		ErrCode:    "DEV.HIGHEST.LINE.RATE_LIMITED",
 		Err:        "LINE is limiting how often this account can sign in. Please try again later.",
+		StatusCode: http.StatusTooManyRequests,
+	}
+	ErrLoginInProgress = bridgev2.RespError{
+		ErrCode:    "DEV.HIGHEST.LINE.LOGIN_IN_PROGRESS",
+		Err:        "A LINE sign-in is already in progress for this account. Continue it or cancel it before starting another.",
 		StatusCode: http.StatusTooManyRequests,
 	}
 	ErrLoginRejected = bridgev2.RespError{
@@ -122,7 +128,7 @@ func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 		ExceptionCode:         intPtr(details.ErrorCode),
 		Category:              cat,
 		ProviderReason:        line.SanitizeProviderAlert(reason),
-		ProviderAlertStatus:   providerMessageStatus,
+		ProviderAlertStatus:   "absent",
 		ProviderMessage:       providerMessage,
 		ProviderMessageStatus: providerMessageStatus,
 		UserMessage:           mapped.Err,
@@ -137,6 +143,40 @@ func wrapLineLoginErrorAt(err error, stage line.AuthErrorStage) error {
 		ae.UserMessage = providerMessage
 	}
 	return fmt.Errorf("%w: %w", ae, mapped)
+}
+
+func wrapSessionEstablishError(login *LineEmailLogin, err error) error {
+	if err == nil {
+		return nil
+	}
+	details := parseLoginErrorDetails(err)
+	providerMessage, messageStatus := line.SanitizeProviderMessage(providerLoginMessage(details))
+	category := line.AuthErrorUnknown
+	var networkErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.As(err, &networkErr) {
+		category = line.AuthErrorNetworkUnavailable
+	} else if details.HTTPStatus >= http.StatusInternalServerError {
+		category = line.AuthErrorServiceUnavailable
+	}
+	flow := "email"
+	if login != nil && login.authFlow != "" {
+		flow = login.authFlow
+	}
+	userMessage := "LINE accepted sign-in, but the bridge could not verify the new session. Please try again."
+	if messageStatus == "recognized" || messageStatus == "partially_redacted" || messageStatus == "safe_unrecognized" {
+		userMessage = providerMessage
+	}
+	authErr := &line.AuthError{
+		Flow: flow, Stage: line.AuthStageSessionEstablish, HTTPStatus: details.HTTPStatus,
+		ResponseCode: intPtr(details.ResponseCode), ExceptionType: details.ErrorName,
+		ExceptionCode: intPtr(details.ErrorCode), Category: category,
+		ProviderReason:  line.SanitizeProviderAlert(providerLoginMessage(details)),
+		ProviderMessage: providerMessage, ProviderMessageStatus: messageStatus,
+		UserMessage: userMessage, RetryRecommended: category == line.AuthErrorNetworkUnavailable || category == line.AuthErrorServiceUnavailable,
+		Temporary:          category == line.AuthErrorNetworkUnavailable || category == line.AuthErrorServiceUnavailable,
+		UserActionRequired: true, Err: err,
+	}
+	return fmt.Errorf("%w: %w", authErr, bridgev2.RespError(mautrix.MUnknown.WithMessage("%s", userMessage)))
 }
 
 // classifyEmailError classifies an email/login error into an AuthErrorCategory.

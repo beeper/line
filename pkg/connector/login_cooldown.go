@@ -40,8 +40,34 @@ const (
 // in-memory on purpose: the limit is enforced by LINE, so the bridge only
 // needs to avoid making it worse.
 type loginCooldown struct {
-	mu    sync.Mutex
-	until map[string]time.Time
+	mu     sync.Mutex
+	until  map[string]time.Time
+	active map[string]bool
+}
+
+func (c *loginCooldown) acquire(userID string) bool {
+	if c == nil || userID == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.active == nil {
+		c.active = make(map[string]bool)
+	}
+	if c.active[userID] {
+		return false
+	}
+	c.active[userID] = true
+	return true
+}
+
+func (c *loginCooldown) release(userID string) {
+	if c == nil || userID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.active, userID)
+	c.mu.Unlock()
 }
 
 // block stops new login attempts for the account until the given time.
@@ -155,17 +181,21 @@ func (ll *LineEmailLogin) noteLoginRateLimit(err error) {
 	}
 	now := time.Now()
 	var authErr *line.AuthError
-	if errors.As(err, &authErr) && authErr.RetryAfter != nil {
-		ll.cooldown.block(string(ll.User.MXID), now.Add(*authErr.RetryAfter))
-		return
-	}
+	_ = errors.As(err, &authErr)
+	var delay time.Duration
 	switch classifyLoginRateLimit(err) {
 	case loginRateLimitLocked:
-		ll.cooldown.block(string(ll.User.MXID), now.Add(loginRateLimitCooldown))
+		delay = loginRateLimitCooldown
 	case loginRateLimitRetryLater:
-		ll.cooldown.block(string(ll.User.MXID), now.Add(loginRetryLaterCooldown))
+		delay = loginRetryLaterCooldown
 	case loginRateLimitVerificationUnavailable:
-		ll.cooldown.block(string(ll.User.MXID), now.Add(verificationTemporarilyUnavailableCooldown))
+		delay = verificationTemporarilyUnavailableCooldown
+	}
+	if authErr != nil && authErr.RetryAfter != nil && *authErr.RetryAfter > delay {
+		delay = *authErr.RetryAfter
+	}
+	if delay > 0 {
+		ll.cooldown.block(string(ll.User.MXID), now.Add(delay))
 	}
 }
 

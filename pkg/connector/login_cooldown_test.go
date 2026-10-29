@@ -251,11 +251,29 @@ func TestLoginCooldownExpires(t *testing.T) {
 	}
 }
 
+func TestLoginClaimSerializesSameAccount(t *testing.T) {
+	var cooldown loginCooldown
+	user := &bridgev2.User{User: &database.User{MXID: "@same:example.com"}}
+	first := &LineEmailLogin{User: user, cooldown: &cooldown}
+	second := &LineEmailLogin{User: user, cooldown: &cooldown}
+	if err := first.claimLogin(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.claimLogin(); !errors.Is(err, ErrLoginInProgress) {
+		t.Fatalf("concurrent login claim = %v, want ErrLoginInProgress", err)
+	}
+	first.releaseLogin()
+	if err := second.claimLogin(); err != nil {
+		t.Fatalf("claim after release = %v", err)
+	}
+	second.releaseLogin()
+}
+
 func TestLoginCooldownUsesRetryAfter(t *testing.T) {
 	var cooldown loginCooldown
 	user := &bridgev2.User{User: &database.User{MXID: "@user:example.com"}}
 	ll := &LineEmailLogin{User: user, cooldown: &cooldown}
-	delay := 37 * time.Second
+	delay := 20 * time.Minute
 	ll.noteLoginRateLimit(&line.AuthError{Category: line.AuthErrorTooManyAttempts, RetryAfter: &delay})
 	if remaining := cooldown.remaining(string(user.MXID)); remaining < delay-time.Second || remaining > delay {
 		t.Fatalf("cooldown=%s, want provider Retry-After %s", remaining, delay)
