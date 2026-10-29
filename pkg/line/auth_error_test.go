@@ -9,6 +9,7 @@ func TestSanitizeProviderMessage(t *testing.T) {
 		{"verified verification alert", "Verification is temporarily unavailable.\nPlease try again later.", "Verification is temporarily unavailable.\nPlease try again later.", "recognized"},
 		{"token field redacted", "Login failed; access_token=private-value. Please try later.", "Login failed; access_token=[redacted]. Please try later.", "partially_redacted"},
 		{"email redacted", "Account for person@example.org is locked.", "Account for [redacted email] is locked.", "partially_redacted"},
+		{"opaque token redacted", "Login failed: abcdefghijklmnopqrstuvwxyz0123456789, please retry.", "Login failed: [redacted token], please retry.", "partially_redacted"},
 		{"bounded safe provider text", "LINE could not complete this sign-in. Try again later.", "LINE could not complete this sign-in. Try again later.", "safe_unrecognized"},
 		{"structured response suppressed", `{"token":"private"}`, "", "suppressed"},
 		{"control sequence suppressed", "safe text\x1b[31mprivate", "", "suppressed"},

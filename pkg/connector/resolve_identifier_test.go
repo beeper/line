@@ -276,6 +276,19 @@ func TestSearchUsersRejectsUnrequestedContactMID(t *testing.T) {
 	}
 }
 
+func TestSearchUsersEmptyQueryDoesNotEnumerateContacts(t *testing.T) {
+	lc := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("empty search made LINE request: %s", req.URL.Path)
+		return nil, nil
+	})
+	for _, query := range []string{"", " \t\n "} {
+		results, err := lc.SearchUsers(context.Background(), query)
+		if err != nil || len(results) != 0 {
+			t.Fatalf("empty query %q: results=%v err=%v", query, results, err)
+		}
+	}
+}
+
 func TestResolveIdentifierFailuresDoNotPersistPortals(t *testing.T) {
 	for _, tc := range []struct {
 		name, query, response string

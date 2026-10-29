@@ -358,6 +358,9 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	// Exact public ID and MID lookup is shared with start-chat. Only search
 	// falls back to non-unique display-name matches.
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
+	if lowerQuery == "" {
+		return nil, nil
+	}
 	if lowerQuery != "" {
 		contact, err := lc.resolveContactIdentifier(ctx, query)
 		exactErr = err

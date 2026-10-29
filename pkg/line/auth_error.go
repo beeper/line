@@ -171,13 +171,12 @@ func (e *AuthError) Unwrap() error {
 	return e.Err
 }
 
-// SafeAlertStatus returns a safe provider alert status string. Never returns
-// raw provider text.
 var (
 	providerCredentialPattern = regexp.MustCompile(`(?i)\b(access[_ -]?token|refresh[_ -]?token|id[_ -]?token|password|passwd|authorization|cookie|authsessionid|session[_ -]?id|qr[_ -]?(token|secret)|credential|secret)\b\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,;.!?]+)([.!?]?)`)
 	providerEmailPattern      = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
 	providerJWTpattern        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b`)
 	providerOpaqueMIDPattern  = regexp.MustCompile(`\bU[A-Za-z0-9_-]{43}\b`)
+	providerLongSecretPattern = regexp.MustCompile(`\b[A-Za-z0-9_-]{32,}\b`)
 )
 
 // SanitizeProviderMessage keeps useful provider wording while removing common
@@ -202,6 +201,7 @@ func SanitizeProviderMessage(message string) (safe, status string) {
 	message = providerEmailPattern.ReplaceAllString(message, "[redacted email]")
 	message = providerJWTpattern.ReplaceAllString(message, "[redacted token]")
 	message = providerOpaqueMIDPattern.ReplaceAllString(message, "[redacted LINE ID]")
+	message = providerLongSecretPattern.ReplaceAllString(message, "[redacted token]")
 	if strings.ContainsAny(message, "{}") || strings.Contains(strings.ToLower(message), "bearer ") || strings.Contains(message, "https://") || strings.Contains(message, "http://") {
 		return "", "suppressed"
 	}
