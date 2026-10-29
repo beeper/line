@@ -34,6 +34,8 @@ type Handler struct {
 
 	// DownloadOBSResource overrides non-talk OBS downloads in tests.
 	DownloadOBSResource func(ctx context.Context, client *line.Client, service, sid, oid string) ([]byte, error)
+	// DownloadPublicMedia overrides public link-preview downloads in tests.
+	DownloadPublicMedia func(ctx context.Context, client *line.Client, resource string) ([]byte, error)
 
 	// DownloadAlbumPreview overrides album thumbnail downloads in tests.
 	DownloadAlbumPreview func(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error)
