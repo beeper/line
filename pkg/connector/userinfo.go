@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -341,6 +342,8 @@ func (lc *LineClient) midToResolveIdentifier(ctx context.Context, mid string) *b
 	}
 }
 
+const maxSearchResults = 20
+
 func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev2.ResolveIdentifierResponse, error) {
 	var results []*bridgev2.ResolveIdentifierResponse
 
@@ -353,9 +356,6 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 		if err == nil && contact != nil && contact.Mid != "" {
 			if r := lc.midToResolveIdentifier(ctx, contact.Mid); r != nil {
 				results = append(results, r)
-				if len(results) >= 20 {
-					return results, nil
-				}
 			}
 		}
 	}
@@ -370,7 +370,10 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 	}
 
 	// Fetch contacts in batches to check display names
-	for i := 0; i < len(allMids); i += 50 {
+	for i := 0; i < len(allMids) && len(results) < maxSearchResults; i += 50 {
+		if err := ctx.Err(); err != nil {
+			return results, err
+		}
 		end := i + 50
 		if end > len(allMids) {
 			end = len(allMids)
@@ -385,10 +388,14 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 			if c.Mid == "" {
 				continue
 			}
+			lc.setCachedContact(c.Mid, c)
 			name := strings.ToLower(c.EffectiveDisplayName())
 			if lowerQuery == "" || strings.Contains(name, lowerQuery) {
 				if r := lc.midToResolveIdentifier(ctx, c.Mid); r != nil {
 					results = append(results, r)
+					if len(results) >= maxSearchResults {
+						break
+					}
 				}
 			}
 		}
@@ -409,6 +416,9 @@ func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveId
 
 	var results []*bridgev2.ResolveIdentifierResponse
 	for i := 0; i < len(allMids); i += 50 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := i + 50
 		if end > len(allMids) {
 			end = len(allMids)
@@ -422,6 +432,7 @@ func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveId
 			if wrapper.Contact.Mid == "" {
 				continue
 			}
+			lc.setCachedContact(mid, wrapper.Contact)
 			if r := lc.midToResolveIdentifier(ctx, mid); r != nil {
 				results = append(results, r)
 			}
@@ -434,11 +445,17 @@ func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveId
 var _ bridgev2.ContactListingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) GetAvatar(ctx context.Context, id networkid.AvatarID) ([]byte, error) {
-	url := fmt.Sprintf("https://profile.line-scdn.net%s", id)
-	resp, err := lc.HTTPClient.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://profile.line-scdn.net%s", id), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := lc.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected avatar response status %d", resp.StatusCode)
+	}
 	return io.ReadAll(resp.Body)
 }
