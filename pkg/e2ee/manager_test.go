@@ -69,8 +69,8 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spec-version-2 group encryption: %v", err)
 	}
-	if version := ChunksVersion(groupChunks); version != 2 {
-		t.Fatalf("spec-version-2 group chunks version = %d, want 2", version)
+	if got, _, err := m.DecryptGroupMessage(&line.Message{Chunks: groupChunks, From: "u-sender", To: "u-receiver"}, "c-test"); err != nil || got != plaintext {
+		t.Fatalf("spec-version-2 group fallback decrypt = (%q, %v)", got, err)
 	}
 	got, groupKey, err := m.DecryptGroupMessage(msg, "c-test")
 	if err != nil || got != plaintext || groupKey != myRaw {
