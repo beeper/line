@@ -39,6 +39,9 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if version := ChunksVersion(chunks); version != 1 {
+		t.Fatalf("V1 chunks version = %d, want 1", version)
+	}
 	msg := &line.Message{Chunks: chunks, From: "u-sender", To: "u-receiver"}
 	for i := 0; i < 1800; i++ {
 		got, err := m.DecryptMessageV2(msg)
@@ -52,6 +55,23 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 	}
 
 	m.groupKeys["c-test"] = map[int]int{myRaw: myKey}
+	m.latestGroupKey["c-test"] = myRaw
+	m.groupSpecVersion["c-test"] = 1
+	groupChunks, err := m.EncryptGroupMessageRaw("c-test", "u-sender", 0, []byte(plaintext))
+	if err != nil {
+		t.Fatalf("spec-version-1 group encryption: %v", err)
+	}
+	if version := ChunksVersion(groupChunks); version != 1 {
+		t.Fatalf("spec-version-1 group chunks version = %d, want 1", version)
+	}
+	m.groupSpecVersion["c-test"] = 2
+	groupChunks, err = m.EncryptGroupMessageRaw("c-test", "u-sender", 0, []byte(plaintext))
+	if err != nil {
+		t.Fatalf("spec-version-2 group encryption: %v", err)
+	}
+	if version := ChunksVersion(groupChunks); version != 2 {
+		t.Fatalf("spec-version-2 group chunks version = %d, want 2", version)
+	}
 	got, groupKey, err := m.DecryptGroupMessage(msg, "c-test")
 	if err != nil || got != plaintext || groupKey != myRaw {
 		t.Fatalf("group V1 decrypt = (%q, %d, %v)", got, groupKey, err)
@@ -87,6 +107,14 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 		}
 		if _, _, err := m.DecryptGroupMessage(&invalid, "c-test"); err == nil {
 			t.Fatal("invalid group header was accepted")
+		}
+	}
+}
+
+func TestChunksVersionDefaultsMalformedAndEmptyInputToV2(t *testing.T) {
+	for _, chunks := range [][]string{nil, {}, {"not-base64"}} {
+		if version := ChunksVersion(chunks); version != 2 {
+			t.Fatalf("ChunksVersion(%v) = %d, want 2", chunks, version)
 		}
 	}
 }
