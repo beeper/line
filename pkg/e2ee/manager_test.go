@@ -55,8 +55,12 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 	}
 
 	m.groupKeys["c-test"] = map[int]int{myRaw: myKey}
-	m.latestGroupKey["c-test"] = myRaw
-	m.groupSpecVersion["c-test"] = 1
+	if _, err := m.UnwrapGroupSharedKey("c-test", &line.E2EEGroupSharedKey{GroupKeyID: myRaw, SpecVersion: 1}); err != nil {
+		t.Fatalf("cache group spec version 1: %v", err)
+	}
+	if m.groupSpecVersion["c-test"] != 1 {
+		t.Fatalf("stored group spec version = %d, want 1", m.groupSpecVersion["c-test"])
+	}
 	groupChunks, err := m.EncryptGroupMessageRaw("c-test", "u-sender", 0, []byte(plaintext))
 	if err != nil {
 		t.Fatalf("spec-version-1 group encryption: %v", err)
@@ -64,7 +68,12 @@ func TestV1WireHeaderUsesV1DecryptWithoutMetadata(t *testing.T) {
 	if version := ChunksVersion(groupChunks); version != 1 {
 		t.Fatalf("spec-version-1 group chunks version = %d, want 1", version)
 	}
-	m.groupSpecVersion["c-test"] = 2
+	if _, err := m.UnwrapGroupSharedKey("c-test", &line.E2EEGroupSharedKey{GroupKeyID: myRaw, SpecVersion: 2}); err != nil {
+		t.Fatalf("cache group spec version 2: %v", err)
+	}
+	if m.groupSpecVersion["c-test"] != 2 {
+		t.Fatalf("rotated group spec version = %d, want 2", m.groupSpecVersion["c-test"])
+	}
 	groupChunks, err = m.EncryptGroupMessageRaw("c-test", "u-sender", 0, []byte(plaintext))
 	if err != nil {
 		t.Fatalf("spec-version-2 group encryption: %v", err)
