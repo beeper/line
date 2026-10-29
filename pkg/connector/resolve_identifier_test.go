@@ -193,6 +193,74 @@ func TestResolveIdentifierMIDLookup(t *testing.T) {
 	}
 }
 
+func TestResolveIdentifierPreservesOpaqueMIDCase(t *testing.T) {
+	opaque := "U" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-aDEFg"
+	for _, tc := range []struct {
+		name, key, responseMID string
+		wantErr                bool
+	}{
+		{"exact opaque", opaque, opaque, false},
+		{"different opaque case", "U" + strings.ToLower(opaque[1:]), opaque, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lc := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+				switch {
+				case strings.HasSuffix(req.URL.Path, "/getContactsV2"):
+					var args []json.RawMessage
+					if err := json.NewDecoder(req.Body).Decode(&args); err != nil || len(args) < 1 {
+						t.Fatalf("opaque MID request malformed: %v", err)
+					}
+					var request struct {
+						TargetUserMids []string `json:"targetUserMids"`
+					}
+					if err := json.Unmarshal(args[0], &request); err != nil || len(request.TargetUserMids) != 1 || request.TargetUserMids[0] != opaque {
+						t.Fatalf("opaque MID was changed in request: %q, %v", request, err)
+					}
+					return resolutionResponse(`{"code":0,"data":{"contacts":{"` + tc.key + `":{"contact":{"mid":"` + tc.responseMID + `","displayName":"Opaque"}}}}}`), nil
+				case strings.HasSuffix(req.URL.Path, "/getBuddyProfile"):
+					return resolutionResponse(`{"code":0,"data":{}}`), nil
+				default:
+					t.Fatalf("opaque MID used unexpected RPC: %s", req.URL.Path)
+					return nil, nil
+				}
+			})
+			result, err := lc.ResolveIdentifier(context.Background(), opaque, true)
+			if tc.wantErr && result != nil || !tc.wantErr && (err != nil || result == nil) {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if tc.wantErr {
+				if result != nil {
+					t.Fatalf("mismatched opaque identity accepted: %+v", result)
+				}
+				return
+			}
+			if result == nil || string(result.UserID) != opaque || string(result.Chat.PortalKey.ID) != opaque {
+				t.Fatalf("opaque identity changed: %+v", result)
+			}
+		})
+	}
+}
+
+func TestSearchUsersRejectsUnrequestedContactMID(t *testing.T) {
+	lc := newResolutionClient(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/findContactByUserid"):
+			return resolutionResponse(`{"code":0,"data":{}}`), nil
+		case strings.HasSuffix(req.URL.Path, "/getAllContactIds"):
+			return resolutionResponse(`{"code":0,"data":["` + resolutionMID + `"]}`), nil
+		case strings.HasSuffix(req.URL.Path, "/getContactsV2"):
+			return resolutionResponse(`{"code":0,"data":{"contacts":{"` + resolutionOwnMID + `":{"contact":{"mid":"` + resolutionOwnMID + `","displayName":"spoofed"}}}}}`), nil
+		default:
+			t.Fatalf("unexpected search RPC: %s", req.URL.Path)
+			return nil, nil
+		}
+	})
+	results, err := lc.SearchUsers(context.Background(), "alice")
+	if err == nil || len(results) != 0 {
+		t.Fatalf("unrequested contact accepted: results=%+v err=%v", results, err)
+	}
+}
+
 func TestResolveIdentifierFailuresDoNotPersistPortals(t *testing.T) {
 	for _, tc := range []struct {
 		name, query, response string

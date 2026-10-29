@@ -11,15 +11,13 @@ import (
 )
 
 func isCanonicalUserMID(identifier string) bool {
-	if len(identifier) != 33 || identifier[0] != 'u' {
-		return false
-	}
-	for _, ch := range identifier[1:] {
-		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
-			return false
-		}
-	}
-	return true
+	normalized, valid := line.NormalizeUserMID(identifier)
+	return valid && normalized == identifier
+}
+
+func normalizeUserMID(identifier string) string {
+	normalized, _ := line.NormalizeUserMID(identifier)
+	return normalized
 }
 
 // resolveContactIdentifier never matches display names or creates portals.
@@ -29,7 +27,12 @@ func (lc *LineClient) resolveContactIdentifier(ctx context.Context, identifier s
 	if err := lc.checkLineCall(ctx); err != nil {
 		return nil, err
 	}
-	identifier = strings.ToLower(strings.TrimSpace(identifier))
+	identifier = strings.TrimSpace(identifier)
+	if normalized, valid := line.NormalizeUserMID(identifier); valid {
+		identifier = normalized
+	} else {
+		identifier = strings.ToLower(identifier)
+	}
 	if identifier == "" || strings.ContainsFunc(identifier, unicode.IsSpace) || strings.ContainsFunc(identifier, unicode.IsControl) {
 		return nil, fmt.Errorf("provide a LINE public ID or user MID, not a display name")
 	}
@@ -56,8 +59,13 @@ func (lc *LineClient) resolveContactIdentifier(ctx context.Context, identifier s
 			})
 			err = lookupErr
 			if contacts != nil {
-				if wrapper, found := contacts.Contacts[identifier]; found {
-					contact = &wrapper.Contact
+				for key, wrapper := range contacts.Contacts {
+					if normalizeUserMID(key) == identifier {
+						if contact != nil {
+							return nil, fmt.Errorf("LINE lookup returned ambiguous user MID entries")
+						}
+						contact = &wrapper.Contact
+					}
 				}
 			}
 			if err == nil && contact == nil {
@@ -84,6 +92,7 @@ func (lc *LineClient) resolveContactIdentifier(ctx context.Context, identifier s
 	if contact == nil || contact.Mid == "" {
 		return nil, nil
 	}
+	contact.Mid = normalizeUserMID(contact.Mid)
 	if !isCanonicalUserMID(contact.Mid) || isCanonicalUserMID(identifier) && contact.Mid != identifier {
 		return nil, fmt.Errorf("LINE lookup returned an invalid or mismatched user MID")
 	}

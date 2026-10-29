@@ -353,12 +353,14 @@ func (lc *LineClient) midToResolveIdentifier(ctx context.Context, mid string) *b
 
 func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev2.ResolveIdentifierResponse, error) {
 	var results []*bridgev2.ResolveIdentifierResponse
+	var exactErr, validationErr error
 
 	// Exact public ID and MID lookup is shared with start-chat. Only search
 	// falls back to non-unique display-name matches.
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
 	if lowerQuery != "" {
 		contact, err := lc.resolveContactIdentifier(ctx, query)
+		exactErr = err
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -377,8 +379,7 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get all contact IDs for search")
-		return results, nil
+		return nil, fmt.Errorf("LINE contact search failed: %w", err)
 	}
 
 	// Fetch contacts in batches to check display names
@@ -388,16 +389,26 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 			end = len(allMids)
 		}
 		batch := allMids[i:end]
+		requested := make(map[string]bool, len(batch))
+		for _, mid := range batch {
+			requested[normalizeUserMID(mid)] = true
+		}
 		contactsResp, err := client.GetContactsV2Context(ctx, batch)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			continue
+			return nil, fmt.Errorf("LINE contact search failed: %w", err)
 		}
-		for _, wrapper := range contactsResp.Contacts {
+		keyCounts := make(map[string]int, len(contactsResp.Contacts))
+		for key := range contactsResp.Contacts {
+			keyCounts[normalizeUserMID(key)]++
+		}
+		for key, wrapper := range contactsResp.Contacts {
 			c := wrapper.Contact
-			if c.Mid == "" {
+			c.Mid = normalizeUserMID(c.Mid)
+			if !isCanonicalUserMID(c.Mid) || normalizeUserMID(key) != c.Mid || !requested[c.Mid] || keyCounts[c.Mid] != 1 {
+				validationErr = fmt.Errorf("LINE contact search returned invalid or ambiguous user MIDs")
 				continue
 			}
 			name := strings.ToLower(c.EffectiveDisplayName())
@@ -407,6 +418,14 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 					results = append(results, r)
 				}
 			}
+		}
+	}
+	if len(results) == 0 {
+		if exactErr != nil {
+			return nil, fmt.Errorf("exact LINE lookup failed and no matching contacts were found: %w", exactErr)
+		}
+		if validationErr != nil {
+			return nil, validationErr
 		}
 	}
 
@@ -430,12 +449,21 @@ func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveId
 			end = len(allMids)
 		}
 		batch := allMids[i:end]
+		requested := make(map[string]bool, len(batch))
+		for _, mid := range batch {
+			requested[normalizeUserMID(mid)] = true
+		}
 		contactsResp, err := client.GetContactsV2(batch)
 		if err != nil {
 			continue
 		}
-		for mid, wrapper := range contactsResp.Contacts {
-			if wrapper.Contact.Mid == "" {
+		keyCounts := make(map[string]int, len(contactsResp.Contacts))
+		for key := range contactsResp.Contacts {
+			keyCounts[normalizeUserMID(key)]++
+		}
+		for key, wrapper := range contactsResp.Contacts {
+			mid := normalizeUserMID(wrapper.Contact.Mid)
+			if !isCanonicalUserMID(mid) || normalizeUserMID(key) != mid || !requested[mid] || keyCounts[mid] != 1 {
 				continue
 			}
 			if r := lc.midToResolveIdentifier(ctx, mid); r != nil {
