@@ -16,17 +16,16 @@
 ## Historical PR relationships
 
 - `beeper/line#271` is still open (head `meramsey/line:integration/linux-build-20261020`,
-  SHA `587164f7ced99bc5765ac7df4eafc11314e6d602`). Its eight patches are present
+  SHA `587164f7ced99bc5765ac7df4eafc11314e6d602`). Its nine commits are present
   in the checkpoint by patch equivalence. This integration is intended to
   supersede #271 because it contains those features plus follow-up authentication,
   identity, contact validation, media, CI, and release corrections. #271 remains
   open and untouched; do not merge both versions without comparing their diffs.
-- `meramsey/line#1` remains open against the fork's integration branch (head
-  `a7b5764a6a4c0d45d10814fd101c21eca70199b9`). Relevant bounded test modes,
-  deterministic concurrency fixtures, native heap test support, coverage gates,
-  and CI caching are adapted in this integration. Historical benchmark numbers
-  in its old performance report are intentionally not copied as they are
-  environment-specific.
+- `meramsey/line#1` remains open against the fork's integration branch (6 commits,
+  head `a7b5764a6a4c0d45d10814fd101c21eca70199b9`). Two patches are identical by
+  patch ID; bounded test modes, measurements, coverage gates, and CI caching were
+  adapted in later integration commits. Historical benchmark numbers in its old
+  performance report are intentionally not copied as they are environment-specific.
 - Upstream commits already incorporated include latest #296 (`45a48b9`), which
   bounds search results and honors cancellation. The integration retains this
   behavior rather than reverting it.
