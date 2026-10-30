@@ -417,6 +417,17 @@ func (lc *LineClient) sendConnectedStateIfCurrent(ctx context.Context) bool {
 	// Whichever transition gets this lock last determines the visible state.
 	lc.recoverMu.Lock()
 	defer lc.recoverMu.Unlock()
+	lc.missingE2EEKeyMu.Lock()
+	defer lc.missingE2EEKeyMu.Unlock()
+	if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || !lc.hasAccessToken() {
+		return false
+	}
+	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.ForceFullE2EELogin {
+		lc.missingE2EEKeyMarked = true
+		lc.UserLogin.Bridge.Log.Warn().Msg("LINE login still needs a full reconnect to refresh E2EE keys")
+		lc.sendMissingE2EEKeyState()
+		return true
+	}
 	return lc.sendConnectedStateLocked(ctx)
 }
 
@@ -484,24 +495,25 @@ func (lc *LineClient) markMissingE2EEKey(ctx context.Context, err error) {
 		return
 	}
 	lc.missingE2EEKeyMarked = true
+	needsSave := false
 	if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok {
-		needsSave := !meta.ForceFullE2EELogin || meta.Certificate != ""
+		needsSave = !meta.ForceFullE2EELogin || meta.Certificate != ""
 		meta.ForceFullE2EELogin = true
 		meta.Certificate = ""
-		if !needsSave {
-			lc.missingE2EEKeyMu.Unlock()
-			return
-		}
-		lc.missingE2EEKeyMu.Unlock()
+	}
+	lc.missingE2EEKeyMu.Unlock()
+	if needsSave {
 		if errSave := lc.UserLogin.Save(ctx); errSave != nil && lc.UserLogin.Bridge != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(errSave).Msg("Failed to save LINE E2EE reconnect requirement")
 		}
-	} else {
-		lc.missingE2EEKeyMu.Unlock()
 	}
 	if lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE E2EE private key missing; marking login for full reconnect")
 	}
+	lc.sendMissingE2EEKeyState()
+}
+
+func (lc *LineClient) sendMissingE2EEKeyState() {
 	lc.UserLogin.BridgeState.Send(status.BridgeState{
 		StateEvent: status.StateBadCredentials,
 		Error:      "line-e2ee-key-missing",
