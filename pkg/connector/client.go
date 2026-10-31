@@ -111,6 +111,9 @@ type LineClient struct {
 	paidReactionIconMXC     map[string]string   // LINE sticon URL -> cached MXC URI
 	unblockBackfills        sync.Map            // chat MID -> *unblockBackfillState while unblock history restoration is active
 
+	avatarSlotsOnce sync.Once
+	avatarSlots     chan struct{}
+
 	wg sync.WaitGroup
 }
 

@@ -444,7 +444,26 @@ func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveId
 
 var _ bridgev2.ContactListingNetworkAPI = (*LineClient)(nil)
 
+const avatarDownloadConcurrency = 16
+
+func (lc *LineClient) acquireAvatarSlot(ctx context.Context) (func(), error) {
+	lc.avatarSlotsOnce.Do(func() {
+		lc.avatarSlots = make(chan struct{}, avatarDownloadConcurrency)
+	})
+	select {
+	case lc.avatarSlots <- struct{}{}:
+		return func() { <-lc.avatarSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (lc *LineClient) GetAvatar(ctx context.Context, id networkid.AvatarID) ([]byte, error) {
+	release, err := lc.acquireAvatarSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://profile.line-scdn.net%s", id), nil)
 	if err != nil {
 		return nil, err
