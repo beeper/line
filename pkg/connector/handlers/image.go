@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -40,8 +42,16 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		if err != nil {
 			return nil, err
 		}
+		// Keep the type that LINE reports (for example GIF) in the event and in
+		// the saved metadata that the download response uses.
+		info, body := lineImageInfo(data.ContentMetadata, nil)
+		directMedia.ContentType = info.MimeType
+		directMedia.FileName = body
+		if directMedia.Size == 0 {
+			directMedia.Size = info.Size
+		}
 		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
-			MsgType: event.MsgImage, RelatesTo: relatesTo,
+			MsgType: event.MsgImage, Body: body, Info: info, RelatesTo: relatesTo,
 		}); converted != nil || err != nil {
 			return converted, err
 		}
@@ -111,9 +121,10 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
-	// Upload to Matrix
+	// Upload to Matrix with the image's real type, so GIFs stay GIFs.
+	info, body := lineImageInfo(data.ContentMetadata, imgData)
 	uploadStart := time.Now()
-	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, "image.jpg", "image/jpeg")
+	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, body, info.MimeType)
 	uploadDuration := time.Since(uploadStart)
 	if err != nil {
 		h.Log.Error().
@@ -145,9 +156,10 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 				Type: event.EventMessage,
 				Content: &event.MessageEventContent{
 					MsgType:   event.MsgImage,
-					Body:      "image.jpg",
+					Body:      body,
 					URL:       mxc,
 					File:      file,
+					Info:      info,
 					RelatesTo: relatesTo,
 				},
 			},
@@ -173,6 +185,62 @@ func lineImageDownloadSource(data line.Message) imageDownloadSource {
 
 	// For plain media, the image is stored at r/talk/m/{messageID}.
 	return imageDownloadSource{oid: data.ID, isPlainMedia: true}
+}
+
+// lineImageInfo describes an incoming LINE image for Matrix: its real MIME
+// type, size and dimensions from MEDIA_CONTENT_INFO, and fi.mau.gif for
+// animated GIFs so clients play them as GIFs. data is the downloaded image, or
+// nil when only the metadata is known.
+func lineImageInfo(metadata map[string]string, data []byte) (*event.FileInfo, string) {
+	var contentInfo struct {
+		Extension string `json:"extension"`
+		Animated  bool   `json:"animated"`
+		Width     int    `json:"width"`
+		Height    int    `json:"height"`
+		FileSize  int    `json:"fileSize"`
+	}
+	if raw := metadata["MEDIA_CONTENT_INFO"]; raw != "" {
+		_ = json.Unmarshal([]byte(raw), &contentInfo)
+	}
+
+	mimeType := ""
+	switch strings.ToLower(contentInfo.Extension) {
+	case "gif":
+		mimeType = "image/gif"
+	case "png":
+		mimeType = "image/png"
+	case "webp":
+		mimeType = "image/webp"
+	case "jpg", "jpeg":
+		mimeType = "image/jpeg"
+	}
+	if data != nil {
+		if detected := http.DetectContentType(data); strings.HasPrefix(detected, "image/") {
+			mimeType = detected
+		}
+	}
+	if mimeType == "" {
+		mimeType = "image/jpeg"
+	}
+
+	info := &event.FileInfo{
+		MimeType: mimeType,
+		Width:    contentInfo.Width,
+		Height:   contentInfo.Height,
+		Size:     contentInfo.FileSize,
+	}
+	if data != nil {
+		info.Size = len(data)
+	}
+	if mimeType == "image/gif" && contentInfo.Animated {
+		info.MauGIF = true
+	}
+
+	extension := strings.TrimPrefix(mimeType, "image/")
+	if extension == "jpeg" {
+		extension = "jpg"
+	}
+	return info, "image." + extension
 }
 
 func lineMediaCategory(metadata map[string]string) string {

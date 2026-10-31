@@ -35,13 +35,6 @@ func isHEICImage(mimeType, fileName string) bool {
 	return extension == ".heic" || extension == ".heif"
 }
 
-func jpegFileName(fileName string) string {
-	if fileName == "" {
-		return "image.jpg"
-	}
-	return strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
-}
-
 func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -281,27 +274,27 @@ func generateThumbnail(imageData []byte) ([]byte, int, int, error) {
 	width := bounds.Dx()
 	height := bounds.Dy()
 
-	maxDim := 1280
+	// The LINE Chrome Extension scales image thumbnails so the longest side is
+	// at most 384 pixels, keeps the aspect ratio and never scales up.
+	maxDim := 384
 	newWidth := width
 	newHeight := height
 
 	if width > maxDim || height > maxDim {
 		if width > height {
 			newWidth = maxDim
-			newHeight = (height * maxDim) / width
+			newHeight = max(1, (height*maxDim)/width)
 		} else {
 			newHeight = maxDim
-			newWidth = (width * maxDim) / height
+			newWidth = max(1, (width*maxDim)/height)
 		}
 	}
 
-	var thumbnail image.Image
-	if newWidth != width || newHeight != height {
-		thumbnail = image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
-		draw.CatmullRom.Scale(thumbnail.(draw.Image), thumbnail.Bounds(), img, bounds, draw.Over, nil)
-	} else {
-		thumbnail = img
-	}
+	// JPEG has no alpha channel: draw on white so transparent areas don't turn
+	// black in the preview LINE shows before a GIF plays.
+	thumbnail := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
+	draw.Draw(thumbnail, thumbnail.Bounds(), image.White, image.Point{}, draw.Src)
+	draw.CatmullRom.Scale(thumbnail, thumbnail.Bounds(), img, bounds, draw.Over, nil)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, thumbnail, &jpeg.Options{Quality: 60}); err != nil {
@@ -346,27 +339,57 @@ func encryptThumbnail(thumbnailData []byte, keyMaterialB64 string) ([]byte, erro
 	return append(encrypted, h.Sum(nil)...), nil
 }
 
+// isAnimatedGif reports whether a GIF has more than one frame. It walks the
+// GIF block structure instead of scanning for the 0x2C image separator byte,
+// which also appears inside compressed pixel data and made single-frame GIFs
+// look animated.
 func isAnimatedGif(data []byte) bool {
-	// GIF header: "GIF89a" or "GIF87a"
-	if len(data) < 6 {
+	// Header ("GIF87a"/"GIF89a") and logical screen descriptor.
+	if len(data) < 13 || string(data[0:3]) != "GIF" {
 		return false
 	}
-
-	if string(data[0:3]) != "GIF" {
-		return false
+	pos := 13
+	if flags := data[10]; flags&0x80 != 0 {
+		pos += 3 << ((flags & 0x07) + 1) // global color table
 	}
 
-	// Count image descriptors (0x2C) which indicate frames
-	frameCount := 0
-	for i := 0; i < len(data)-1; i++ {
-		if data[i] == 0x2C { // Image descriptor separator
-			frameCount++
-			if frameCount > 1 {
+	// skipSubBlocks skips data sub-blocks up to and including the terminator.
+	skipSubBlocks := func(p int) int {
+		for p < len(data) {
+			size := int(data[p])
+			p++
+			if size == 0 {
+				return p
+			}
+			p += size
+		}
+		return -1
+	}
+
+	frames := 0
+	for pos >= 0 && pos < len(data) {
+		switch data[pos] {
+		case 0x2C: // image descriptor
+			frames++
+			if frames > 1 {
 				return true
 			}
+			if pos+10 > len(data) {
+				return false
+			}
+			flags := data[pos+9]
+			pos += 10
+			if flags&0x80 != 0 {
+				pos += 3 << ((flags & 0x07) + 1) // local color table
+			}
+			pos++ // LZW minimum code size
+			pos = skipSubBlocks(pos)
+		case 0x21: // extension: label, then sub-blocks
+			pos = skipSubBlocks(pos + 2)
+		default: // 0x3B trailer, or data we cannot parse
+			return false
 		}
 	}
-
 	return false
 }
 
