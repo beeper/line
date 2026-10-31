@@ -57,11 +57,11 @@ func TestSubmitUserInputLogsStructuredLoginErrorWithoutCredentials(t *testing.T)
 		"error_summary":         "API error 400",
 		"http_status":           float64(400),
 		"line_response_code":    float64(10051),
-		"line_response_message": "RESPONSE_ERROR",
+		"line_response_message": "redacted",
 		"line_error_name":       "TalkException",
 		"line_error_code":       float64(35),
-		"line_error_message":    "Blocked user",
-		"line_error_reason":     "blocked user",
+		"line_error_message":    "redacted",
+		"line_error_reason":     "blocked_user",
 	}
 	for key, want := range wantFields {
 		if got := event[key]; got != want {
@@ -88,11 +88,82 @@ func TestParseLoginErrorDetailsWithoutJSON(t *testing.T) {
 	}
 }
 
+func TestSessionEstablishmentErrorKeepsStageAndSafeMessage(t *testing.T) {
+	err := errors.New(`API error 503: {"code":10051,"data":{"name":"LoginException","message":"LINE could not verify this session. Please try again."}}`)
+	wrapped := wrapSessionEstablishError(&LineEmailLogin{authFlow: "qr"}, err)
+	var authErr *line.AuthError
+	if !errors.As(wrapped, &authErr) {
+		t.Fatalf("session failure lacks AuthError: %v", wrapped)
+	}
+	if authErr.Flow != "qr" || authErr.Stage != line.AuthStageSessionEstablish || authErr.Category != line.AuthErrorServiceUnavailable {
+		t.Fatalf("incorrect session classification: %+v", authErr)
+	}
+	var respErr bridgev2.RespError
+	if !errors.As(wrapped, &respErr) || !strings.Contains(respErr.Err, "LINE could not verify this session") {
+		t.Fatalf("safe provider message did not reach Matrix: %v", wrapped)
+	}
+}
+
+func TestLoginTransportErrorsUseNetworkCategory(t *testing.T) {
+	wrapped := wrapLineLoginError(context.DeadlineExceeded)
+	var authErr *line.AuthError
+	if !errors.As(wrapped, &authErr) || authErr.Category != line.AuthErrorNetworkUnavailable || authErr.Stage != line.AuthStageEmailLogin {
+		t.Fatalf("transport error classification = %#v (%v)", authErr, wrapped)
+	}
+	var respErr bridgev2.RespError
+	if !errors.As(wrapped, &respErr) || !strings.Contains(respErr.Err, "reach LINE") {
+		t.Fatalf("network error is not actionable: %v", wrapped)
+	}
+}
+
+func TestReconnectErrorReasonKeepsNetworkAndProviderUnavailableMeaning(t *testing.T) {
+	if got := loginErrorReason(context.DeadlineExceeded); got != line.UserMessageForCategory(line.AuthErrorNetworkUnavailable) {
+		t.Fatalf("network reconnect reason = %q", got)
+	}
+	err := errors.New(`API error 503: {"code":10051,"data":{"name":"TalkException"}}`)
+	if got := loginErrorReason(err); got != line.UserMessageForCategory(line.AuthErrorServiceUnavailable) {
+		t.Fatalf("provider-unavailable reconnect reason = %q", got)
+	}
+}
+
+func TestUnknownHTTP400LoginRejectionHasSafeFallback(t *testing.T) {
+	err := wrapLineLoginError(errors.New(`API error 400: {"code":10051,"data":{"name":"LoginException","code":987}}`))
+	var authErr *line.AuthError
+	if !errors.As(err, &authErr) || authErr.Category != line.AuthErrorUnknown {
+		t.Fatalf("unknown rejection classification = %#v (%v)", authErr, err)
+	}
+	var respErr bridgev2.RespError
+	if !errors.As(err, &respErr) || respErr.Err != genericLoginFailureReason {
+		t.Fatalf("unknown rejection fallback = %v", err)
+	}
+}
+
 func TestLoginErrorSummaryDoesNotIncludeNonJSONResponseBody(t *testing.T) {
 	err := errors.New("login failed: API error 502: upstream secret response")
 	details := parseLoginErrorDetails(err)
 	if got := loginErrorSummary(err, details); got != "API error 502" {
 		t.Fatalf("loginErrorSummary = %q, want %q", got, "API error 502")
+	}
+}
+
+func TestLoginErrorReasonDoesNotLeakUnknownProviderText(t *testing.T) {
+	for _, tc := range []struct {
+		reason, want string
+	}{
+		{"blocked user", loginTooManyAttemptsReason},
+		{"Too many login attempts", loginTooManyAttemptsReason},
+		{"Verification is temporarily unavailable", "Verification is temporarily unavailable"},
+		{"Account ID or password is invalid", "Account ID or password is invalid"},
+		{"Authentication failed", "Authentication failed"},
+		{"", ""},
+		{"response-token secret", ""},
+		{"password: hunter2", "password=[redacted]"},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			if got := safeEmailLoginReason(tc.reason); got != tc.want {
+				t.Fatalf("safeEmailLoginReason(%q) = %q, want %q", tc.reason, got, tc.want)
+			}
+		})
 	}
 }
 

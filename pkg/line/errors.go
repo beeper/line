@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -21,11 +22,19 @@ var (
 // HTTPError is returned when a LINE endpoint answers with an unexpected HTTP status.
 type HTTPError struct {
 	StatusCode int
+	RetryAfter time.Duration
 	text       string
 }
 
 func newHTTPError(statusCode int, format string, args ...any) *HTTPError {
 	return &HTTPError{StatusCode: statusCode, text: fmt.Sprintf(format, args...)}
+}
+
+// newHTTPResponseError retains bounded retry guidance from an HTTP response.
+func newHTTPResponseError(resp *http.Response, format string, args ...any) *HTTPError {
+	err := newHTTPError(resp.StatusCode, format, args...)
+	err.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+	return err
 }
 
 func (e *HTTPError) Error() string {
@@ -38,6 +47,15 @@ func HTTPStatusCode(err error) int {
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode
+	}
+	return 0
+}
+
+// HTTPRetryAfter returns a parsed Retry-After duration carried by an HTTPError.
+func HTTPRetryAfter(err error) time.Duration {
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.RetryAfter
 	}
 	return 0
 }
