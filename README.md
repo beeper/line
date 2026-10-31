@@ -336,3 +336,7 @@ automatically.
 
 For details on how the bridge handles different Letter Sealing
 combinations, see [readme/LETTER_SEALING.md](readme/LETTER_SEALING.md).
+
+For LINE app settings that change how a bridged message looks or plays (GIF
+autoplay, auto-download, photo quality), see
+[readme/LINE_CLIENT_SETTINGS.md](readme/LINE_CLIENT_SETTINGS.md).
