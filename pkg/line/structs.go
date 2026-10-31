@@ -367,3 +367,18 @@ type CreateChatRequest struct {
 type CreateChatResponse2 struct {
 	Chat Chat `json:"chat"`
 }
+
+// ChatAttribute is the updatedAttribute of updateChat, and param2 of the
+// chat update operation (121) LINE sends back.
+type ChatAttribute int
+
+const (
+	ChatAttributeName    ChatAttribute = 1
+	ChatAttributePicture ChatAttribute = 2
+)
+
+type UpdateChatRequest struct {
+	ReqSeq           int64          `json:"reqSeq"`
+	Chat             map[string]any `json:"chat"`
+	UpdatedAttribute ChatAttribute  `json:"updatedAttribute"`
+}
