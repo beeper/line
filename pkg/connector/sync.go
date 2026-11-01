@@ -2466,12 +2466,18 @@ func (lc *LineClient) handleInvite(ctx context.Context, chatMid string, opType O
 	if chat.Type == 1 {
 		membership = event.MembershipJoin
 	}
+	inviteeMids := make([]string, 0, len(chat.Extra.GroupExtra.InviteeMids))
 	for inviteeMid := range chat.Extra.GroupExtra.InviteeMids {
 		if inviteeMid == lc.Mid || inviteeMid == string(lc.UserLogin.ID) {
 			continue
 		}
-		lc.emitMemberChange(chat.ChatMid, inviteeMid, membership, time.Now())
+		inviteeMids = append(inviteeMids, inviteeMid)
 	}
+	if len(inviteeMids) == 0 {
+		return
+	}
+	portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, lc.makeSystemMemberChangesEvent(portalKey, inviteeMids, membership, time.Now()))
 }
 
 func (lc *LineClient) handleInviteForSelf(ctx context.Context, chatMid string) {
