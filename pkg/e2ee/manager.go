@@ -258,15 +258,33 @@ func (m *Manager) DecryptSecureBlob(b64Cipher string) (map[string]any, error) {
 	return out, nil
 }
 
+func secureDataPath(id string) string {
+	return filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
+}
+
 // LoadSecureDataFromFile reads key files written by older bridge versions.
 // New keys are only stored in the user login metadata.
 func (m *Manager) LoadSecureDataFromFile(id string) (map[string]any, error) {
-	path := filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(secureDataPath(id))
 	if err != nil {
 		return nil, err
 	}
 	return m.DecryptSecureBlob(strings.TrimSpace(string(b)))
+}
+
+// HasSecureDataFile reports whether an older bridge version left a key file for id.
+func HasSecureDataFile(id string) bool {
+	_, err := os.Stat(secureDataPath(id))
+	return err == nil
+}
+
+// RemoveSecureDataFile deletes a key file written by an older bridge version.
+// A missing file is not an error.
+func RemoveSecureDataFile(id string) error {
+	if err := os.Remove(secureDataPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) InitFromLoginKeyChain(serverPubB64, encryptedKeyChainB64 string) (map[string]string, error) {
