@@ -2,7 +2,7 @@
 """Parse LINE network captures (CDP or net-log format).
 
 Usage:
-    python3 scripts/parse-line-traffic.py <capture.json> [output.json]
+    python3 .agents/skills/line-analyze/scripts/parse-line-traffic.py <capture.json> [output.json]
 
 Supports two input formats:
 - CDP capture (from line-cdp-capture.py): has SSE message bodies, Thrift response bodies
@@ -231,14 +231,17 @@ def parse_cdp_capture(data: dict) -> dict:
             entry["status"] = req["status"]
 
         # Extract interesting request headers
-        headers = req.get("headers", {})
+        # requestWillBeSentExtraInfo carries the headers Chrome really sent
+        # (Cookie, Origin, Sec-*, X-Line-*), which requestWillBeSent omits.
+        headers = {**req.get("headers", {}), **req.get("request_extra_headers", {})}
         interesting_req = {}
         for k, v in headers.items():
             if k.lower() in (
                 "content-type", "x-line-access", "x-line-application",
                 "x-lhm", "x-lpv", "x-lsr", "x-obs-params",
-                "x-line-channeltoken", "accept",
-            ):
+                "x-line-channeltoken", "accept", "origin", "user-agent",
+                "x-line-chrome-version", "x-line-mid",
+            ) or k.lower().startswith("x-line-") or k.lower().startswith("x-ls"):
                 interesting_req[k] = v
         if interesting_req:
             entry["request_headers"] = interesting_req
@@ -270,7 +273,19 @@ def parse_cdp_capture(data: dict) -> dict:
 
         # Include request body if available
         if "request_body" in req:
-            entry["request_body_text"] = req["request_body"]
+            body = req["request_body"]
+            if isinstance(body, dict):
+                # Raw captures keep the bytes in base64; the parsed output only
+                # keeps the text form and a size + sha256 for binary bodies.
+                if body.get("error"):
+                    entry["request_body_error"] = body["error"]
+                else:
+                    entry["request_body_size"] = body.get("size")
+                    entry["request_body_sha256"] = body.get("sha256")
+                    if body.get("text") is not None:
+                        entry["request_body_text"] = body["text"]
+            else:
+                entry["request_body_text"] = body
 
         entry["timestamp"] = req.get("timestamp", "")
         line_requests.append(entry)
