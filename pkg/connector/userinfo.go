@@ -47,7 +47,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_10_21",
+		ID:               "dev.highest.matrix.line.capabilities.2026_11_01",
 		MaxTextLength:    5000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
