@@ -2,6 +2,7 @@ package e2ee
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -10,22 +11,20 @@ func TestRemoveSecureDataFile(t *testing.T) {
 	if err := os.Mkdir("data", 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if HasSecureDataFile("u-mid") {
-		t.Fatal("HasSecureDataFile = true before the file exists")
-	}
-	if err := RemoveSecureDataFile("u-mid"); err != nil {
-		t.Fatalf("RemoveSecureDataFile(missing) = %v, want nil", err)
-	}
-	if err := os.WriteFile(secureDataPath("u-mid"), []byte("x"), 0o600); err != nil {
+	path := filepath.Join("data", "lcs_secure_u-mid.json")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
-	}
-	if !HasSecureDataFile("u-mid") {
-		t.Fatal("HasSecureDataFile = false after writing the file")
 	}
 	if err := RemoveSecureDataFile("u-mid"); err != nil {
 		t.Fatalf("RemoveSecureDataFile = %v", err)
 	}
-	if HasSecureDataFile("u-mid") {
-		t.Fatal("file still exists after RemoveSecureDataFile")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file still exists after RemoveSecureDataFile: %v", err)
+	}
+	if err := RemoveSecureDataFile("u-mid"); err != nil {
+		t.Fatalf("RemoveSecureDataFile(missing) = %v, want nil", err)
+	}
+	if err := RemoveSecureDataFile(""); err != nil {
+		t.Fatalf("RemoveSecureDataFile(empty) = %v, want nil", err)
 	}
 }

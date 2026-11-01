@@ -246,42 +246,14 @@ func (m *Manager) LoadMyKeyFromExportedMap(exported map[string]string) error {
 	return m.LoadMyKeyFromSecureData(map[string]any{"exportedKeyMap": raw})
 }
 
-func (m *Manager) DecryptSecureBlob(b64Cipher string) (map[string]any, error) {
-	pt, err := m.runner.StorageDecrypt(b64Cipher)
-	if err != nil {
-		return nil, err
-	}
-	var out map[string]any
-	if err := json.Unmarshal([]byte(pt), &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func secureDataPath(id string) string {
-	return filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
-}
-
-// LoadSecureDataFromFile reads key files written by older bridge versions.
-// New keys are only stored in the user login metadata.
-func (m *Manager) LoadSecureDataFromFile(id string) (map[string]any, error) {
-	b, err := os.ReadFile(secureDataPath(id))
-	if err != nil {
-		return nil, err
-	}
-	return m.DecryptSecureBlob(strings.TrimSpace(string(b)))
-}
-
-// HasSecureDataFile reports whether an older bridge version left a key file for id.
-func HasSecureDataFile(id string) bool {
-	_, err := os.Stat(secureDataPath(id))
-	return err == nil
-}
-
-// RemoveSecureDataFile deletes a key file written by an older bridge version.
-// A missing file is not an error.
+// RemoveSecureDataFile deletes a key file that an older bridge version wrote.
+// A missing file or an empty id is not an error.
 func RemoveSecureDataFile(id string) error {
-	if err := os.Remove(secureDataPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if id == "" {
+		return nil
+	}
+	path := filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
