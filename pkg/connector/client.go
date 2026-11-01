@@ -231,6 +231,103 @@ func (lc *LineClient) claimForcedLogoutState() bool {
 	return true
 }
 
+// loadConnectE2EEKeys loads the user's E2EE keys from the login metadata.
+// Older bridge versions also wrote the keys to an encrypted file. If such a
+// file is still on disk, its keys are merged into the metadata once and the
+// file is deleted, so later connects never read or decrypt it.
+func (lc *LineClient) loadConnectE2EEKeys(ctx context.Context, mgr *e2ee.Manager) {
+	log := lc.UserLogin.Bridge.Log
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return
+	}
+	lc.migrateLegacySecureDataFiles(ctx, mgr, meta)
+	if len(meta.ExportedKeyMap) == 0 {
+		return
+	}
+	if err := mgr.LoadMyKeyFromExportedMap(meta.ExportedKeyMap); err != nil {
+		log.Warn().Err(err).Msg("Failed to load E2EE key from DB metadata")
+		return
+	}
+	log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
+}
+
+// migrateLegacySecureDataFiles merges the keys from old key files into the
+// login metadata and deletes the files. Keys already in the metadata win,
+// because they come from a newer login. If the merge cannot be saved, the
+// files stay on disk so the next connect can try again.
+func (lc *LineClient) migrateLegacySecureDataFiles(ctx context.Context, mgr *e2ee.Manager, meta *UserLoginMetadata) {
+	log := lc.UserLogin.Bridge.Log
+	var fileIDs []string
+	for _, id := range legacySecureDataIDs(meta.Mid, string(lc.UserLogin.ID), lc.UserLogin.UserMXID.String()) {
+		if e2ee.HasSecureDataFile(id) {
+			fileIDs = append(fileIDs, id)
+		}
+	}
+	if len(fileIDs) == 0 {
+		return
+	}
+	ei3, err := lc.newClient().GetEncryptedIdentityV3()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to fetch EncryptedIdentityV3 for old E2EE key file")
+		return
+	}
+	if err := mgr.InitStorage(ei3.WrappedNonce, ei3.KDFParameter1, ei3.KDFParameter2); err != nil {
+		log.Warn().Err(err).Msg("Failed to init storage key for old E2EE key file")
+		return
+	}
+	fromFiles := make(map[string]string)
+	for _, id := range fileIDs {
+		data, err := mgr.LoadSecureDataFromFile(id)
+		if err != nil {
+			log.Warn().Err(err).Str("id", id).Msg("Failed to read old E2EE key file")
+			return
+		}
+		fromFiles = mergeLoginKeyMaps(fromFiles, exportedKeyMapFromSecureData(data))
+	}
+	merged := mergeLoginKeyMaps(fromFiles, meta.ExportedKeyMap)
+	if len(merged) > len(meta.ExportedKeyMap) {
+		previous := meta.ExportedKeyMap
+		meta.ExportedKeyMap = merged
+		if err := lc.UserLogin.Save(ctx); err != nil {
+			meta.ExportedKeyMap = previous
+			log.Warn().Err(err).Msg("Failed to save E2EE keys from old key file")
+			return
+		}
+		log.Info().Int("added_keys", len(merged)-len(previous)).Msg("Moved E2EE keys from old key file to DB metadata")
+	}
+	for _, id := range fileIDs {
+		if err := e2ee.RemoveSecureDataFile(id); err != nil {
+			log.Warn().Err(err).Str("id", id).Msg("Failed to delete old E2EE key file")
+		}
+	}
+}
+
+// legacySecureDataIDs lists the IDs that older bridge versions used to name
+// key files: the LINE MID, the login ID, and the Matrix user ID.
+func legacySecureDataIDs(ids ...string) []string {
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func exportedKeyMapFromSecureData(data map[string]any) map[string]string {
+	raw, _ := data["exportedKeyMap"].(map[string]any)
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		if s, ok := v.(string); ok && s != "" {
+			out[k] = s
+		}
+	}
+	return out
+}
+
 func (lc *LineClient) newClient() *line.Client {
 	return lc.newClientWithToken(lc.getAccessToken())
 }
@@ -684,29 +781,7 @@ func (lc *LineClient) Connect(ctx context.Context) {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to init E2EE manager")
 	} else {
 		lc.E2EE = mgr
-		// Storage key is optional for runtime decrypt/encrypt; try it for file support
-		client := lc.newClient()
-		ei3, err := client.GetEncryptedIdentityV3()
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch EncryptedIdentityV3")
-		} else {
-			if err := mgr.InitStorage(ei3.WrappedNonce, ei3.KDFParameter1, ei3.KDFParameter2); err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to init storage key")
-			} else if data, err := mgr.LoadSecureDataFromFile(string(lc.UserLogin.ID)); err == nil {
-				if err := mgr.LoadMyKeyFromSecureData(data); err != nil {
-					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to load E2EE key from secure data")
-				}
-			}
-		}
-		// DB metadata reflects the latest login, even if writing the secure file failed.
-		// Load it last so an older file cannot replace the freshly verified key.
-		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok && len(meta.ExportedKeyMap) > 0 {
-			if err := mgr.LoadMyKeyFromExportedMap(meta.ExportedKeyMap); err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to load E2EE key from DB metadata")
-			} else {
-				lc.UserLogin.Bridge.Log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
-			}
-		}
+		lc.loadConnectE2EEKeys(ctx, mgr)
 	}
 
 	// Seed the last-known block list before fetching a fresh copy, so a

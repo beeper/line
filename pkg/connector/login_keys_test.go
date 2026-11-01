@@ -235,3 +235,23 @@ func TestRefreshLoginE2EEKeysKeepsMetadataOnExportFailure(t *testing.T) {
 		t.Fatalf("metadata was clobbered on export failure: %#v", meta)
 	}
 }
+
+func TestLegacySecureDataIDsSkipsEmptyAndDuplicates(t *testing.T) {
+	got := legacySecureDataIDs("u-mid", "", "u-mid", "@user:example.com")
+	want := []string{"u-mid", "@user:example.com"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("legacySecureDataIDs = %v, want %v", got, want)
+	}
+}
+
+func TestExportedKeyMapFromSecureDataKeepsStringKeys(t *testing.T) {
+	got := exportedKeyMapFromSecureData(map[string]any{
+		"exportedKeyMap": map[string]any{"1": "a", "2": "", "3": 4},
+	})
+	if len(got) != 1 || got["1"] != "a" {
+		t.Fatalf("exportedKeyMapFromSecureData = %v, want only key 1", got)
+	}
+	if got := exportedKeyMapFromSecureData(map[string]any{}); len(got) != 0 {
+		t.Fatalf("exportedKeyMapFromSecureData(empty) = %v, want empty", got)
+	}
+}
