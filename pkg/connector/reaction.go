@@ -170,6 +170,7 @@ var lineEmojiReactionURLs = map[string]string{
 	"\U0001F444": lineSticonURL(lineTrialEmojiProductID, "247"),
 	"\U0001F44B": lineSticonURL(lineOriginalEmojiProductID, "147"),
 	"\U0001F64F": lineSticonURL(lineOriginalEmojiProductID, "148"),
+	"\U0001F647": lineSticonURL(lineOriginalEmojiProductID, "130"),
 	"\U0001F4AA": lineSticonURL(lineOriginalEmojiProductID, "149"),
 	"\U0001FAF6": lineSticonURL(lineOriginalEmojiProductID, "150"),
 	"\U0001F448": lineSticonURL(lineOriginalEmojiProductID, "151"),
@@ -237,6 +238,9 @@ var lineEmojiReactionURLs = map[string]string{
 	"7":          lineSticonURL(lineOriginalEmojiProductID, "209"),
 	"8":          lineSticonURL(lineOriginalEmojiProductID, "210"),
 	"9":          lineSticonURL(lineOriginalEmojiProductID, "211"),
+
+	"\U0001F647\u200D\u2642": lineSticonURL(lineOriginalEmojiProductID, "130"),
+	"\U0001F647\u200D\u2640": lineSticonURL(lineOriginalEmojiProductID, "130"),
 }
 
 // lineAllowedReactions is the Matrix-facing form of the outbound LINE reaction
