@@ -163,6 +163,7 @@ pacman -Syu mingw-w64-x86_64-gcc cmake
 ```
 
 - [Go](https://go.dev/dl/)
+- Optional: [FFmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` on `PATH`) to send GIFs from GIF pickers, which send videos. Without it, the bridge sends only GIF files as GIFs.
 - [olm](https://gitlab.matrix.org/matrix-org/olm) library:
 
 ```bash
@@ -241,6 +242,7 @@ cd data
 
 - [Go](https://go.dev/dl/) and build tools (`gcc`, `make`)
 - [olm](https://gitlab.matrix.org/matrix-org/olm) library (install via your package manager or build from source)
+- Optional: [FFmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` on `PATH`) to send GIFs from GIF pickers, which send videos. Without it, the bridge sends only GIF files as GIFs.
 - If using Beeper, compile [bbctl](https://github.com/beeper/bridge-manager) from source
 
 ### Linux / macOS build
