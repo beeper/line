@@ -81,8 +81,26 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 				bodyName := "sticker." + ext
 
 				info := &event.FileInfo{
-					MimeType: mimeType,
-					Size:     len(stkData),
+					MimeType:       mimeType,
+					Size:           len(stkData),
+					BridgedSticker: &event.BridgedSticker{Network: "line", ID: stkID},
+				}
+				if packID := data.ContentMetadata["STKPKGID"]; packID != "" {
+					info.BridgedSticker.PackURL = "https://store.line.me/stickershop/product/" + packID
+				}
+				stickerInfo := map[string]any{"id": stkID}
+				for key, field := range map[string]string{
+					"STKPKGID":   "package_id",
+					"STKVER":     "version",
+					"STKPKGNAME": "pack_name",
+				} {
+					if value := data.ContentMetadata[key]; value != "" {
+						stickerInfo[field] = value
+					}
+				}
+				if _, ok := data.ContentMetadata["STKOPT"]; ok {
+					stickerInfo["animated"] = isAnimated
+					stickerInfo["sound"] = strings.Contains(stkOpt, "S")
 				}
 				if cfg, _, err := image.DecodeConfig(bytes.NewReader(stkData)); err == nil {
 					info.Width = cfg.Width * 2 / 3
@@ -96,7 +114,8 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 					return &bridgev2.ConvertedMessage{
 						Parts: []*bridgev2.ConvertedMessagePart{
 							{
-								Type: event.EventSticker,
+								Type:  event.EventSticker,
+								Extra: map[string]any{"fi.mau.line.sticker": stickerInfo},
 								Content: &event.MessageEventContent{
 									Body:      bodyName,
 									URL:       mxc,
