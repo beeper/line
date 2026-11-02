@@ -35,6 +35,11 @@ type mentionEntry struct {
 
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
+var lineMediaSizeLimits = map[event.MessageType]int{
+	event.MsgImage: 20 * 1024 * 1024,
+	event.MsgAudio: 30 * 1024 * 1024,
+}
+
 const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
 
 func isTerminalCryptoError(err error) bool {
@@ -142,6 +147,23 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
+	var mediaData []byte
+	switch effectiveMsgType {
+	case event.MsgImage, event.MsgFile, event.MsgVideo, event.MsgAudio:
+		mediaData, err = lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
+		}
+		if sizeLimit, ok := lineMediaSizeLimits[effectiveMsgType]; ok && len(mediaData) > sizeLimit {
+			lc.UserLogin.Bridge.Log.Info().
+				Str("msg_type", string(effectiveMsgType)).
+				Int("size", len(mediaData)).
+				Int("limit", sizeLimit).
+				Msg("Media exceeds LINE's limit for its type, sending as a file")
+			effectiveMsgType = event.MsgFile
+		}
+	}
+
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
 	// This must happen before media processing since it affects the upload path.
 	useE2EEMedia := !plainText
@@ -188,10 +210,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgImage:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		mimeType := msg.Content.Info.MimeType
 		fileName := msg.Content.GetFileName()
@@ -331,10 +350,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgFile:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		contentType = int(ContentFile)
 
@@ -396,10 +412,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgVideo:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		contentType = int(ContentVideo)
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
@@ -527,10 +540,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgAudio:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		var mimeType string
 		if msg.Content.Info != nil {
