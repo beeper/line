@@ -62,6 +62,10 @@ var getProfileWithToken = func(ctx context.Context, token string) (*line.Profile
 }
 
 type LineClient struct {
+	stickerPacksMu       sync.Mutex
+	stickerPacksFetching chan struct{}
+	stickerPacks         map[string]line.ShopProduct
+
 	UserLogin    *bridgev2.UserLogin
 	AccessToken  string
 	RefreshToken string

@@ -102,10 +102,21 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if !isGroup && lc.isUserBlocked(portalMid) {
 		return nil, errBlockedContact
 	}
+	var sticker *lineSticker
+	if msg.Content.MsgType == event.CapMsgSticker {
+		var err error
+		sticker, err = lc.resolveSticker(ctx, msg.Content)
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE sticker, sending as image")
+		}
+	}
 
 	// Determine whether we need to send as plain text (peer/group has Letter Sealing off).
 	plainText := false
-	if lc.E2EE == nil {
+	if sticker != nil {
+		// LINE sends native stickers as metadata without an encrypted payload.
+		plainText = true
+	} else if lc.E2EE == nil {
 		plainText = true
 		lc.UserLogin.Bridge.Log.Warn().Msg("E2EE not initialized, sending as plain text")
 	} else if isGroup {
@@ -134,7 +145,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
 	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
 	effectiveMsgType := msg.Content.MsgType
-	if effectiveMsgType == event.CapMsgSticker {
+	if effectiveMsgType == event.CapMsgSticker && sticker == nil {
 		effectiveMsgType = event.MsgImage
 	} else if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
 		mime := msg.Content.Info.MimeType
@@ -198,6 +209,20 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var rawFileName string
 
 	switch effectiveMsgType {
+	case event.CapMsgSticker:
+		contentType = int(ContentSticker)
+		contentMetadata = map[string]string{
+			"STKPKGID": sticker.ProductID,
+			"STKID":    sticker.ID,
+			"STKVER":   sticker.Version,
+			"STKTXT":   sticker.Body,
+		}
+		if sticker.Option != "" {
+			contentMetadata["STKOPT"] = sticker.Option
+		}
+		if sticker.Hash != "" {
+			contentMetadata["STKHASH"] = sticker.Hash
+		}
 	case event.MsgText:
 		contentType = int(ContentText)
 		if plainText {
