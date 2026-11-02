@@ -24,6 +24,7 @@ var (
 	errLineSessionInvalidated = errors.New("LINE session invalidated by another client")
 	errLineClientSuperseded   = errors.New("LINE client was superseded")
 	errLineQRLoginRequired    = errors.New("LINE requires a new QR scan. Reconnect in Beeper to continue")
+	errLinePINNotVerified     = errors.New("PIN verification failed")
 )
 
 func init() {
@@ -81,6 +82,9 @@ type LineClient struct {
 	tokenMu              sync.RWMutex
 	recoverMu            sync.Mutex
 	recoverTime          time.Time
+	recoverErr           error
+	recoverRetryAt       time.Time
+	recoverBackoff       reconnectBackoff
 	recoveryStopped      bool
 	missingE2EEKeyMu     sync.Mutex
 	missingE2EEKeyMarked bool
@@ -356,10 +360,24 @@ func (lc *LineClient) markLoggedOutByOtherClient(ctx context.Context, err error)
 	lc.markLoggedOutByOtherClientLocked(ctx, err)
 }
 
-// markLoggedOutByOtherClientLocked applies the persistent forced-logout
-// transition. The caller must hold recoverMu so token rotation and invalidation
-// cannot interleave.
 func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err error) {
+	lc.invalidateSessionLocked(ctx, err, false)
+}
+
+// markRecoveryRejected invalidates the session unless another recovery already
+// replaced the token the rejected recovery started from.
+func (lc *LineClient) markRecoveryRejected(ctx context.Context, recoveryToken string, err error) {
+	lc.recoverMu.Lock()
+	defer lc.recoverMu.Unlock()
+	if lc.isSessionInvalidated() || lc.getAccessToken() != recoveryToken {
+		return
+	}
+	lc.invalidateSessionLocked(ctx, err, true)
+}
+
+// invalidateSessionLocked applies the persistent forced-logout transition. The
+// caller must hold recoverMu so token rotation and invalidation cannot interleave.
+func (lc *LineClient) invalidateSessionLocked(ctx context.Context, err error, expired bool) {
 	if lc.UserLogin == nil {
 		lc.invalidateAccessToken()
 		lc.obsTokenCache.Invalidate()
@@ -380,6 +398,9 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 	lc.obsTokenCache.Invalidate()
 	stateError := status.BridgeStateErrorCode("line-logged-out")
 	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
+	if expired {
+		stateError, stateMessage = "line-token-expired", ""
+	}
 	invalidSenderKey := line.IsInvalidSenderKey(err)
 	needsFullE2EELogin := invalidSenderKey
 	lc.missingE2EEKeyMu.Lock()
@@ -397,7 +418,7 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 		stateError = "line-e2ee-key-missing"
 		stateMessage = lineMissingE2EEKeyMessage
 	}
-	lc.saveSessionInvalidated(ctx)
+	lc.saveSessionInvalidated(ctx, expired)
 	if sendState && lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated; marking login bad credentials")
 	}
@@ -407,6 +428,7 @@ func (lc *LineClient) markLoggedOutByOtherClientLocked(ctx context.Context, err 
 			Error:      stateError,
 			Message:    stateMessage,
 			UserAction: status.UserActionRelogin,
+			Info:       map[string]any{"go_error": err.Error()},
 		})
 	}
 	lc.cancelActiveRun()
@@ -470,7 +492,7 @@ func (lc *LineClient) sendSSEDisconnectedIfCurrent(ctx context.Context, err erro
 	return true
 }
 
-func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
+func (lc *LineClient) saveSessionInvalidated(ctx context.Context, expired bool) {
 	if lc.UserLogin == nil || lc.UserLogin.UserLogin == nil {
 		return
 	}
@@ -480,6 +502,7 @@ func (lc *LineClient) saveSessionInvalidated(ctx context.Context) {
 	}
 	meta.AccessToken = ""
 	meta.SessionInvalidated = true
+	meta.SessionExpired = expired
 	if err := lc.UserLogin.Save(ctx); err != nil && lc.UserLogin.Bridge != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save LINE session invalidation")
 	}
@@ -530,7 +553,6 @@ func (lc *LineClient) applyRefreshedLoginE2EEKeys(meta *UserLoginMetadata, res *
 }
 
 // recoverToken attempts to restore a valid session by refreshing, then re-logging in.
-// Returns nil on success. On failure the caller should send StateBadCredentials.
 func (lc *LineClient) recoverToken(ctx context.Context) error {
 	return lc.recoverTokenWith(ctx, lc.refreshAndSave, lc.tryLogin)
 }
@@ -549,7 +571,7 @@ func (lc *LineClient) recoverTokenWith(
 			return nil
 		} else if ctx.Err() != nil {
 			return ctx.Err()
-		} else if lc.isLoggedOut(err) || errors.Is(err, errLineSessionInvalidated) || errors.Is(err, errLineClientSuperseded) || errors.Is(err, context.Canceled) {
+		} else if lc.isLoggedOut(err) || isTransientLineError(err) || errors.Is(err, errLineSessionInvalidated) || errors.Is(err, errLineClientSuperseded) || errors.Is(err, context.Canceled) {
 			return err
 		}
 		lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
@@ -578,8 +600,15 @@ func (lc *LineClient) runTokenRecovery(ctx context.Context, recover func(context
 	if !lc.recoverTime.IsZero() && time.Since(lc.recoverTime) < recentTokenRecoveryWindow {
 		return nil
 	}
+	if time.Now().Before(lc.recoverRetryAt) {
+		return fmt.Errorf("waiting to retry LINE token recovery: %w", lc.recoverErr)
+	}
 
 	if err := recover(ctx); err != nil {
+		if ctx.Err() == nil {
+			lc.recoverErr = err
+			lc.recoverRetryAt = time.Now().Add(lc.recoverBackoff.next())
+		}
 		return err
 	}
 	if ctx.Err() != nil {
@@ -591,6 +620,9 @@ func (lc *LineClient) runTokenRecovery(ctx context.Context, recover func(context
 	if lc.isSessionInvalidated() {
 		return errLineSessionInvalidated
 	}
+	lc.recoverBackoff.reset()
+	lc.recoverErr = nil
+	lc.recoverRetryAt = time.Time{}
 	lc.recoverTime = time.Now()
 	return nil
 }
@@ -600,14 +632,11 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	if !started {
 		return
 	}
-	defer lc.wg.Done()
+	handedOff := false
 	workersStarted := false
 	defer func() {
-		if !workersStarted {
-			if lc.E2EE != nil {
-				lc.E2EE.Close()
-			}
-			run.cancel()
+		if !handedOff {
+			lc.finishStartup(run, workersStarted)
 		}
 	}()
 
@@ -641,7 +670,10 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	}
 	if !lc.hasAccessToken() {
 		if lc.isSessionInvalidated() {
-			lc.markLoggedOutByOtherClient(ctx, errLineSessionInvalidated)
+			meta, _ := lc.UserLogin.Metadata.(*UserLoginMetadata)
+			lc.recoverMu.Lock()
+			lc.invalidateSessionLocked(ctx, errLineSessionInvalidated, meta != nil && meta.SessionExpired)
+			lc.recoverMu.Unlock()
 			return
 		}
 		if err := lc.runTokenRecovery(ctx, lc.tryLogin); err != nil {
@@ -663,31 +695,76 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	}
 
 	// Verify the token is still valid before proceeding
-	if err := lc.ensureValidToken(ctx); err != nil {
-		if ctx.Err() != nil {
+	if tokenErr := lc.ensureValidToken(ctx); tokenErr != nil {
+		if ctx.Err() == nil && lc.isLoggedOut(tokenErr) {
+			lc.markLoggedOutByOtherClient(ctx, tokenErr)
+		}
+		if ctx.Err() != nil || lc.isSessionInvalidated() {
 			return
 		}
-		if lc.isLoggedOut(err) {
-			lc.markLoggedOutByOtherClient(ctx, err)
+		if lc.shouldWaitForToken(tokenErr) {
+			if !lc.sendSSEDisconnectedIfCurrent(ctx, tokenErr) {
+				return
+			}
+			lc.UserLogin.Bridge.Log.Warn().Err(tokenErr).Msg("Failed to verify LINE token, retrying before starting the session")
+			// Startup work below runs once per connection, so it waits for a working
+			// token instead of running against a failing one. Connect itself returns so
+			// other logins aren't held up.
+			handedOff = true
+			go func() {
+				lc.finishStartup(run, lc.waitForValidToken(ctx) && lc.startSession(ctx))
+			}()
 			return
 		}
-		lc.UserLogin.BridgeState.Send(status.BridgeState{
-			StateEvent: status.StateBadCredentials,
-			Error:      "line-token-expired",
-			Info:       map[string]any{"go_error": err.Error()},
-			UserAction: status.UserActionRelogin,
-		})
-		return
+		lc.UserLogin.Bridge.Log.Warn().Err(tokenErr).Msg("Failed to verify LINE token, starting anyway")
 	}
+	workersStarted = lc.startSession(ctx)
+}
+
+func (lc *LineClient) shouldWaitForToken(err error) bool {
+	return lc.isTokenError(err) || isTransientLineError(err)
+}
+
+func (lc *LineClient) finishStartup(run *lineClientRun, workersStarted bool) {
+	if !workersStarted {
+		if lc.E2EE != nil {
+			lc.E2EE.Close()
+		}
+		run.cancel()
+	}
+	lc.wg.Done()
+}
+
+func (lc *LineClient) waitForValidToken(ctx context.Context) bool {
+	var backoff reconnectBackoff
+	for waitForSSEReconnect(ctx, backoff.next()) {
+		err := lc.ensureValidToken(ctx)
+		switch {
+		case err == nil:
+			return true
+		case ctx.Err() != nil:
+			return false
+		case lc.isLoggedOut(err):
+			lc.markLoggedOutByOtherClient(ctx, err)
+			return false
+		case lc.isSessionInvalidated():
+			return false
+		case !lc.shouldWaitForToken(err):
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to verify LINE token, starting anyway")
+			return true
+		}
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Still failing to verify LINE token, retrying")
+	}
+	return false
+}
+
+func (lc *LineClient) startSession(ctx context.Context) bool {
 	// LINE Chrome disables mobile notifications while its session is active by
 	// default. Explicitly clear that setting once per bridge connection so the
 	// user's phone continues receiving notifications.
 	lc.configurePhoneNotifications(ctx)
-	if ctx.Err() != nil {
-		return
-	}
-	if !lc.sendConnectedStateIfCurrent(ctx) {
-		return
+	if ctx.Err() != nil || !lc.sendConnectedStateIfCurrent(ctx) {
+		return false
 	}
 
 	// Initialize E2EE manager and load keys
@@ -744,14 +821,28 @@ func (lc *LineClient) Connect(ctx context.Context) {
 	// sender's existing membership look like a fresh join.
 	lc.syncChatsNow(ctx)
 	if ctx.Err() != nil {
-		return
+		return false
 	}
 
 	lc.wg.Add(3)
 	go lc.syncDMChats(ctx)
 	go lc.prefetchMessages(ctx)
 	go lc.pollLoop(ctx)
-	workersStarted = true
+	return true
+}
+
+func verifyReloginProfile(ctx context.Context, accessToken string) (*line.Profile, error) {
+	for attempt := 1; ; attempt++ {
+		profile, err := newLineAPIClient(accessToken).GetProfileContext(ctx)
+		if err == nil || attempt >= 3 || !isTransientLineError(err) {
+			return profile, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(attempt) * 2 * time.Second):
+		}
+	}
 }
 
 func (lc *LineClient) tryLogin(ctx context.Context) error {
@@ -813,7 +904,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		waitClient.LoginAttempt = res.Attempt
 		waitRes, err := waitClient.WaitForLogin(res.Verifier, res.NoE2EE)
 		if err != nil {
-			return fmt.Errorf("PIN verification failed: %w", err)
+			return fmt.Errorf("%w: %w", errLinePINNotVerified, err)
 		}
 		if waitRes.AuthToken == "" {
 			return fmt.Errorf("PIN verification completed but no auth token received")
@@ -838,7 +929,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		return errLineClientSuperseded
 	}
 	if res.Attempt != nil {
-		profile, err := newLineAPIClient(accessToken).GetProfileContext(ctx)
+		profile, err := verifyReloginProfile(ctx, accessToken)
 		if err != nil {
 			return fmt.Errorf("verify re-login account: %w", err)
 		}
@@ -985,20 +1076,16 @@ func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLogi
 }
 
 func (lc *LineClient) ensureValidToken(ctx context.Context) error {
-	_, _, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Profile, error) {
-		return getProfileWithToken(ctx, client.AccessToken)
+	_, _, err := callLineWithRecovery(ctx, nil, lineCallDeps[*line.Profile]{
+		newClient:   func() *line.Client { return lc.newClient() },
+		recover:     lc.recoverSessionAfterAuthError,
+		isAuthError: lc.isTokenError,
+		beforeCall:  func() error { return lc.checkLineCall(ctx) },
+		call: func(client *line.Client) (*line.Profile, error) {
+			return getProfileWithToken(ctx, client.AccessToken)
+		},
 	})
-	if err == nil {
-		return nil
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if line.IsAuthError(err) {
-		return err
-	}
-	lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("GetProfile failed with non-auth error, continuing anyway")
-	return nil
+	return err
 }
 
 func (lc *LineClient) Disconnect() {

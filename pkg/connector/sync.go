@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"slices"
 	"sort"
 	"strconv"
@@ -21,7 +22,6 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
-	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 
 	"github.com/beeper/line/pkg/line"
@@ -38,6 +38,7 @@ const (
 	groupPortalCreateWait                     = 30 * time.Second
 	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
 	defaultReceiveAuthProbeInterval           = 150 * time.Second
+	maxReconnectDelay                         = 5 * time.Minute
 )
 
 var (
@@ -1590,11 +1591,25 @@ func isReceiveAuthProbeDue(receiveCtx context.Context, nextProbeAt time.Time) bo
 	return errors.Is(context.Cause(receiveCtx), errReceiveAuthProbeDue) || !receiveAuthProbeNow().Before(nextProbeAt)
 }
 
-func waitForSSEReconnect(ctx context.Context) bool {
-	if sseReconnectDelay <= 0 {
+type reconnectBackoff struct {
+	delay time.Duration
+}
+
+func (b *reconnectBackoff) next() time.Duration {
+	b.delay = min(max(b.delay*2, sseReconnectDelay), maxReconnectDelay)
+	half := b.delay / 2
+	return half + rand.N(half+1)
+}
+
+func (b *reconnectBackoff) reset() {
+	b.delay = 0
+}
+
+func waitForSSEReconnect(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
 		return ctx.Err() == nil
 	}
-	timer := time.NewTimer(sseReconnectDelay)
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -1639,7 +1654,9 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	}
 
 	sseDisconnected := false
+	var backoff reconnectBackoff
 	handler := func(eventType, data string) {
+		backoff.reset()
 		if sseDisconnected && lc.sendSSEConnectedIfCurrent(ctx) {
 			sseDisconnected = false
 		}
@@ -1728,21 +1745,14 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 					if probeAndReschedule() {
 						return
 					}
-					if !waitForSSEReconnect(receiveCtx) {
-						continue
-					}
-					continue
+				} else if line.IsAuthError(err) && lc.handleReceiveAuthError(ctx, client, err) {
+					return
 				}
-
-				if line.IsAuthError(err) {
-					if lc.handleReceiveAuthError(ctx, client, err) {
-						return
-					}
-				} else if !sseDisconnected && lc.sendSSEDisconnectedIfCurrent(ctx, err) {
+				if !sseDisconnected && lc.sendSSEDisconnectedIfCurrent(ctx, err) {
 					sseDisconnected = true
 				}
 			}
-			if !waitForSSEReconnect(receiveCtx) {
+			if !waitForSSEReconnect(receiveCtx, backoff.next()) {
 				continue
 			}
 		}
@@ -1775,7 +1785,7 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 		return lc.handleReceiveAuthError(ctx, probeClient, probeErr)
 	}
 
-	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, probeClient, probeErr)
+	recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, probeClient, probeErr)
 	if errRecover != nil {
 		if errors.Is(errRecover, errLineSessionInvalidated) || errors.Is(errRecover, errLineClientSuperseded) || ctx.Err() != nil {
 			return true
@@ -1803,7 +1813,7 @@ func (lc *LineClient) handleReceiveAuthProbe(ctx context.Context) bool {
 // the detailed forced-logout envelope before deciding whether recovery is safe.
 func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *line.Client, err error) bool {
 	if lc.isLoggedOut(err) {
-		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+		recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, failedClient, err)
 		if errRecover != nil {
 			return true
 		}
@@ -1820,7 +1830,7 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *
 		return true
 	}
 	if lc.isLoggedOut(profileErr) {
-		recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, profileClient, profileErr)
+		recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, profileClient, profileErr)
 		if errRecover != nil {
 			return true
 		}
@@ -1830,7 +1840,7 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *
 		return false
 	}
 
-	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+	recoveredClient, errRecover := lc.recoverSessionAfterAuthError(ctx, failedClient, err)
 	if recoveredClient != nil {
 		return false
 	}
@@ -1838,24 +1848,16 @@ func (lc *LineClient) handleReceiveAuthError(ctx context.Context, failedClient *
 		return true
 	}
 
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || lc.isSessionInvalidated() {
 		return true
 	}
 	if errors.Is(errRecover, errLineSessionInvalidated) || errors.Is(errRecover, errLineClientSuperseded) {
 		return true
 	}
 	if lc.UserLogin != nil && lc.UserLogin.Bridge != nil {
-		lc.UserLogin.Bridge.Log.Error().Err(errRecover).Msg("Failed to recover session, stopping poll loop")
+		lc.UserLogin.Bridge.Log.Warn().Err(errRecover).Msg("Failed to recover session, retrying")
 	}
-	if lc.UserLogin != nil && lc.UserLogin.BridgeState != nil {
-		lc.UserLogin.BridgeState.Send(status.BridgeState{
-			StateEvent: status.StateBadCredentials,
-			Error:      "line-logged-out",
-			Message:    "LINE session was invalidated (logged out by another client). Please re-authenticate the bridge.",
-			UserAction: status.UserActionRelogin,
-		})
-	}
-	return true
+	return false
 }
 
 func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
