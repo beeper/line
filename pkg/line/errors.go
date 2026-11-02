@@ -292,6 +292,14 @@ type talkExceptionData struct {
 	Reason  string `json:"reason"`
 }
 
+const (
+	talkExceptionDBFailed         = 2
+	talkExceptionExcessiveAccess  = 4
+	talkExceptionSystemError      = 15
+	talkExceptionInternalError    = 20
+	talkExceptionMaintenanceError = 33
+)
+
 func loginPollingFailure(httpStatus int, body []byte) error {
 	var response struct {
 		Code    *int              `json:"code"`
@@ -352,25 +360,51 @@ func safeLoginPollingReason(reason string) string {
 // IsE2EEGroupMemberMismatch identifies a rejected registration that needs a
 // fresh server member/key snapshot, not a plaintext fallback.
 func IsE2EEGroupMemberMismatch(err error) bool {
-	if err == nil {
+	talk, ok := parseTalkException(err)
+	return ok && talk.Code == 99 && strings.EqualFold(strings.TrimSpace(talk.Reason), "member count mismatch")
+}
+
+// IsTalkExceptionRateLimited returns true when LINE rejected a Talk API call
+// for excessive access.
+func IsTalkExceptionRateLimited(err error) bool {
+	talk, ok := parseTalkException(err)
+	return ok && talk.Code == talkExceptionExcessiveAccess
+}
+
+// IsTalkExceptionServerError returns true when a TalkException reports that
+// LINE failed to handle a Talk API call, rather than rejecting it.
+func IsTalkExceptionServerError(err error) bool {
+	talk, ok := parseTalkException(err)
+	if !ok {
 		return false
+	}
+	switch talk.Code {
+	case talkExceptionDBFailed, talkExceptionSystemError, talkExceptionInternalError, talkExceptionMaintenanceError:
+		return true
+	}
+	return false
+}
+
+func parseTalkException(err error) (talkExceptionData, bool) {
+	if err == nil {
+		return talkExceptionData{}, false
 	}
 	msg := err.Error()
 	start := strings.IndexByte(msg, '{')
 	if start < 0 {
-		return false
+		return talkExceptionData{}, false
 	}
 	var response struct {
 		Code    int               `json:"code"`
 		Message string            `json:"message"`
 		Data    talkExceptionData `json:"data"`
 	}
-	if json.NewDecoder(strings.NewReader(msg[start:])).Decode(&response) != nil {
-		return false
+	if json.NewDecoder(strings.NewReader(msg[start:])).Decode(&response) != nil ||
+		response.Code != 10051 || !strings.EqualFold(response.Message, "RESPONSE_ERROR") ||
+		!strings.EqualFold(response.Data.Name, "TalkException") {
+		return talkExceptionData{}, false
 	}
-	return response.Code == 10051 && strings.EqualFold(response.Message, "RESPONSE_ERROR") &&
-		strings.EqualFold(response.Data.Name, "TalkException") && response.Data.Code == 99 &&
-		strings.EqualFold(strings.TrimSpace(response.Data.Reason), "member count mismatch")
+	return response.Data, true
 }
 
 // IsGroupKeyNotRegisteredError returns true when SendMessage returns code 99

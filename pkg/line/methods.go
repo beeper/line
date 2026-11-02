@@ -427,7 +427,7 @@ func (c *Client) UpdateSettingsAttributes2Context(ctx context.Context, reqSeq in
 	if wrapper.Code != 0 {
 		// Preserve the response data because TalkException details contain the
 		// error code used by connector-level auth recovery.
-		return fmt.Errorf("updateSettingsAttributes2 failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
+		return fmt.Errorf("updateSettingsAttributes2 failed: %s", resp)
 	}
 	return nil
 }
@@ -451,7 +451,7 @@ func (c *Client) React(reqSeq int64, messageID string, reactionType ReactionType
 		return err
 	}
 	if wrapper.Code != 0 {
-		return fmt.Errorf("react failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
+		return fmt.Errorf("react failed: %s", resp)
 	}
 	return nil
 }
@@ -474,7 +474,7 @@ func (c *Client) CancelReaction(reqSeq int64, messageID string) error {
 		return err
 	}
 	if wrapper.Code != 0 {
-		return fmt.Errorf("cancelReaction failed: code %d message %s data %s", wrapper.Code, wrapper.Message, string(wrapper.Data))
+		return fmt.Errorf("cancelReaction failed: %s", resp)
 	}
 	return nil
 }
