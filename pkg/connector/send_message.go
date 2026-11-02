@@ -107,7 +107,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		var err error
 		sticker, err = lc.resolveSticker(ctx, msg.Content)
 		if err != nil {
-			return nil, wrapSendError(err)
+			lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE sticker, sending as image")
 		}
 	}
 

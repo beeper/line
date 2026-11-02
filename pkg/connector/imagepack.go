@@ -171,7 +171,7 @@ func (lc *LineClient) ListImagePacks(ctx context.Context) ([]*event.ImagePackMet
 	return packs, nil
 }
 
-func (lc *LineClient) ownedStickerPack(ctx context.Context, productID string) (*line.ShopProduct, []lineSticker, error) {
+func (lc *LineClient) ownedStickerPack(ctx context.Context, productID string, refreshOnMiss bool) (*line.ShopProduct, []lineSticker, error) {
 	for _, refresh := range []bool{false, true} {
 		products, err := lc.ownedStickerProducts(ctx, refresh)
 		if err != nil {
@@ -180,6 +180,9 @@ func (lc *LineClient) ownedStickerPack(ctx context.Context, productID string) (*
 		if product, ok := products[productID]; ok {
 			stickers, err := productStickers(product)
 			return &product, stickers, err
+		}
+		if !refreshOnMiss {
+			break
 		}
 	}
 	return nil, nil, fmt.Errorf("LINE sticker pack is not owned")
@@ -254,7 +257,7 @@ func (lc *LineClient) DownloadImagePack(ctx context.Context, rawURL string) (*br
 	if err != nil {
 		return nil, err
 	}
-	product, stickers, err := lc.ownedStickerPack(ctx, productID)
+	product, stickers, err := lc.ownedStickerPack(ctx, productID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +298,7 @@ func (lc *LineClient) resolveSticker(ctx context.Context, content *event.Message
 	if err != nil {
 		return nil, err
 	}
-	_, stickers, err := lc.ownedStickerPack(ctx, productID)
+	_, stickers, err := lc.ownedStickerPack(ctx, productID, false)
 	if err != nil {
 		return nil, err
 	}
