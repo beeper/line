@@ -28,18 +28,17 @@ type StickerSummary struct {
 func (c *Client) GetOwnedStickerProducts(ctx context.Context, country string) ([]ShopProduct, error) {
 	const pageSize, maxProducts = 1000, 100000
 	var products []ShopProduct
-	for offset := 0; offset < maxProducts; {
+	for len(products) < maxProducts {
 		resp, err := c.callRPCWithBaseURLContext(ctx, ShopBaseURL, "ShopService", "getOwnedProductSummaries",
-			"stickershop", offset, pageSize, map[string]string{"language": "en", "country": country})
+			"stickershop", len(products), pageSize, map[string]string{"language": "en", "country": country})
 		if err != nil {
 			return nil, err
 		}
 		var result struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
-			Data    *struct {
+			Data    struct {
 				Products []ShopProduct `json:"productList"`
-				Offset   int           `json:"offset"`
 				Total    int           `json:"totalSize"`
 			} `json:"data"`
 		}
@@ -49,17 +48,9 @@ func (c *Client) GetOwnedStickerProducts(ctx context.Context, country string) ([
 		if result.Code != 0 {
 			return nil, fmt.Errorf("getOwnedProductSummaries failed: code %d: %s", result.Code, result.Message)
 		}
-		data := result.Data
-		if data == nil || data.Offset != offset || data.Total < offset || data.Total > maxProducts {
-			return nil, fmt.Errorf("invalid LINE shop pagination")
-		}
-		products = append(products, data.Products...)
-		offset += len(data.Products)
-		if offset >= data.Total {
+		products = append(products, result.Data.Products...)
+		if len(result.Data.Products) == 0 || len(products) >= result.Data.Total {
 			return products, nil
-		}
-		if len(data.Products) == 0 {
-			return nil, fmt.Errorf("empty LINE shop page before end of catalog")
 		}
 	}
 	return nil, fmt.Errorf("LINE shop catalog exceeded pagination limit")
