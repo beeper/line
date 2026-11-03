@@ -221,6 +221,46 @@ func TestDownloadOBSPreflightsBaseObjectBeforeTID(t *testing.T) {
 	}
 }
 
+func TestDownloadOBSFallsBackFromMissingOriginal(t *testing.T) {
+	var paths []string
+	client := newClientWithCachedOBSToken("line-token")
+	client.OBSClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			paths = append(paths, req.URL.Path)
+			if req.URL.RawQuery != "p=pop-value" {
+				t.Fatalf("query = %q, want OBS pop query", req.URL.RawQuery)
+			}
+			switch len(paths) {
+			case 1:
+				return obsResponse(http.StatusOK, `{"status":"exist","encodeStatus":"done"}`), nil
+			case 2:
+				return obsResponse(http.StatusNotFound, "not found"), nil
+			default:
+				return obsResponse(http.StatusOK, "default-image"), nil
+			}
+		}),
+	}
+
+	data, err := client.DownloadOBSWithSIDOptions(context.Background(), "message-id", "", "m", OBSDownloadOptions{
+		TID:    "original",
+		OBSPop: "pop-value",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "default-image" {
+		t.Fatalf("data = %q, want default-image", data)
+	}
+	want := []string{
+		"/r/talk/m/message-id/object_info.obs",
+		"/r/talk/m/message-id/original",
+		"/r/talk/m/message-id",
+	}
+	if strings.Join(paths, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+}
+
 func TestDownloadOBSEncryptedIncludesTalkMeta(t *testing.T) {
 	var talkMetaHeaders []string
 	client := newClientWithCachedOBSToken("line-token")

@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	gen "github.com/beeper/line/pkg"
 	"github.com/beeper/line/pkg/line/password"
 )
@@ -956,6 +958,10 @@ func (c *Client) downloadOBSWithServiceAndSIDOptions(ctx context.Context, servic
 		if err == nil {
 			var data []byte
 			data, err = c.downloadOBSObject(ctx, obsURL, obsToken, messageID)
+			if opts.TID != "" && HTTPStatusCode(err) == http.StatusNotFound {
+				zerolog.Ctx(ctx).Debug().Msg("Original OBS variant is missing, falling back to the default variant")
+				data, err = c.downloadOBSObject(ctx, objectInfoURL, obsToken, messageID)
+			}
 			if err == nil {
 				return data, nil
 			}
