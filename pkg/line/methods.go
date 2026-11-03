@@ -1,6 +1,7 @@
 package line
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -651,6 +652,64 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 		return nil, fmt.Errorf("getChats failed: %s", wrapper.Message)
 	}
 	return &wrapper.Data, nil
+}
+
+// GetRawChat fetches a chat as it came from getChats, so it can be sent back to
+// updateChat unchanged except for the edited field. Numbers are kept as
+// json.Number so none of them change on the way back.
+func (c *Client) GetRawChat(ctx context.Context, chatMid string) (map[string]any, error) {
+	req := GetChatsRequest{
+		ChatMids:     []string{chatMid},
+		WithMembers:  true,
+		WithInvitees: true,
+	}
+	resp, err := c.callRPCContext(ctx, "TalkService", "getChats", req, 2)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Chats []map[string]any `json:"chats"`
+		} `json:"data"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(resp))
+	dec.UseNumber()
+	if err := dec.Decode(&wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse getChats response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getChats failed: %s", wrapper.Message)
+	}
+	if len(wrapper.Data.Chats) == 0 {
+		return nil, fmt.Errorf("chat not found")
+	}
+	return wrapper.Data.Chats[0], nil
+}
+
+// UpdateChat sends a full chat object (from GetRawChat) back to LINE. The
+// attribute says which field changed, like the Chrome extension does.
+func (c *Client) UpdateChat(ctx context.Context, reqSeq int64, chat map[string]any, attribute ChatAttribute) error {
+	req := UpdateChatRequest{
+		ReqSeq:           reqSeq,
+		Chat:             chat,
+		UpdatedAttribute: attribute,
+	}
+	resp, err := c.callRPCContext(ctx, "TalkService", "updateChat", req)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse updateChat response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("updateChat failed: %s", resp)
+	}
+	return nil
 }
 
 func (c *Client) GetRoomsV2(mids []string) ([]Room, error) {
