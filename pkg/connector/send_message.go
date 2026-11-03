@@ -234,7 +234,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentType = int(ContentText)
 		var sticonMetadata map[string]string
 		textBody, sticonMetadata = outgoingSticons(ctx, msg.Content, func(mxc id.ContentURIString) *lineSticker {
-			sticon, err := lc.resolveSticker(ctx, mxc, nil, true)
+			resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			sticon, err := lc.resolveSticker(resolveCtx, mxc, nil, true)
 			if err != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE emoji, sending alt text")
 			}

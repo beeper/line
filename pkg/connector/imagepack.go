@@ -222,11 +222,32 @@ func (lc *LineClient) packStickers(ctx context.Context, product line.ShopProduct
 	if !lineAssetID.MatchString(product.ID) {
 		return nil, fmt.Errorf("invalid LINE emoji product ID")
 	}
+	version, err := productVersion(product)
+	if err != nil {
+		return nil, err
+	}
+	cacheKey := product.ID + "/" + version
+	lc.sticonPacksMu.Lock()
+	sticons, ok := lc.sticonPacks[cacheKey]
+	lc.sticonPacksMu.Unlock()
+	if ok {
+		return sticons, nil
+	}
 	meta, err := lc.fetchStickerCDN(ctx, "https://stickershop.line-scdn.net/sticonshop/v1/product/"+product.ID+"/android/meta.json")
 	if err != nil {
 		return nil, err
 	}
-	return productSticons(product, meta)
+	sticons, err = productSticons(product, meta)
+	if err != nil {
+		return nil, err
+	}
+	lc.sticonPacksMu.Lock()
+	if lc.sticonPacks == nil || len(lc.sticonPacks) >= 256 {
+		lc.sticonPacks = make(map[string][]lineSticker)
+	}
+	lc.sticonPacks[cacheKey] = sticons
+	lc.sticonPacksMu.Unlock()
+	return sticons, nil
 }
 
 func packMetadata(product line.ShopProduct) *event.ImagePackMetadata {

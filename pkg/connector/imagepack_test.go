@@ -1,7 +1,11 @@
 package connector
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/beeper/line/pkg/line"
@@ -37,6 +41,32 @@ func testSticonProduct(resourceType int) line.ShopProduct {
 	product := line.ShopProduct{ID: "5ac1bfd5040ab15980c9b435", Name: "Moon", LatestVersion: "3", ValidUntil: "-1"}
 	product.ProductTypeSummary.Sticon = &line.SticonSummary{ResourceType: resourceType}
 	return product
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestPackStickersCachesSticonMeta(t *testing.T) {
+	var fetches []string
+	lc := &LineClient{HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		fetches = append(fetches, req.URL.String())
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"orders":["001"]}`))}, nil
+	})}}
+	product := testSticonProduct(1)
+	for range 2 {
+		sticons, err := lc.packStickers(context.Background(), product)
+		if err != nil || len(sticons) != 1 || sticons[0].ID != "001" {
+			t.Fatalf("packStickers = %+v, %v", sticons, err)
+		}
+	}
+	if len(fetches) != 1 || fetches[0] != "https://stickershop.line-scdn.net/sticonshop/v1/product/5ac1bfd5040ab15980c9b435/android/meta.json" {
+		t.Fatalf("meta.json fetches = %v", fetches)
+	}
+	product.LatestVersion = "4"
+	if _, err := lc.packStickers(context.Background(), product); err != nil || len(fetches) != 2 {
+		t.Fatalf("new version fetches = %v, %v", fetches, err)
+	}
 }
 
 func TestProductSticons(t *testing.T) {
