@@ -117,12 +117,14 @@ func (lc *LineClient) ownedStickerProducts(ctx context.Context, refresh bool) (m
 		return nil, fmt.Errorf("LINE profile has no shop region")
 	}
 	packs := make(map[string]line.ShopProduct)
+	partial := false
 	for _, shop := range []string{line.StickerShop, line.SticonShop} {
 		_, products, err := callLineResult(lc, ctx, func(client *line.Client) ([]line.ShopProduct, error) {
 			return client.GetOwnedProducts(ctx, shop, profile.RegionCode)
 		})
 		if err != nil && shop == line.SticonShop {
 			lc.UserLogin.Log.Warn().Err(err).Msg("Failed to fetch owned LINE emoji packs")
+			partial = true
 		} else if err != nil {
 			return nil, err
 		}
@@ -132,6 +134,7 @@ func (lc *LineClient) ownedStickerProducts(ctx context.Context, refresh bool) (m
 	}
 	lc.stickerPacksMu.Lock()
 	lc.stickerPacks = packs
+	lc.stickerPacksPartial = partial
 	lc.stickerPacksMu.Unlock()
 	return packs, nil
 }
@@ -286,7 +289,10 @@ func (lc *LineClient) ownedStickerPack(ctx context.Context, packURL string, refr
 			stickers, err := lc.packStickers(ctx, product)
 			return &product, stickers, err
 		}
-		if !refreshOnMiss {
+		lc.stickerPacksMu.Lock()
+		partial := lc.stickerPacksPartial
+		lc.stickerPacksMu.Unlock()
+		if !refreshOnMiss && !partial {
 			break
 		}
 	}

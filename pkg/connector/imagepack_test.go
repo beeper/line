@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
+
 	"github.com/beeper/line/pkg/line"
 )
 
@@ -66,6 +69,44 @@ func TestPackStickersCachesSticonMeta(t *testing.T) {
 	product.LatestVersion = "4"
 	if _, err := lc.packStickers(context.Background(), product); err != nil || len(fetches) != 2 {
 		t.Fatalf("new version fetches = %v, %v", fetches, err)
+	}
+}
+
+func TestOwnedStickerPackRetriesFailedEmojiShop(t *testing.T) {
+	oldNewClient := newLineAPIClient
+	t.Cleanup(func() { newLineAPIClient = oldNewClient })
+	emojiCalls := 0
+	newLineAPIClient = func(token string) *line.Client {
+		client := line.NewClient(token)
+		client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(req.Body)
+			resp := `{"code":0,"data":{"regionCode":"JP"}}`
+			switch {
+			case strings.Contains(string(body), `"stickershop"`):
+				resp = `{"code":0,"data":{"totalSize":0,"productList":[]}}`
+			case strings.Contains(string(body), `"sticonshop"`):
+				emojiCalls++
+				resp = `{"code":1,"message":"unavailable"}`
+				if emojiCalls > 1 {
+					resp = `{"code":0,"data":{"totalSize":1,"productList":[{"id":"5ac1bfd5040ab15980c9b435","latestVersion":3,"validUntil":-1,"productTypeSummary":{"sticonSummary":{"sticonResourceType":1}}}]}}`
+				}
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(resp))}, nil
+		})}
+		return client
+	}
+	lc := &LineClient{
+		UserLogin: &bridgev2.UserLogin{Log: zerolog.Nop()},
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"orders":["001"]}`))}, nil
+		})},
+	}
+	_, sticons, err := lc.ownedStickerPack(context.Background(), linePackURL("5ac1bfd5040ab15980c9b435", true), false)
+	if err != nil || len(sticons) != 1 || emojiCalls != 2 {
+		t.Fatalf("ownedStickerPack = %+v, %v, emoji shop calls = %d", sticons, err, emojiCalls)
+	}
+	if _, _, err = lc.ownedStickerPack(context.Background(), linePackURL("123", false), false); err == nil || emojiCalls != 2 {
+		t.Fatalf("complete cache miss = %v, emoji shop calls = %d", err, emojiCalls)
 	}
 }
 
