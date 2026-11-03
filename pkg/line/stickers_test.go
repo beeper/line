@@ -60,7 +60,7 @@ func TestGetOwnedStickerProductsPaging(t *testing.T) {
 				}
 				return obsResponse(http.StatusOK, tt.pages[len(offsets)-1]), nil
 			})}
-			products, err := client.GetOwnedStickerProducts(context.Background(), "JP")
+			products, err := client.GetOwnedProducts(context.Background(), StickerShop, "JP")
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}

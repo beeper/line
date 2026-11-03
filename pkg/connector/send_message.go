@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"maps"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	gen "github.com/beeper/line/pkg"
 	"github.com/beeper/line/pkg/e2ee"
@@ -104,8 +106,12 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 	var sticker *lineSticker
 	if msg.Content.MsgType == event.CapMsgSticker {
+		var bridged *event.BridgedSticker
+		if msg.Content.Info != nil {
+			bridged = msg.Content.Info.BridgedSticker
+		}
 		var err error
-		sticker, err = lc.resolveSticker(ctx, msg.Content)
+		sticker, err = lc.resolveSticker(ctx, msg.Content.URL, bridged, false)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE sticker, sending as image")
 		}
@@ -194,6 +200,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// For plain text, we set lineMsg.Text directly; payload is used only for E2EE.
 	var payload []byte
 	var plainTextBody string // used when plainText == true for text messages
+	textBody := msg.Content.Body
 
 	// For plain media: we send the message first, then upload media to r/talk/m/{msgId}.
 	var plainMediaData []byte // raw media data to upload after sending
@@ -225,10 +232,23 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	case event.MsgText:
 		contentType = int(ContentText)
+		var sticonMetadata map[string]string
+		textBody, sticonMetadata = outgoingSticons(ctx, msg.Content, func(mxc id.ContentURIString) *lineSticker {
+			sticon, err := lc.resolveSticker(ctx, mxc, nil, true)
+			if err != nil {
+				lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE emoji, sending alt text")
+			}
+			return sticon
+		})
+		maps.Copy(contentMetadata, sticonMetadata)
 		if plainText {
-			plainTextBody = msg.Content.Body
+			plainTextBody = textBody
 		} else {
-			payload, err = json.Marshal(map[string]string{"text": msg.Content.Body})
+			textPayload := map[string]any{"text": textBody}
+			if replace := sticonMetadata["REPLACE"]; replace != "" {
+				textPayload["REPLACE"] = json.RawMessage(replace)
+			}
+			payload, err = json.Marshal(textPayload)
 			if err != nil {
 				return nil, wrapConvertError(fmt.Errorf("failed to marshal text payload: %w", err))
 			}
@@ -634,7 +654,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			msg.Content.Mentions.Room = true
 		}
 	}
-	mentionMeta := lc.buildMentionMetadata(ctx, msg.Content.Body, msg.Content.FormattedBody, msg.Content.Mentions)
+	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, msg.Content.Mentions)
 	for k, v := range mentionMeta {
 		contentMetadata[k] = v
 	}
@@ -651,21 +671,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					return nil, errFetch
 				}
 			}
-			if contentType != int(ContentText) {
-				chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
-			} else {
-				chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
-			}
+			chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 			if err != nil {
 				if isTerminalCryptoError(err) {
 					return nil, err
 				}
 				if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch == nil {
-					if contentType != int(ContentText) {
-						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
-					} else {
-						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
-					}
+					chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 				} else if isTerminalCryptoError(errFetch) {
 					return nil, errFetch
 				} else if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
@@ -684,7 +696,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					err = nil
 					delete(contentMetadata, "e2eeVersion")
 					if contentType == int(ContentText) {
-						plainTextBody = msg.Content.Body
+						plainTextBody = textBody
 					} else {
 						delete(contentMetadata, "OID")
 						delete(contentMetadata, "SID")
@@ -717,6 +729,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		lc.UserLogin.Bridge.Log.Info().Str("portal", portalMid).Int("content_type", contentType).Msg("Sending plain text message (no E2EE)")
 	}
 
+	if !plainText {
+		delete(contentMetadata, "REPLACE")
+	}
 	now := time.Now().UnixMilli()
 	lineMsg := &line.Message{
 		ID:              fmt.Sprintf("local-%d", now),
@@ -845,11 +860,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Msg("autoRegisterGroupKey succeeded, retrying send")
 			if !plainText && lc.E2EE != nil {
 				if fetchErr := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); fetchErr == nil {
-					if contentType != int(ContentText) {
-						chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
-					} else {
-						chunks, err = lc.E2EE.EncryptGroupMessage(portalMid, fromMid, msg.Content.Body)
-					}
+					chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 					if err == nil {
 						lineMsg.Chunks = chunks
 						contentMetadata["e2eeVersion"] = strconv.Itoa(e2ee.ChunksVersion(chunks))
