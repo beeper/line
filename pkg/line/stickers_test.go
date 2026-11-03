@@ -23,15 +23,24 @@ func TestGetOwnedStickerProductsPaging(t *testing.T) {
 		}
 		return fmt.Sprintf(`{"code":0,"data":{"offset":0%s,"productList":[%s]}}`, totalField, strings.Join(products, ","))
 	}
+	fullPage := make([]string, 1000)
+	for i := range fullPage {
+		fullPage[i] = fmt.Sprint(i)
+	}
 	tests := []struct {
 		name        string
 		pages       []string
 		wantIDs     []string
 		wantOffsets []int
+		wantErr     bool
 	}{
-		{"ignores echoed offset and short pages", []string{page(3, "1", "2"), page(3, "3")}, []string{"1", "2", "3"}, []int{0, 2}},
-		{"stops on empty page", []string{page(5, "1", "2"), page(5)}, []string{"1", "2"}, []int{0, 2}},
-		{"missing total", []string{page(-1, "1")}, []string{"1"}, []int{0}},
+		{"ignores echoed offset and short pages", []string{page(3, "1", "2"), page(3, "3")}, []string{"1", "2", "3"}, []int{0, 2}, false},
+		{"errors on empty page before total", []string{page(5, "1", "2"), page(5)}, nil, []int{0, 2}, true},
+		{"errors on null data", []string{`{"code":0,"data":null}`}, nil, []int{0}, true},
+		{"missing total", []string{page(-1, "1")}, []string{"1"}, []int{0}, false},
+		{"zero total stops on empty page", []string{page(0)}, nil, []int{0}, false},
+		{"missing total pages until short page", []string{page(-1, fullPage...), page(-1, "1000")}, append(slices.Clone(fullPage), "1000"), []int{0, 1000}, false},
+		{"zero total pages until empty page", []string{page(0, fullPage...), page(0)}, fullPage, []int{0, 1000}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -52,8 +61,8 @@ func TestGetOwnedStickerProductsPaging(t *testing.T) {
 				return obsResponse(http.StatusOK, tt.pages[len(offsets)-1]), nil
 			})}
 			products, err := client.GetOwnedStickerProducts(context.Background(), "JP")
-			if err != nil {
-				t.Fatal(err)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}
 			var ids []string
 			for _, product := range products {

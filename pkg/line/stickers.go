@@ -37,7 +37,7 @@ func (c *Client) GetOwnedStickerProducts(ctx context.Context, country string) ([
 		var result struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
-			Data    struct {
+			Data    *struct {
 				Products []ShopProduct `json:"productList"`
 				Total    int           `json:"totalSize"`
 			} `json:"data"`
@@ -47,9 +47,18 @@ func (c *Client) GetOwnedStickerProducts(ctx context.Context, country string) ([
 		}
 		if result.Code != 0 {
 			return nil, fmt.Errorf("getOwnedProductSummaries failed: code %d: %s", result.Code, result.Message)
+		} else if result.Data == nil {
+			return nil, fmt.Errorf("getOwnedProductSummaries returned no data")
 		}
-		products = append(products, result.Data.Products...)
-		if len(result.Data.Products) == 0 || len(products) >= result.Data.Total {
+		page := result.Data.Products
+		products = append(products, page...)
+		if result.Data.Total > 0 {
+			if len(products) >= result.Data.Total {
+				return products, nil
+			} else if len(page) == 0 {
+				return nil, fmt.Errorf("getOwnedProductSummaries returned empty page at %d of %d products", len(products), result.Data.Total)
+			}
+		} else if len(page) < pageSize {
 			return products, nil
 		}
 	}
