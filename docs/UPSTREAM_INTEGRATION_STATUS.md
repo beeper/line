@@ -1,5 +1,19 @@
 # Upstream integration status
 
+## Reviewer update (2026-11-02)
+
+PR [#297](https://github.com/beeper/line/pull/297) is published. It now has a
+[before/after comparison](PR297_BEFORE_AFTER.md), a
+[reproducible test/evidence matrix](PR297_TEST_MATRIX.md), and a
+[blast-radius/split assessment](PR297_BLAST_RADIUS.md). These supersede the
+publication/CI status recorded below. Upstream main advanced to `10e0a5f`;
+the PR is conflicting in `pkg/connector/client.go` and has no reported GitHub
+checks. No runtime conflict resolution was performed in this documentation update.
+
+The sections below retain the historical integration and validation record;
+the earlier CLI authentication blocker was subsequently resolved using the
+normal user configuration. They are not a claim of current-main compatibility.
+
 ## Verified sources
 
 - Current upstream baseline fetched from `origin/main`: `45a48b9b3b57330d99d326d443f9a9fc8725a48f`.
