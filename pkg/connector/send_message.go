@@ -35,6 +35,11 @@ type mentionEntry struct {
 
 var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
+var lineMediaSizeLimits = map[event.MessageType]int{
+	event.MsgImage: 20 * 1024 * 1024,
+	event.MsgAudio: 30 * 1024 * 1024,
+}
+
 const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
 
 func isTerminalCryptoError(err error) bool {
@@ -110,10 +115,21 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if !isGroup && lc.isUserBlocked(portalMid) {
 		return nil, errBlockedContact
 	}
+	var sticker *lineSticker
+	if msg.Content.MsgType == event.CapMsgSticker {
+		var err error
+		sticker, err = lc.resolveSticker(ctx, msg.Content)
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE sticker, sending as image")
+		}
+	}
 
 	// Determine whether we need to send as plain text (peer/group has Letter Sealing off).
 	plainText := false
-	if lc.E2EE == nil {
+	if sticker != nil {
+		// LINE sends native stickers as metadata without an encrypted payload.
+		plainText = true
+	} else if lc.E2EE == nil {
 		plainText = true
 		lc.UserLogin.Bridge.Log.Warn().Msg("E2EE not initialized, sending as plain text")
 	} else if isGroup {
@@ -142,7 +158,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
 	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
 	effectiveMsgType := msg.Content.MsgType
-	if effectiveMsgType == event.CapMsgSticker {
+	if effectiveMsgType == event.CapMsgSticker && sticker == nil {
 		effectiveMsgType = event.MsgImage
 	} else if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
 		mime := msg.Content.Info.MimeType
@@ -152,6 +168,23 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			effectiveMsgType = event.MsgVideo
 		} else if strings.HasPrefix(mime, "image/") {
 			effectiveMsgType = event.MsgImage
+		}
+	}
+
+	var mediaData []byte
+	switch effectiveMsgType {
+	case event.MsgImage, event.MsgFile, event.MsgVideo, event.MsgAudio:
+		mediaData, err = lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
+		}
+		if sizeLimit, ok := lineMediaSizeLimits[effectiveMsgType]; ok && len(mediaData) > sizeLimit {
+			lc.UserLogin.Bridge.Log.Info().
+				Str("msg_type", string(effectiveMsgType)).
+				Int("size", len(mediaData)).
+				Int("limit", sizeLimit).
+				Msg("Media exceeds LINE's limit for its type, sending as a file")
+			effectiveMsgType = event.MsgFile
 		}
 	}
 
@@ -189,6 +222,20 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var rawFileName string
 
 	switch effectiveMsgType {
+	case event.CapMsgSticker:
+		contentType = int(ContentSticker)
+		contentMetadata = map[string]string{
+			"STKPKGID": sticker.ProductID,
+			"STKID":    sticker.ID,
+			"STKVER":   sticker.Version,
+			"STKTXT":   sticker.Body,
+		}
+		if sticker.Option != "" {
+			contentMetadata["STKOPT"] = sticker.Option
+		}
+		if sticker.Hash != "" {
+			contentMetadata["STKHASH"] = sticker.Hash
+		}
 	case event.MsgText:
 		contentType = int(ContentText)
 		if plainText {
@@ -201,10 +248,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgImage:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		mimeType := msg.Content.Info.MimeType
 		fileName := msg.Content.GetFileName()
@@ -344,10 +388,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgFile:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		contentType = int(ContentFile)
 
@@ -409,10 +450,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgVideo:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		contentType = int(ContentVideo)
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
@@ -540,10 +578,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 
 	case event.MsgAudio:
-		data, err := lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-		}
+		data := mediaData
 
 		var mimeType string
 		if msg.Content.Info != nil {

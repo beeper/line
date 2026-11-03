@@ -2,7 +2,10 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 
 	"github.com/beeper/line/pkg/line"
 )
@@ -63,6 +66,27 @@ func callLineWithRecovery[T any](ctx context.Context, client *line.Client, deps 
 		_, _ = deps.recover(ctx, client, err)
 	}
 	return client, res, err
+}
+
+func isTransientLineError(err error) bool {
+	// An unanswered PIN prompt times out like a network request, but retrying
+	// would only send the user another prompt.
+	if errors.Is(err, errLinePINNotVerified) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	statusCode := line.HTTPStatusCode(err)
+	return statusCode >= http.StatusInternalServerError || statusCode == http.StatusTooManyRequests
+}
+
+func isRecoveryRejected(err error) bool {
+	return !isTransientLineError(err) &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, errLineSessionInvalidated) &&
+		!errors.Is(err, errLineClientSuperseded)
 }
 
 func (lc *LineClient) isTokenError(err error) bool {
@@ -151,6 +175,15 @@ func (lc *LineClient) recoverClientAfterAuthError(ctx context.Context, failedCli
 		return nil, errLineSessionInvalidated
 	}
 	return lc.newClient(), nil
+}
+
+func (lc *LineClient) recoverSessionAfterAuthError(ctx context.Context, failedClient *line.Client, err error) (*line.Client, error) {
+	recoveryToken := lc.getAccessToken()
+	recoveredClient, errRecover := lc.recoverClientAfterAuthError(ctx, failedClient, err)
+	if errRecover != nil && ctx.Err() == nil && isRecoveryRejected(errRecover) {
+		lc.markRecoveryRejected(ctx, recoveryToken, errRecover)
+	}
+	return recoveredClient, errRecover
 }
 
 func (lc *LineClient) callLine(ctx context.Context, call func(*line.Client) error) (*line.Client, error) {

@@ -63,7 +63,7 @@ func (lc *LineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities 
 	return &bridgev2.NetworkGeneralCapabilities{
 		AggressiveUpdateInfo: true,
 		Provisioning: bridgev2.ProvisioningCapabilities{
-			ImagePackImport: false,
+			ImagePackImport: true,
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
 				Search:      true,
 				ContactList: true,
@@ -133,6 +133,7 @@ type UserLoginMetadata struct {
 	AccessToken        string            `json:"access_token"`
 	RefreshToken       string            `json:"refresh_token,omitempty"`
 	SessionInvalidated bool              `json:"session_invalidated,omitempty"`
+	SessionExpired     bool              `json:"session_expired,omitempty"`
 	Email              string            `json:"email,omitempty"`
 	Password           string            `json:"password,omitempty"`
 	Certificate        string            `json:"certificate,omitempty"`
