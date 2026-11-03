@@ -65,6 +65,9 @@ type LineClient struct {
 	stickerPacksMu       sync.Mutex
 	stickerPacksFetching chan struct{}
 	stickerPacks         map[string]line.ShopProduct
+	stickerPacksPartial  bool
+	sticonPacksMu        sync.Mutex
+	sticonPacks          map[string][]lineSticker
 
 	UserLogin    *bridgev2.UserLogin
 	AccessToken  string

@@ -6,6 +6,11 @@ import (
 	"fmt"
 )
 
+const (
+	StickerShop = "stickershop"
+	SticonShop  = "sticonshop"
+)
+
 type ShopProduct struct {
 	ID                 string      `json:"id"`
 	Name               string      `json:"name"`
@@ -13,7 +18,12 @@ type ShopProduct struct {
 	ValidUntil         json.Number `json:"validUntil"`
 	ProductTypeSummary struct {
 		Sticker *StickerSummary `json:"stickerSummary"`
+		Sticon  *SticonSummary  `json:"sticonSummary"`
 	} `json:"productTypeSummary"`
+}
+
+type SticonSummary struct {
+	ResourceType int `json:"sticonResourceType"`
 }
 
 type StickerSummary struct {
@@ -25,12 +35,12 @@ type StickerSummary struct {
 	} `json:"stickerIdRanges"`
 }
 
-func (c *Client) GetOwnedStickerProducts(ctx context.Context, country string) ([]ShopProduct, error) {
+func (c *Client) GetOwnedProducts(ctx context.Context, shop, country string) ([]ShopProduct, error) {
 	const pageSize, maxProducts = 1000, 100000
 	var products []ShopProduct
 	for len(products) < maxProducts {
 		resp, err := c.callRPCWithBaseURLContext(ctx, ShopBaseURL, "ShopService", "getOwnedProductSummaries",
-			"stickershop", len(products), pageSize, map[string]string{"language": "en", "country": country})
+			shop, len(products), pageSize, map[string]string{"language": "en", "country": country})
 		if err != nil {
 			return nil, err
 		}
