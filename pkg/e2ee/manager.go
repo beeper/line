@@ -250,42 +250,17 @@ func (m *Manager) LoadMyKeyFromExportedMap(exported map[string]string) error {
 	return m.LoadMyKeyFromSecureData(map[string]any{"exportedKeyMap": raw})
 }
 
-func (m *Manager) DecryptSecureBlob(b64Cipher string) (map[string]any, error) {
-	pt, err := m.runner.StorageDecrypt(b64Cipher)
-	if err != nil {
-		return nil, err
+// RemoveSecureDataFile deletes a key file that an older bridge version wrote.
+// A missing file or an empty id is not an error.
+func RemoveSecureDataFile(id string) error {
+	if id == "" {
+		return nil
 	}
-	var out map[string]any
-	if err := json.Unmarshal([]byte(pt), &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (m *Manager) EncryptSecureBlob(data map[string]any) (string, error) {
-	buf, err := json.Marshal(data)
-	if err != nil {
-		return "", err
-	}
-	return m.runner.StorageEncrypt(string(buf))
-}
-
-func (m *Manager) LoadSecureDataFromFile(id string) (map[string]any, error) {
 	path := filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return m.DecryptSecureBlob(strings.TrimSpace(string(b)))
-}
-
-func (m *Manager) SaveSecureDataToFile(id string, data map[string]any) error {
-	ct, err := m.EncryptSecureBlob(data)
-	if err != nil {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	path := filepath.Join("data", fmt.Sprintf("lcs_secure_%s.json", id))
-	return os.WriteFile(path, []byte(ct), 0o600)
+	return nil
 }
 
 func (m *Manager) InitFromLoginKeyChain(serverPubB64, encryptedKeyChainB64 string) (map[string]string, error) {

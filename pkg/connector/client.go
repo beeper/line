@@ -245,6 +245,30 @@ func (lc *LineClient) claimForcedLogoutState() bool {
 	return true
 }
 
+// loadConnectE2EEKeys loads the user's E2EE keys from the login metadata.
+// Older bridge versions also tried to save the keys to a file. Delete any file
+// that is left, because the keys in the metadata replace it.
+func (lc *LineClient) loadConnectE2EEKeys(mgr *e2ee.Manager) {
+	log := lc.UserLogin.Bridge.Log
+	meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok {
+		return
+	}
+	for _, id := range []string{meta.Mid, string(lc.UserLogin.ID), lc.UserLogin.UserMXID.String()} {
+		if err := e2ee.RemoveSecureDataFile(id); err != nil {
+			log.Warn().Err(err).Msg("Failed to delete old E2EE key file")
+		}
+	}
+	if len(meta.ExportedKeyMap) == 0 {
+		return
+	}
+	if err := mgr.LoadMyKeyFromExportedMap(meta.ExportedKeyMap); err != nil {
+		log.Warn().Err(err).Msg("Failed to load E2EE key from DB metadata")
+		return
+	}
+	log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
+}
+
 func (lc *LineClient) newClient() *line.Client {
 	return lc.newClientWithToken(lc.getAccessToken())
 }
@@ -783,29 +807,7 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to init E2EE manager")
 	} else {
 		lc.E2EE = mgr
-		// Storage key is optional for runtime decrypt/encrypt; try it for file support
-		client := lc.newClient()
-		ei3, err := client.GetEncryptedIdentityV3()
-		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch EncryptedIdentityV3")
-		} else {
-			if err := mgr.InitStorage(ei3.WrappedNonce, ei3.KDFParameter1, ei3.KDFParameter2); err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to init storage key")
-			} else if data, err := mgr.LoadSecureDataFromFile(string(lc.UserLogin.ID)); err == nil {
-				if err := mgr.LoadMyKeyFromSecureData(data); err != nil {
-					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to load E2EE key from secure data")
-				}
-			}
-		}
-		// DB metadata reflects the latest login, even if writing the secure file failed.
-		// Load it last so an older file cannot replace the freshly verified key.
-		if meta, ok := lc.UserLogin.Metadata.(*UserLoginMetadata); ok && len(meta.ExportedKeyMap) > 0 {
-			if err := mgr.LoadMyKeyFromExportedMap(meta.ExportedKeyMap); err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to load E2EE key from DB metadata")
-			} else {
-				lc.UserLogin.Bridge.Log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
-			}
-		}
+		lc.loadConnectE2EEKeys(mgr)
 	}
 
 	// Seed the last-known block list before fetching a fresh copy, so a
@@ -1019,12 +1021,6 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	if mgr != nil {
 		lc.missingE2EEKeyMarked = false
 	}
-	if mgr != nil {
-		if err := mgr.SaveSecureDataToFile(loginSecureDataID(&staged, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save E2EE secure data after re-login")
-		}
-	}
-
 	lc.UserLogin.Bridge.Log.Info().Msg("Login successful!")
 	return nil
 }
@@ -1078,9 +1074,6 @@ func (lc *LineClient) refreshLoginE2EEKeys(res *line.LoginResult, meta *UserLogi
 		return errLineClientSuperseded
 	}
 	lc.applyRefreshedLoginE2EEKeys(meta, res, exported)
-	if err := mgr.SaveSecureDataToFile(loginSecureDataID(meta, string(lc.UserLogin.ID)), map[string]any{"exportedKeyMap": exported}); err != nil {
-		return fmt.Errorf("save E2EE secure data after re-login: %w", err)
-	}
 	lc.UserLogin.Bridge.Log.Info().Int("keys", len(exported)).Msg("Refreshed E2EE keys after re-login")
 	return nil
 }
