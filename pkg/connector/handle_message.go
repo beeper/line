@@ -394,6 +394,15 @@ func isLineDecryptFallbackText(text string) bool {
 // ConvertedMessage. bodyText/unwrappedText are the (decrypted) message text as
 // returned by decryptMessageBody. Shared by the live message path and backfill.
 func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, bodyText, unwrappedText string, decryptionFailed bool) (*bridgev2.ConvertedMessage, error) {
+	converted, err := lc.convertLineMessageContent(ctx, portal, intent, data, bodyText, unwrappedText, decryptionFailed)
+	if err != nil {
+		return nil, err
+	}
+	lc.cutOffLongMessage(ctx, converted, ContentType(data.ContentType))
+	return converted, nil
+}
+
+func (lc *LineClient) convertLineMessageContent(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data line.Message, bodyText, unwrappedText string, decryptionFailed bool) (*bridgev2.ConvertedMessage, error) {
 	decryptedBody := bodyText
 	replyRelatesTo := lc.resolveReplyRelatesTo(ctx, &data)
 
