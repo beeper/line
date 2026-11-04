@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -13,9 +14,8 @@ import (
 )
 
 const (
-	maxMatrixTextBytes     = 40000
+	maxEncodedContentBytes = 40000
 	maxFallbackBodyBytes   = 500
-	longFormattedBodyBytes = 20000
 	longMessageCutOffText  = "\n\n[long message cut off]"
 	longMessageCutOffHTML  = "<br><em>[long message cut off]</em>"
 )
@@ -32,47 +32,66 @@ func (lc *LineClient) cutOffLongMessage(ctx context.Context, converted *bridgev2
 		if part == nil || part.Content == nil {
 			continue
 		}
-		before := textContentSize(part.Content)
-		if !cutOffLongContent(part.Content, isGhost) {
+		before := encodedContentSize(part.Content)
+		if before <= maxEncodedContentBytes {
 			continue
 		}
+		cutOffLongContent(part.Content, isGhost)
 		zerolog.Ctx(ctx).Warn().
 			Int("content_type", int(contentType)).
 			Int("part_index", i).
 			Int("size_before", before).
-			Int("size_after", textContentSize(part.Content)).
+			Int("size_after", encodedContentSize(part.Content)).
 			Msg("Cut off long LINE message to fit in a Matrix event")
 	}
 }
 
-func textContentSize(content *event.MessageEventContent) int {
-	size := len(content.Body) + len(content.FormattedBody)
-	if content.Mentions != nil {
-		for _, userID := range content.Mentions.UserIDs {
-			size += len(userID)
-		}
+func encodedContentSize(content *event.MessageEventContent) int {
+	data, err := json.Marshal(content)
+	if err != nil {
+		return len(content.Body) + len(content.FormattedBody)
 	}
-	return size
+	return len(data)
 }
 
-func cutOffLongContent(content *event.MessageEventContent, isGhost func(id.UserID) bool) bool {
-	if textContentSize(content) <= maxMatrixTextBytes {
-		return false
-	}
+func cutOffLongContent(content *event.MessageEventContent, isGhost func(id.UserID) bool) {
 	if content.Mentions != nil && isGhost != nil {
 		content.Mentions.UserIDs = slices.DeleteFunc(content.Mentions.UserIDs, isGhost)
-	}
-	if content.FormattedBody == "" {
-		if len(content.Body) > maxMatrixTextBytes {
-			content.Body = truncateUTF8(content.Body, maxMatrixTextBytes) + longMessageCutOffText
+		if encodedContentSize(content) <= maxEncodedContentBytes {
+			return
 		}
-	} else if len(content.FormattedBody) > longFormattedBodyBytes && len(content.Body) > maxFallbackBodyBytes {
+	}
+	if content.FormattedBody != "" && len(content.Body) > maxFallbackBodyBytes {
 		content.Body = truncateUTF8(content.Body, maxFallbackBodyBytes) + "[...]"
+		if encodedContentSize(content) <= maxEncodedContentBytes {
+			return
+		}
 	}
-	if len(content.FormattedBody) > maxMatrixTextBytes {
-		content.FormattedBody = truncateHTML(content.FormattedBody, maxMatrixTextBytes) + longMessageCutOffHTML
+	if content.FormattedBody != "" {
+		shrinkToFit(content, &content.FormattedBody, longMessageCutOffHTML, truncateHTML)
+		if encodedContentSize(content) <= maxEncodedContentBytes {
+			return
+		}
 	}
-	return true
+	shrinkToFit(content, &content.Body, longMessageCutOffText, truncateUTF8)
+}
+
+func shrinkToFit(content *event.MessageEventContent, field *string, marker string, truncate func(string, int) string) {
+	original := *field
+	fits := func(n int) bool {
+		*field = truncate(original, n) + marker
+		return encodedContentSize(content) <= maxEncodedContentBytes
+	}
+	lo, hi := 0, len(original)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if fits(mid) {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	*field = truncate(original, lo) + marker
 }
 
 func truncateUTF8(s string, maxBytes int) string {
