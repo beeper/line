@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -11,18 +12,23 @@ import (
 )
 
 type LineQRLogin struct {
-	login   *LineEmailLogin
-	client  *line.Client
-	session string
-	qr      *line.QRCodeResponse
-	poll    chan error
-	pin     bool
+	operationMu sync.Mutex
+	login       *LineEmailLogin
+	client      *line.Client
+	session     string
+	qr          *line.QRCodeResponse
+	poll        chan error
+	pin         bool
 }
 
 var _ bridgev2.LoginProcessDisplayAndWait = (*LineQRLogin)(nil)
 var _ bridgev2.LoginProcessWithOverride = (*LineQRLogin)(nil)
 
 func (lq *LineQRLogin) StartWithOverride(ctx context.Context, override *bridgev2.UserLogin) (*bridgev2.LoginStep, error) {
+	if !lq.operationMu.TryLock() {
+		return nil, fmt.Errorf("QR login operation already in progress")
+	}
+	defer lq.operationMu.Unlock()
 	meta, ok := override.Metadata.(*UserLoginMetadata)
 	if !ok {
 		return nil, fmt.Errorf("existing LINE login metadata has unexpected type %T", override.Metadata)
@@ -32,14 +38,32 @@ func (lq *LineQRLogin) StartWithOverride(ctx context.Context, override *bridgev2
 	if meta.ForceFullE2EELogin || len(meta.ExportedKeyMap) == 0 {
 		lq.login.Certificate = ""
 	}
-	return lq.Start(ctx)
+	return lq.start(ctx)
 }
 
 func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	if !lq.operationMu.TryLock() {
+		return nil, fmt.Errorf("QR login operation already in progress")
+	}
+	defer lq.operationMu.Unlock()
+	return lq.start(ctx)
+}
+
+func (lq *LineQRLogin) start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := lq.login.loginCooldownError(); err != nil {
+		return nil, err
+	}
+	if err := lq.login.claimLogin(); err != nil {
+		return nil, err
+	}
 	ll := lq.login
 	ll.mu.Lock()
 	if ll.canceled || ll.attemptCtx != nil {
 		ll.mu.Unlock()
+		ll.releaseLogin()
 		return nil, fmt.Errorf("QR login is already started or canceled")
 	}
 	ll.attemptCtx, ll.attemptCancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
@@ -49,15 +73,24 @@ func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	defer stop()
 	client := newLineAPIClient("")
 	session, qr, err := client.StartQRLogin(processCtx)
-	err = wrapLineLoginError(err)
 	ll.mu.Lock()
 	ll.attempt = client.LoginAttempt
 	canceled := ll.canceled || ctx.Err() != nil || processCtx.Err() != nil
 	ll.mu.Unlock()
 	if err != nil || canceled {
+		// Preserve expiry before Cancel changes the attempt's context error.
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		} else if processCtx.Err() != nil {
+			err = processCtx.Err()
+		} else if canceled {
+			err = context.Canceled
+		}
 		lq.Cancel()
-		if canceled {
-			return nil, context.Canceled
+		if err != nil {
+			ll.noteLoginRateLimit(err)
+			ll.logQRFailure(err, "qr_create")
+			return nil, wrapQRRPCError(err)
 		}
 		return nil, err
 	}
@@ -101,17 +134,25 @@ func (lq *LineQRLogin) startPoll(check func(context.Context, string) error, retr
 }
 
 func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
+	// Overlapping provisioning calls must not consume each other's polling
+	// results or advance the PIN/token exchange twice. Cancel doesn't take this lock.
+	if !lq.operationMu.TryLock() {
+		return nil, fmt.Errorf("QR login operation already in progress")
+	}
+	defer lq.operationMu.Unlock()
 	if lq.poll == nil {
 		return nil, fmt.Errorf("QR login has not started")
 	}
 	select {
 	case err := <-lq.poll:
 		if err != nil {
+			lq.login.noteLoginRateLimit(err)
+			lq.login.logQRFailure(err, "qr_verify")
 			lq.Cancel()
 			if line.IsQRLoginPollExpired(err) {
 				return nil, fmt.Errorf("%w: %w", ErrLoginVerificationFailed, err)
 			}
-			return nil, err
+			return nil, wrapQRRPCError(err)
 		}
 	case <-lq.login.attemptCtx.Done():
 		lq.Cancel()
@@ -123,16 +164,20 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 	if !lq.pin {
 		verified, err := lq.client.VerifyQRCertificate(ctx, lq.session, lq.login.Certificate)
 		if err != nil {
+			lq.login.noteLoginRateLimit(err)
+			lq.login.logQRFailure(err, "qr_certificate")
 			lq.Cancel()
-			return nil, wrapLineLoginError(err)
+			return nil, wrapQRRPCError(err)
 		}
 		if verified {
 			return lq.finish(ctx)
 		}
 		pin, err := lq.client.CreatePinCode(ctx, lq.session)
 		if err != nil {
+			lq.login.noteLoginRateLimit(err)
+			lq.login.logQRFailure(err, "qr_pin")
 			lq.Cancel()
-			return nil, wrapLineLoginError(err)
+			return nil, wrapQRRPCError(err)
 		}
 		lq.pin = true
 		lq.startPoll(lq.client.CheckPinCodeVerifiedContext, false)
@@ -149,7 +194,9 @@ func (lq *LineQRLogin) finish(ctx context.Context) (*bridgev2.LoginStep, error) 
 	defer lq.Cancel()
 	res, err := lq.client.QRCodeLoginV2(ctx, lq.session)
 	if err != nil {
-		return nil, wrapLineLoginError(err)
+		lq.login.noteLoginRateLimit(err)
+		lq.login.logQRFailure(err, "qr_token_issue")
+		return nil, wrapQRRPCError(err)
 	}
 	return lq.login.finishLogin(ctx, res)
 }

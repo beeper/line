@@ -29,11 +29,12 @@ const (
 
 func (lc *LineClient) newMessageHandler() *handlers.Handler {
 	handler := &handlers.Handler{
-		Log:           lc.UserLogin.Bridge.Log,
-		HTTPClient:    lc.HTTPClient,
-		RecoverClient: lc.recoverClientAfterAuthError,
-		NewClient:     func() *line.Client { return lc.newClient() },
-		DecryptMedia:  lc.decryptImageData,
+		Log:               lc.UserLogin.Bridge.Log,
+		HTTPClient:        lc.HTTPClient,
+		RecoverClient:     lc.recoverClientAfterAuthError,
+		NewClient:         func() *line.Client { return lc.newClient() },
+		DecryptMedia:      lc.decryptImageData,
+		DecryptVideoMedia: lc.decryptVideoData,
 	}
 	connector, ok := lc.UserLogin.Bridge.Network.(*LineConnector)
 	if ok && connector.directMedia.Load() {
