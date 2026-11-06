@@ -23,6 +23,18 @@ var (
 	ErrGroupKeyNotLoaded    = errors.New("e2ee key not loaded")
 )
 
+type MissingOwnKeyError struct {
+	KeyID int
+}
+
+func (e *MissingOwnKeyError) Error() string {
+	return fmt.Sprintf("%s for %d", ErrMissingOwnPrivateKey, e.KeyID)
+}
+
+func (e *MissingOwnKeyError) Unwrap() error {
+	return ErrMissingOwnPrivateKey
+}
+
 func isFatalLTSMError(err error) bool {
 	return errors.Is(err, ltsm.ErrAbort) || errors.Is(err, gen.ErrRunnerClosed)
 }
@@ -597,7 +609,7 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 	}
 
 	if myRunnerKey == 0 {
-		return 0, fmt.Errorf("%w for %d", ErrMissingOwnPrivateKey, receiverRawKeyID)
+		return 0, &MissingOwnKeyError{KeyID: receiverRawKeyID}
 	}
 
 	chanID, err := m.runner.ChannelCreate(myRunnerKey, creatorPubKeyB64)
@@ -992,10 +1004,10 @@ func (m *Manager) channelFromKeyIDs(senderKeyID, receiverKeyID int) (int, error)
 		privKeyID = id
 	} else {
 		if _, ok := peerPub[senderKeyID]; ok {
-			return 0, fmt.Errorf("%w for %d", ErrMissingOwnPrivateKey, receiverKeyID)
+			return 0, &MissingOwnKeyError{KeyID: receiverKeyID}
 		}
 		if _, ok := peerPub[receiverKeyID]; ok {
-			return 0, fmt.Errorf("%w for %d", ErrMissingOwnPrivateKey, senderKeyID)
+			return 0, &MissingOwnKeyError{KeyID: senderKeyID}
 		}
 		return 0, fmt.Errorf("no matching private key for senderKeyID=%d receiverKeyID=%d", senderKeyID, receiverKeyID)
 	}
