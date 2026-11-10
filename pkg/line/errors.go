@@ -364,6 +364,11 @@ func IsE2EEGroupMemberMismatch(err error) bool {
 	return ok && talk.Code == 99 && strings.EqualFold(strings.TrimSpace(talk.Reason), "member count mismatch")
 }
 
+func IsMemberSettingsOff(err error) bool {
+	talk, ok := parseTalkException(err)
+	return ok && talk.Code == 98 && strings.Contains(strings.ToLower(talk.Reason), "member settings off")
+}
+
 // IsTalkExceptionRateLimited returns true when LINE rejected a Talk API call
 // for excessive access.
 func IsTalkExceptionRateLimited(err error) bool {

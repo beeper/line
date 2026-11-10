@@ -661,6 +661,20 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata[k] = v
 	}
 
+	fallBackToPlainText := func() {
+		plainText = true
+		delete(contentMetadata, "e2eeVersion")
+		if contentType == int(ContentText) {
+			plainTextBody = textBody
+		} else {
+			delete(contentMetadata, "OID")
+			delete(contentMetadata, "SID")
+			delete(contentMetadata, "ENC_KM")
+			plainMediaData = originalMediaData
+			plainThumbData = originalThumbData
+		}
+	}
+
 	// Encryption phase — skip entirely for plain text
 	if !plainText {
 		if isGroup {
@@ -693,19 +707,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					lc.markGroupNoE2EE(portalMid)
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", portalMid).
 						Msg("Failed to set up E2EE for group, falling back to plain text")
-					plainText = true
+					fallBackToPlainText()
 					chunks = nil
 					err = nil
-					delete(contentMetadata, "e2eeVersion")
-					if contentType == int(ContentText) {
-						plainTextBody = textBody
-					} else {
-						delete(contentMetadata, "OID")
-						delete(contentMetadata, "SID")
-						delete(contentMetadata, "ENC_KM")
-						plainMediaData = originalMediaData
-						plainThumbData = originalThumbData
-					}
 				}
 			}
 		} else {
@@ -731,6 +735,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		lc.UserLogin.Bridge.Log.Info().Str("portal", portalMid).Int("content_type", contentType).Msg("Sending plain text message (no E2EE)")
 	}
 
+	sticonReplace := contentMetadata["REPLACE"]
 	if !plainText {
 		delete(contentMetadata, "REPLACE")
 	}
@@ -879,6 +884,21 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", portalMid).
 				Err(regErr).Msg("autoRegisterGroupKey failed, giving up on retry")
 		}
+	}
+
+	if err != nil && isGroup && !plainText && line.IsMemberSettingsOff(err) {
+		lc.markGroupNoE2EE(portalMid)
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", portalMid).
+			Msg("LINE rejected encrypted group message because a member has Letter Sealing off, resending as plain text")
+		fallBackToPlainText()
+		lineMsg.Chunks = nil
+		lineMsg.Text = plainTextBody
+		if sticonReplace != "" {
+			contentMetadata["REPLACE"] = sticonReplace
+		}
+		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
+		lc.trackReqSeq(retryReqSeq)
+		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 	}
 
 	if shouldRetrySendWithoutReplyRelation(lineMsg, err) {
