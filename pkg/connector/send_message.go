@@ -798,6 +798,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata["FILE_NAME"] = zipFileName
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(zipData))
 		lineMsg.ContentMetadata = contentMetadata
+		originalMediaData = zipData
 
 		if plainText {
 			plainMediaData = zipData
