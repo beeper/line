@@ -16,6 +16,7 @@ var (
 	ErrNoUsableE2EEPublicKey    = errors.New("no usable E2EE public key")
 	ErrNoUsableE2EEGroupKey     = errors.New("no usable E2EE group key")
 	ErrGroupKeyNotFound         = errors.New("group key not found")
+	ErrMemberSettingsOff        = errors.New("member settings off")
 )
 
 // HTTPError is returned when a LINE endpoint answers with an unexpected HTTP status.
@@ -365,6 +366,9 @@ func IsE2EEGroupMemberMismatch(err error) bool {
 }
 
 func IsMemberSettingsOff(err error) bool {
+	if errors.Is(err, ErrMemberSettingsOff) {
+		return true
+	}
 	talk, ok := parseTalkException(err)
 	return ok && talk.Code == 98 && strings.Contains(strings.ToLower(talk.Reason), "member settings off")
 }
@@ -504,6 +508,8 @@ func parseE2EEGroupKeyError(method, message string, rawData json.RawMessage) err
 	if isNoUsableE2EEGroupKeyTalkException(message, talk) {
 		if talk.Code == 5 {
 			return fmt.Errorf("%w: %s", ErrGroupKeyNotFound, talk.Reason)
+		} else if talk.Code == 98 {
+			return fmt.Errorf("%w: %w", ErrNoUsableE2EEGroupKey, ErrMemberSettingsOff)
 		}
 		return fmt.Errorf("%w: %s", ErrNoUsableE2EEGroupKey, talk.Reason)
 	}
