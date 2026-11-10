@@ -661,18 +661,40 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata[k] = v
 	}
 
+	fallBackToPlainText := func() {
+		plainText = true
+		delete(contentMetadata, "e2eeVersion")
+		if contentType == int(ContentText) {
+			plainTextBody = textBody
+		} else {
+			delete(contentMetadata, "OID")
+			delete(contentMetadata, "SID")
+			delete(contentMetadata, "ENC_KM")
+			plainMediaData = originalMediaData
+			plainThumbData = originalThumbData
+		}
+	}
+
+	if !plainText && isGroup {
+		if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); line.IsMemberSettingsOff(errFetch) {
+			lc.markGroupNoE2EE(portalMid)
+			lc.UserLogin.Bridge.Log.Warn().Err(errFetch).Str("chat_mid", portalMid).
+				Msg("Group E2EE is off because a member has Letter Sealing off, sending as plain text")
+			fallBackToPlainText()
+		} else if errFetch != nil {
+			lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
+			if isTerminalCryptoError(errFetch) {
+				return nil, errFetch
+			}
+			if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
+				return nil, errFetch
+			}
+		}
+	}
+
 	// Encryption phase — skip entirely for plain text
 	if !plainText {
 		if isGroup {
-			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
-				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
-				if isTerminalCryptoError(errFetch) {
-					return nil, errFetch
-				}
-				if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
-					return nil, errFetch
-				}
-			}
 			chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 			if err != nil {
 				if isTerminalCryptoError(err) {
@@ -693,19 +715,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 					lc.markGroupNoE2EE(portalMid)
 					lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", portalMid).
 						Msg("Failed to set up E2EE for group, falling back to plain text")
-					plainText = true
+					fallBackToPlainText()
 					chunks = nil
 					err = nil
-					delete(contentMetadata, "e2eeVersion")
-					if contentType == int(ContentText) {
-						plainTextBody = textBody
-					} else {
-						delete(contentMetadata, "OID")
-						delete(contentMetadata, "SID")
-						delete(contentMetadata, "ENC_KM")
-						plainMediaData = originalMediaData
-						plainThumbData = originalThumbData
-					}
 				}
 			}
 		} else {
