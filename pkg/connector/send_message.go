@@ -675,18 +675,26 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
+	if !plainText && isGroup {
+		if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); line.IsMemberSettingsOff(errFetch) {
+			lc.markGroupNoE2EE(portalMid)
+			lc.UserLogin.Bridge.Log.Warn().Err(errFetch).Str("chat_mid", portalMid).
+				Msg("Group E2EE is off because a member has Letter Sealing off, sending as plain text")
+			fallBackToPlainText()
+		} else if errFetch != nil {
+			lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
+			if isTerminalCryptoError(errFetch) {
+				return nil, errFetch
+			}
+			if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
+				return nil, errFetch
+			}
+		}
+	}
+
 	// Encryption phase — skip entirely for plain text
 	if !plainText {
 		if isGroup {
-			if errFetch := lc.fetchAndUnwrapGroupKey(ctx, portalMid, 0); errFetch != nil {
-				lc.UserLogin.Bridge.Log.Debug().Err(errFetch).Str("chat_mid", portalMid).Msg("fetchAndUnwrapGroupKey before encrypt failed")
-				if isTerminalCryptoError(errFetch) {
-					return nil, errFetch
-				}
-				if errFetch = lineGroupE2EEFetchFailureError(errFetch); errFetch != nil {
-					return nil, errFetch
-				}
-			}
 			chunks, err = lc.E2EE.EncryptGroupMessageRaw(portalMid, fromMid, contentType, payload)
 			if err != nil {
 				if isTerminalCryptoError(err) {
@@ -735,7 +743,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		lc.UserLogin.Bridge.Log.Info().Str("portal", portalMid).Int("content_type", contentType).Msg("Sending plain text message (no E2EE)")
 	}
 
-	sticonReplace := contentMetadata["REPLACE"]
 	if !plainText {
 		delete(contentMetadata, "REPLACE")
 	}
@@ -798,7 +805,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata["FILE_NAME"] = zipFileName
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(zipData))
 		lineMsg.ContentMetadata = contentMetadata
-		originalMediaData = zipData
 
 		if plainText {
 			plainMediaData = zipData
@@ -885,21 +891,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			lc.UserLogin.Bridge.Log.Warn().Str("chat_mid", portalMid).
 				Err(regErr).Msg("autoRegisterGroupKey failed, giving up on retry")
 		}
-	}
-
-	if err != nil && isGroup && !plainText && line.IsMemberSettingsOff(err) {
-		lc.markGroupNoE2EE(portalMid)
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", portalMid).
-			Msg("LINE rejected encrypted group message because a member has Letter Sealing off, resending as plain text")
-		fallBackToPlainText()
-		lineMsg.Chunks = nil
-		lineMsg.Text = plainTextBody
-		if sticonReplace != "" {
-			contentMetadata["REPLACE"] = sticonReplace
-		}
-		retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-		lc.trackReqSeq(retryReqSeq)
-		sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
 	}
 
 	if shouldRetrySendWithoutReplyRelation(lineMsg, err) {
