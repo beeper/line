@@ -480,9 +480,21 @@ func (c *Client) CancelReaction(reqSeq int64, messageID string) error {
 }
 
 // SendChatChecked sends a read receipt for a message in a chat
-func (c *Client) SendChatChecked(chatMid, messageID string) error {
-	_, err := c.callRPC("TalkService", "sendChatChecked", 0, chatMid, messageID)
-	return err
+func (c *Client) SendChatChecked(reqSeq int64, chatMid, messageID string) error {
+	resp, err := c.callRPC("TalkService", "sendChatChecked", reqSeq, chatMid, messageID, 0)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse sendChatChecked response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("sendChatChecked failed: %s", resp)
+	}
+	return nil
 }
 
 // GetContactsV2 fetches contact details for a list of MIDs.
