@@ -1026,6 +1026,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 
 	var groupMemberMids []string
 	selfInvitePending := false
+	selfIsGroupMember := false
 	if chat.Extra.GroupExtra != nil {
 		if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
 			members[0].PowerLevel = ptr.Ptr(100)
@@ -1037,11 +1038,13 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		// created as a normal joined room rather than a request. Don't mark self as
 		// MembershipInvite: on Beeper an invite-membership self user is excluded from the room
 		// entirely (getInitialMemberList skips non-join members), so the room would never appear.
-		if _, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]; !isMember && chat.Type == 0 {
+		_, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]
+		if !isMember && chat.Type == 0 {
 			if _, isInvitee := chat.Extra.GroupExtra.InviteeMids[lc.Mid]; isInvitee {
 				selfInvitePending = true
 			}
 		}
+		selfIsGroupMember = isMember && chat.Type == 0
 
 		// Populate group member cache for fallback use when GetChats
 		// returns empty MemberMids (known LINE API issue).
@@ -1133,10 +1136,12 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
 	}
-	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
-	// out from under an accept that's already in flight.
+	// Only a confirmed membership clears the request: GetChats can omit the caller from both
+	// lists, and that must not drop a pending invite out of Requests.
 	if selfInvitePending {
 		info.MessageRequest = ptr.Ptr(true)
+	} else if selfIsGroupMember {
+		info.MessageRequest = ptr.Ptr(false)
 	}
 	return info
 }
@@ -1981,6 +1986,27 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 
 	case OpCancelInvitation:
 		lc.handleMemberLeave(op.Param1, op.Param3)
+
+	case OpAcceptChatInvitation:
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatResync,
+				PortalKey: networkid.PortalKey{ID: makePortalID(op.Param1), Receiver: lc.UserLogin.ID},
+			},
+			ChatInfo: &bridgev2.ChatInfo{MessageRequest: ptr.Ptr(false)},
+		})
+
+	case OpRejectChatInvitation:
+		if lc.consumeSentReqSeq(op.ReqSeq) {
+			return
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatDelete{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatDelete,
+				PortalKey: networkid.PortalKey{ID: makePortalID(op.Param1), Receiver: lc.UserLogin.ID},
+			},
+			OnlyForMe: true,
+		})
 
 	case OpInviteIntoChat, OpNotifiedInviteIntoChat:
 		lc.wg.Add(1)

@@ -28,6 +28,11 @@ const (
 
 const OpNotifiedDeleteOtherFromChat OperationType = 133
 
+const (
+	OpAcceptChatInvitation OperationType = 129
+	OpRejectChatInvitation OperationType = 131
+)
+
 // ContentType values for LINE messages.
 type ContentType int
 
