@@ -165,11 +165,24 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	var mediaData []byte
+	var imageMimeType, imageFileName string
 	switch effectiveMsgType {
 	case event.MsgImage, event.MsgFile, event.MsgVideo, event.MsgAudio:
 		mediaData, err = lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
+		}
+		if effectiveMsgType == event.MsgImage {
+			var imageData []byte
+			imageData, imageMimeType, imageFileName, err = prepareLineImage(ctx, mediaData, msg.Content.GetFileName())
+			if errors.Is(err, errSendImageAsFile) {
+				lc.UserLogin.Bridge.Log.Info().Err(err).Msg("LINE can't show this image, sending it as a file")
+				effectiveMsgType = event.MsgFile
+			} else if err != nil {
+				return nil, err
+			} else {
+				mediaData = imageData
+			}
 		}
 		if sizeLimit, ok := lineMediaSizeLimits[effectiveMsgType]; ok && len(mediaData) > sizeLimit {
 			lc.UserLogin.Bridge.Log.Info().
@@ -259,24 +272,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	case event.MsgImage:
 		data := mediaData
 
-		mimeType := msg.Content.Info.MimeType
-		fileName := msg.Content.GetFileName()
-		if isHEICImage(mimeType, fileName) {
-			data, err = convertHEICToJPEG(ctx, data)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaConvertFailed, err)
-			}
-			mimeType = "image/jpeg"
-			fileName = jpegFileName(fileName)
-		}
+		mimeType := imageMimeType
+		fileName := imageFileName
 		isGif := mimeType == "image/gif"
 		isAnimated := isGif && isAnimatedGif(data)
 
 		extension := "jpg"
-		if isGif {
-			extension = "gif"
-		} else if mimeType == "image/png" {
-			extension = "png"
+		switch mimeType {
+		case "image/gif", "image/png", "image/bmp":
+			extension = strings.TrimPrefix(mimeType, "image/")
 		}
 
 		contentType = int(ContentImage)
