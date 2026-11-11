@@ -58,6 +58,8 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 		}
 		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
 			MsgType: event.MsgAudio, RelatesTo: relatesTo,
+			MSC1767Audio: &event.MSC1767Audio{Duration: directMedia.Duration},
+			MSC3245Voice: &event.MSC3245Voice{},
 		}); converted != nil || err != nil {
 			return converted, err
 		}
@@ -117,12 +119,14 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 			{
 				Type: event.EventMessage,
 				Content: &event.MessageEventContent{
-					MsgType:   event.MsgAudio,
-					Body:      "audio.m4a",
-					URL:       mxc,
-					File:      file,
-					Info:      audioInfo,
-					RelatesTo: relatesTo,
+					MsgType:      event.MsgAudio,
+					Body:         "audio.m4a",
+					URL:          mxc,
+					File:         file,
+					Info:         audioInfo,
+					RelatesTo:    relatesTo,
+					MSC1767Audio: &event.MSC1767Audio{Duration: duration},
+					MSC3245Voice: &event.MSC3245Voice{},
 				},
 			},
 		},
