@@ -406,7 +406,7 @@ func (lc *LineClient) setCachedContact(mid string, contact line.Contact) {
 	lc.cacheMu.Unlock()
 }
 
-var lineUserMIDRegex = regexp.MustCompile(`^u[0-9a-f]{32}$`)
+var lineUserMIDRegex = regexp.MustCompile(`^[Uu][A-Za-z0-9_-]{32,}$`)
 
 var twoDigitCountryCodes = map[string]bool{
 	"20": true, "27": true, "30": true, "31": true, "32": true, "33": true, "34": true, "36": true, "39": true,
@@ -443,6 +443,10 @@ func linePhoneQuery(identifier string) (string, bool) {
 	return "+" + digits[:ccLength] + " " + digits[ccLength:], true
 }
 
+func isInvalidUseridError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), `"reason":"userid is invalid"`)
+}
+
 func (lc *LineClient) resolveIdentifierMID(ctx context.Context, identifier string) (string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if lineUserMIDRegex.MatchString(identifier) {
@@ -460,7 +464,7 @@ func (lc *LineClient) resolveIdentifierMID(ctx context.Context, identifier strin
 			return client.FindContactByUserid(userID)
 		})
 	}
-	if line.IsTalkExceptionNotFound(err) || (err == nil && (contact == nil || contact.Mid == "")) {
+	if line.IsTalkExceptionNotFound(err) || isInvalidUseridError(err) || (err == nil && (contact == nil || contact.Mid == "")) {
 		return "", bridgev2.WrapRespErr(fmt.Errorf("no LINE user found for %q", identifier), mautrix.MNotFound)
 	} else if err != nil {
 		return "", fmt.Errorf("failed to look up LINE user: %w", err)
