@@ -333,6 +333,12 @@ const (
 	talkExceptionSystemError      = 15
 	talkExceptionInternalError    = 20
 	talkExceptionMaintenanceError = 33
+
+	talkExceptionE2EEUpdateReceiverKey  = 84
+	talkExceptionE2EEInvalidVersion     = 86
+	talkExceptionE2EESenderDisabled     = 87
+	talkExceptionE2EEReceiverDisabled   = 88
+	talkExceptionE2EEReceiverNotAllowed = 90
 )
 
 func loginPollingFailure(httpStatus int, body []byte) error {
@@ -405,6 +411,19 @@ func IsMemberSettingsOff(err error) bool {
 	}
 	talk, ok := parseTalkException(err)
 	return ok && talk.Code == 98 && strings.Contains(strings.ToLower(talk.Reason), "member settings off")
+}
+
+func IsE2EEReceiverKeyRejected(err error) bool {
+	talk, ok := parseTalkException(err)
+	if !ok {
+		return false
+	}
+	switch talk.Code {
+	case talkExceptionE2EEUpdateReceiverKey, talkExceptionE2EEInvalidVersion, talkExceptionE2EESenderDisabled,
+		talkExceptionE2EEReceiverDisabled, talkExceptionE2EEReceiverNotAllowed:
+		return true
+	}
+	return false
 }
 
 // IsTalkExceptionRateLimited returns true when LINE rejected a Talk API call
