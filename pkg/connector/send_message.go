@@ -87,6 +87,10 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		return res, err
 	}
 	sendLineMessage := func(reqSeq int, lineMsg *line.Message) (*line.Message, error) {
+		if len(lineMsg.Chunks) > 0 && lineMsg.ContentMetadata["ENC_KM"] != "" {
+			delete(lineMsg.ContentMetadata, "ENC_KM")
+			delete(lineMsg.ContentMetadata, "FILE_NAME")
+		}
 		var err error
 		var sentMsg *line.Message
 		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
@@ -392,7 +396,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				contentMetadata["MEDIA_CONTENT_INFO"] = string(mediaInfoJSON)
 			}
 
-			imgPayload := map[string]string{"keyMaterial": keyMaterialB64}
+			imgPayload := map[string]string{"keyMaterial": keyMaterialB64, "fileName": fileName}
 			payload, _ = json.Marshal(imgPayload)
 		}
 
