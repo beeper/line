@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -285,6 +286,12 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 	}
 
 	backfillEnabled := lc.UserLogin.Bridge.Config.Backfill.Enabled
+	type dmResync struct {
+		mid                string
+		checkNeedsBackfill func(context.Context, *database.Message) (bool, error)
+	}
+	dms := make([]dmResync, 0, len(messageBoxes))
+	dmMIDs := make([]string, 0, len(messageBoxes))
 	for _, box := range messageBoxes {
 		mid := box.ID
 		if lc.isUserBlocked(mid) {
@@ -309,7 +316,14 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 			}
 			continue
 		}
-		lc.queueDMChatResync(ctx, mid, checkNeedsBackfill != nil, true, checkNeedsBackfill)
+		dms = append(dms, dmResync{mid: mid, checkNeedsBackfill: checkNeedsBackfill})
+		dmMIDs = append(dmMIDs, mid)
+	}
+	if err := lc.fetchContacts(ctx, dmMIDs); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for DM sync")
+	}
+	for _, dm := range dms {
+		lc.queueDMChatResync(ctx, dm.mid, dm.checkNeedsBackfill != nil, true, dm.checkNeedsBackfill)
 	}
 }
 
@@ -1037,6 +1051,16 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch batch of chats")
 			continue
+		}
+		var memberMIDs []string
+		for _, chat := range chatsResp.Chats {
+			if chat.Extra.GroupExtra != nil {
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.MemberMids))
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.InviteeMids))
+			}
+		}
+		if err := lc.fetchContacts(ctx, memberMIDs); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for batch of chats")
 		}
 
 		for _, chat := range chatsResp.Chats {

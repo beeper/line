@@ -58,7 +58,6 @@ func (lc *LineConnector) GetBridgeInfoVersion() (info, capabilities int) {
 
 func (lc *LineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return &bridgev2.NetworkGeneralCapabilities{
-		AggressiveUpdateInfo: true,
 		Provisioning: bridgev2.ProvisioningCapabilities{
 			ImagePackImport: true,
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
