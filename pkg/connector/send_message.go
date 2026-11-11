@@ -1040,28 +1040,6 @@ func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridge
 	return wrapSendError(err)
 }
 
-func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev2.Portal) error {
-	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-
-	// A still-pending invite (the user declined the Request without accepting it) must be
-	// rejected, not removed — the user was never a member of the LINE chat. The framework
-	// clears MessageRequest once the invite is accepted, so an accepted chat falls through to
-	// the normal SendChatRemoved leave path below.
-	if portal.MessageRequest {
-		_, err := lc.callLine(ctx, func(client *line.Client) error {
-			return client.RejectChatInvitation(int64(reqSeq), string(portal.ID))
-		})
-		return wrapSendError(err)
-	}
-
-	lc.trackReqSeq(reqSeq)
-
-	_, err := lc.callLine(ctx, func(client *line.Client) error {
-		return client.SendChatRemoved(int64(reqSeq), string(portal.ID), "0", 0)
-	})
-	return wrapSendError(err)
-}
-
 // Compile-time assertion that LineClient handles Beeper message-request acceptance.
 var _ bridgev2.MessageRequestAcceptingNetworkAPI = (*LineClient)(nil)
 

@@ -49,7 +49,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_11_01",
+		ID:               "dev.highest.matrix.line.capabilities.2026_11_11",
 		MaxTextLength:    5000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
@@ -157,6 +157,19 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 	if portal != nil && portal.RoomType == database.RoomTypeDM && !lc.isOwnMID(string(portal.ID)) {
 		caps.ID += "+dm"
 		caps.BlockUser = true
+	} else if portal != nil && strings.HasPrefix(string(portal.ID), "R") {
+		caps.ID += "+room"
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite: event.CapLevelFullySupported,
+			event.MemberActionLeave:  event.CapLevelFullySupported,
+		}
+	} else if portal == nil || isChatMID(string(portal.ID)) {
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite:       event.CapLevelFullySupported,
+			event.MemberActionKick:         event.CapLevelFullySupported,
+			event.MemberActionLeave:        event.CapLevelFullySupported,
+			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
+		}
 	}
 	return caps
 }
