@@ -3,31 +3,34 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"html"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/line/pkg/line"
 )
 
-// ConvertContact converts a LINE contact share (contentType 13) to a Matrix notice.
-// LINE only provides displayName and internal MID, so a vCard would be empty.
-func (h *Handler) ConvertContact(data line.Message, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+// ConvertContact converts a LINE contact share (contentType 13) to a Matrix notice
+// that links the shared user's ghost when one is known.
+func (h *Handler) ConvertContact(data line.Message, ghostMXID id.UserID, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
 	displayName := data.ContentMetadata["displayName"]
 	if displayName == "" {
 		displayName = "Unknown"
 	}
+	content := &event.MessageEventContent{
+		MsgType:   event.MsgNotice,
+		Body:      fmt.Sprintf("LINE contact shared: %s", displayName),
+		Mentions:  &event.Mentions{},
+		RelatesTo: relatesTo,
+	}
+	if ghostMXID != "" {
+		content.Format = event.FormatHTML
+		content.FormattedBody = fmt.Sprintf(`LINE contact shared: <a href="%s">%s</a>`, html.EscapeString(ghostMXID.URI().MatrixToURL()), html.EscapeString(displayName))
+	}
 	return &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{
-			{
-				Type: event.EventMessage,
-				Content: &event.MessageEventContent{
-					MsgType:   event.MsgNotice,
-					Body:      fmt.Sprintf("LINE contact shared: %s. Open LINE to add them.", displayName),
-					RelatesTo: relatesTo,
-				},
-			},
-		},
+		Parts: []*bridgev2.ConvertedMessagePart{{Type: event.EventMessage, Content: content}},
 	}, nil
 }
 

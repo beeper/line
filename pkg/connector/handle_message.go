@@ -451,7 +451,7 @@ func (lc *LineClient) convertLineMessageContent(ctx context.Context, portal *bri
 	case ContentLocation:
 		return h.ConvertLocation(data, replyRelatesTo)
 	case ContentContact:
-		return h.ConvertContact(data, replyRelatesTo)
+		return h.ConvertContact(data, lc.contactCardMXID(data.ContentMetadata["mid"]), replyRelatesTo)
 	case ContentFlex:
 		return h.ConvertFlex(data, replyRelatesTo)
 	}
@@ -601,6 +601,15 @@ func (lc *LineClient) convertLineMessageContent(ctx context.Context, portal *bri
 	}
 
 	return converted, nil
+}
+
+func (lc *LineClient) contactCardMXID(mid string) id.UserID {
+	if !strings.HasPrefix(mid, "u") {
+		return ""
+	} else if lc.isOwnMID(mid) {
+		return lc.UserLogin.UserMXID
+	}
+	return lc.UserLogin.Bridge.Matrix.FormatGhostMXID(makeUserID(mid))
 }
 
 // resolveReplyRelatesTo looks up the Matrix event ID for a replied-to LINE message.
