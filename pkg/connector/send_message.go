@@ -123,8 +123,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		// LINE sends native stickers as metadata without an encrypted payload.
 		plainText = true
 	} else if lc.E2EE == nil {
-		plainText = true
-		lc.UserLogin.Bridge.Log.Warn().Msg("E2EE not initialized, sending as plain text")
+		return nil, wrapConvertError(errors.New("LINE encryption is not initialized"))
 	} else if isGroup {
 		if lc.isGroupNoE2EE(portalMid) {
 			plainText = true
