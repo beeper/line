@@ -54,7 +54,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_11_11_1",
+		ID:               "dev.highest.matrix.line.capabilities.2026_11_23",
 		MaxTextLength:    10000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
@@ -162,11 +162,30 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 	if portal != nil && portal.RoomType == database.RoomTypeDM && !lc.isOwnMID(string(portal.ID)) {
 		caps.ID += "+dm"
 		caps.BlockUser = true
+	} else if portal != nil && strings.HasPrefix(strings.ToLower(string(portal.ID)), "r") {
+		caps.ID += "+room"
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite: event.CapLevelFullySupported,
+			event.MemberActionLeave:  event.CapLevelFullySupported,
+		}
 	} else if portal != nil && isEditableGroupMID(string(portal.ID)) {
 		caps.ID += "+group"
 		caps.State = event.StateFeatureMap{
 			event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
 			event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
+		}
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite:       event.CapLevelFullySupported,
+			event.MemberActionKick:         event.CapLevelFullySupported,
+			event.MemberActionLeave:        event.CapLevelFullySupported,
+			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
+		}
+	} else if portal == nil {
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite:       event.CapLevelFullySupported,
+			event.MemberActionKick:         event.CapLevelFullySupported,
+			event.MemberActionLeave:        event.CapLevelFullySupported,
+			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
 		}
 	}
 	return caps
