@@ -40,6 +40,7 @@ const (
 	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
 	defaultReceiveAuthProbeInterval           = 150 * time.Second
 	maxReconnectDelay                         = 5 * time.Minute
+	opRevisionSaveInterval                    = 30 * time.Second
 )
 
 var (
@@ -1761,7 +1762,19 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	lc.pollLoopFrom(ctx, localRev)
 }
 
+func (lc *LineClient) loginMetadata() *UserLoginMetadata {
+	if lc.UserLogin.UserLogin == nil {
+		return nil
+	}
+	meta, _ := lc.UserLogin.Metadata.(*UserLoginMetadata)
+	return meta
+}
+
 func (lc *LineClient) seedLocalRevision(ctx context.Context) (int64, bool) {
+	if meta := lc.loginMetadata(); meta != nil && meta.OpRevision > 0 {
+		lc.UserLogin.Bridge.Log.Info().Int64("local_rev", meta.OpRevision).Msg("Resuming operation stream from saved revision")
+		return meta.OpRevision, true
+	}
 	_, rev, err := callLineResult(lc, ctx, func(client *line.Client) (int64, error) {
 		return getLastOpRevisionWithClient(ctx, client)
 	})
@@ -1780,7 +1793,23 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 	defer lc.wg.Done()
 
 	client := lc.newClient()
+	meta := lc.loginMetadata()
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
+	savedRev := localRev
+	var savedAt time.Time
+	saveRevision := func(force bool) {
+		if meta == nil || localRev == savedRev || (!force && time.Since(savedAt) < opRevisionSaveInterval) ||
+			lc.superseded.Load() || lc.isSessionInvalidated() {
+			return
+		}
+		meta.OpRevision = localRev
+		if err := lc.UserLogin.Save(ctx); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save operation revision")
+			return
+		}
+		savedRev = localRev
+		savedAt = time.Now()
+	}
 
 	receiveCtx, cancelReceive, nextProbeAt := startReceiveAuthProbeContext(ctx, receiveAuthProbeNow())
 	defer func() {
@@ -1821,7 +1850,7 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 					lc.UserLogin.Bridge.Log.Info().Int64("old", localRev).Int64("new", newRev).Msg("Updating local revision from fullSync")
 
 					localRev = newRev
-
+					saveRevision(true)
 				}
 			}
 			newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
@@ -1857,6 +1886,7 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			}
 
 			lc.handleOperation(ctx, op)
+			saveRevision(false)
 		}
 	}
 
