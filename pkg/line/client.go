@@ -571,6 +571,44 @@ func (c *Client) postWithHMAC(fullURL string, body []byte) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+// UploadChatPicture sets a group's picture. The extension posts the image as the raw request
+// body, which its gateway client sends without an X-Hmac header.
+func (c *Client) UploadChatPicture(ctx context.Context, chatMid string, data []byte, contentType string) error {
+	fullURL := "https://line-chrome-gw.line-apps.com/api/obs/uploadProfile?mid=" + url.QueryEscape(chatMid)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("x-line-chrome-version", ExtensionVersion)
+	req.Header.Set("x-line-application", "CHROMEOS\t3.7.2\tChrome_OS")
+	req.Header.Set("x-lal", "en_US")
+	if c.AccessToken != "" {
+		req.Header.Set("x-line-access", c.AccessToken)
+		req.Header.Set("Cookie", fmt.Sprintf("lct=%s", c.AccessToken))
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return newHTTPError(resp.StatusCode, "uploadProfile failed (%d): %s", resp.StatusCode, string(respBody))
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(respBody, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse uploadProfile response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("uploadProfile failed: %s", respBody)
+	}
+	return nil
+}
+
 func (c *Client) RefreshAccessToken(refreshToken string) (*TokenV3IssueResult, error) {
 	url := "https://line-chrome-gw.line-apps.com/api/auth/tokenRefresh"
 

@@ -1296,6 +1296,9 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
 	}
+	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
+		info.Members.PowerLevels = lineGroupPowerLevels()
+	}
 	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
 	// out from under an accept that's already in flight.
 	if selfInvitePending {

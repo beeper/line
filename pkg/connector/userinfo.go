@@ -170,6 +170,13 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			event.MemberActionLeave:        event.CapLevelFullySupported,
 			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
 		}
+		if portal != nil && isEditableGroupMID(string(portal.ID)) {
+			caps.ID += "+group"
+			caps.State = event.StateFeatureMap{
+				event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
+				event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
+			}
+		}
 	}
 	return caps
 }
