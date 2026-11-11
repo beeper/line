@@ -272,10 +272,11 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 // get a resync, and when backfill is enabled every chat whose newest message
 // isn't bridged yet catches up through forward backfill.
 func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
+	backfillEnabled := lc.UserLogin.Bridge.Config.Backfill.Enabled
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
 		MessageBoxCountLimit:           messageBoxPageLimit,
-		WithUnreadCount:                false,
+		WithUnreadCount:                backfillEnabled,
 		LastMessagesPerMessageBoxCount: 0,
 	}
 
@@ -285,9 +286,9 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 		return
 	}
 
-	backfillEnabled := lc.UserLogin.Bridge.Config.Backfill.Enabled
 	type dmResync struct {
 		mid                string
+		lastSeenMessageID  string
 		checkNeedsBackfill func(context.Context, *database.Message) (bool, error)
 	}
 	dms := make([]dmResync, 0, len(messageBoxes))
@@ -313,10 +314,11 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 					},
 					CheckNeedsBackfillFunc: checkNeedsBackfill,
 				})
+				lc.queueOwnReadReceipt(mid, box.LastSeenMessageID, time.Now())
 			}
 			continue
 		}
-		dms = append(dms, dmResync{mid: mid, checkNeedsBackfill: checkNeedsBackfill})
+		dms = append(dms, dmResync{mid: mid, lastSeenMessageID: box.LastSeenMessageID, checkNeedsBackfill: checkNeedsBackfill})
 		dmMIDs = append(dmMIDs, mid)
 	}
 	if err := lc.fetchContacts(ctx, dmMIDs); err != nil {
@@ -324,6 +326,11 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 	}
 	for _, dm := range dms {
 		lc.queueDMChatResync(ctx, dm.mid, dm.checkNeedsBackfill != nil, true, dm.checkNeedsBackfill)
+		if dm.checkNeedsBackfill != nil {
+			// The resync runs the catch-up backfill in the portal queue, so this
+			// receipt lands after the caught-up messages.
+			lc.queueOwnReadReceipt(dm.mid, dm.lastSeenMessageID, time.Now())
+		}
 	}
 }
 
