@@ -36,6 +36,8 @@ const (
 	OpRejectChatInvitation OperationType = 131
 )
 
+const OpNotifiedUpdateProfile OperationType = 2
+
 // ContentType values for LINE messages.
 type ContentType int
 
