@@ -407,11 +407,7 @@ func (lc *LineClient) invalidateSessionLocked(ctx context.Context, err error, ex
 	sendState := lc.claimForcedLogoutState()
 	lc.invalidateAccessToken()
 	lc.obsTokenCache.Invalidate()
-	stateError := status.BridgeStateErrorCode("line-logged-out")
-	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
-	if expired {
-		stateError, stateMessage = "line-token-expired", ""
-	}
+	logoutCode, logoutReason, _ := line.LogoutReason(err)
 	invalidSenderKey := line.IsInvalidSenderKey(err)
 	needsFullE2EELogin := invalidSenderKey
 	lc.missingE2EEKeyMu.Lock()
@@ -422,27 +418,63 @@ func (lc *LineClient) invalidateSessionLocked(ctx context.Context, err error, ex
 				meta.Certificate = ""
 			}
 			needsFullE2EELogin = meta.ForceFullE2EELogin
+			if logoutCode != 0 {
+				meta.LogoutCode, meta.LogoutReason = logoutCode, logoutReason
+			}
+			logoutCode, logoutReason = meta.LogoutCode, meta.LogoutReason
 		}
 	}
 	lc.missingE2EEKeyMu.Unlock()
+	stateError := status.BridgeStateErrorCode("line-logged-out")
+	stateMessage := lineLogoutMessage(logoutCode, logoutReason)
+	if expired {
+		stateError, stateMessage = "line-token-expired", ""
+	}
 	if needsFullE2EELogin {
 		stateError = "line-e2ee-key-missing"
 		stateMessage = lineMissingE2EEKeyMessage
 	}
 	lc.saveSessionInvalidated(ctx, expired)
 	if sendState && lc.UserLogin.Bridge != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated; marking login bad credentials")
+		lc.UserLogin.Bridge.Log.Warn().Err(err).
+			Int("logout_code", logoutCode).
+			Str("logout_reason", logoutReason).
+			Msg("LINE session invalidated; marking login bad credentials")
 	}
 	if sendState && lc.UserLogin.BridgeState != nil {
+		info := map[string]any{"go_error": err.Error()}
+		if logoutCode != 0 {
+			info["line_error_code"] = logoutCode
+			info["line_error_reason"] = logoutReason
+		}
 		lc.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      stateError,
 			Message:    stateMessage,
 			UserAction: status.UserActionRelogin,
-			Info:       map[string]any{"go_error": err.Error()},
+			Info:       info,
 		})
 	}
 	lc.cancelActiveRun()
+}
+
+func lineLogoutMessage(code int, reason string) string {
+	const reconnect = " Click Reconnect in Beeper to reconnect LINE."
+	switch {
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "AUTHENTICATION_DIVESTED_BY_OTHER_DEVICE":
+		return "LINE logged this session out because you logged in to LINE on another PC." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "IDENTIFY_MODIFIED":
+		return "LINE logged this session out because the account's email or password changed." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "REVOKE":
+		return "LINE logged this session out because it was blocked from your phone." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "EXPIRED":
+		return "LINE logged this session out after a long period of inactivity." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "DEVICE_LOSE":
+		return "LINE needs you to verify your account. Log in to LINE on your phone with your registered email, then click Reconnect in Beeper."
+	case code == line.TalkExceptionNotAvailableUser && reason == "DELETED_ACCOUNT":
+		return "LINE logged this session out because the LINE account was deleted."
+	}
+	return "LINE logged this session out." + reconnect
 }
 
 func (lc *LineClient) sendConnectedStateIfCurrent(ctx context.Context) bool {
