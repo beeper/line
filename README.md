@@ -94,6 +94,14 @@ The Docker container will automatically generate a matching
 `registration.yaml` from the Beeper-issued tokens in your config on
 first startup.
 
+Beeper apps send group name and photo changes as state requests. To
+bridge them to LINE, set this in `data/config.yaml`:
+
+```yaml
+bridge:
+    enable_send_state_requests: true
+```
+
 ### Beeper Docker run
 
 ```bash
@@ -211,6 +219,9 @@ Copy the olm `.dll` and `.dll.a` files to the project root, then:
 bbctl c --type bridgev2 sh-line > data/config.yaml
 bbctl r sh-line > data/registration.yaml
 ```
+
+To rename groups and change their photos from Beeper, also set
+`bridge.enable_send_state_requests: true` in `data/config.yaml`.
 
 **Self-hosted Matrix server:**
 
