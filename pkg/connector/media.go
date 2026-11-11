@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 	mauffmpeg "go.mau.fi/util/ffmpeg"
@@ -32,6 +33,7 @@ import (
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/event"
 )
 
 const maxLineImagePixels = 100_000_000
@@ -523,4 +525,38 @@ func generateChunkHashes(encryptedData []byte) []byte {
 	}
 
 	return allHashes
+}
+
+const maxLineVideoDuration = 300 * time.Second
+
+var errSendVideoAsFile = errors.New("video must be sent to LINE as a file")
+
+func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([]byte, error) {
+	var mimeType string
+	var duration time.Duration
+	if info != nil {
+		mimeType, _, _ = strings.Cut(info.MimeType, ";")
+		duration = time.Duration(info.Duration) * time.Millisecond
+	}
+	if mimeType == "" {
+		mimeType, _, _ = strings.Cut(http.DetectContentType(data), ";")
+	}
+	if duration > maxLineVideoDuration {
+		return nil, fmt.Errorf("%w: %s is longer than %s", errSendVideoAsFile, duration, maxLineVideoDuration)
+	}
+	switch strings.TrimSpace(mimeType) {
+	case "video/mp4", "video/quicktime", "video/x-m4v", "video/3gpp":
+		return data, nil
+	}
+	if !mauffmpeg.Supported() {
+		return nil, fmt.Errorf("%w: %s needs ffmpeg", errSendVideoAsFile, mimeType)
+	}
+	converted, err := mauffmpeg.ConvertBytes(ctx, data, ".mp4", nil, []string{
+		"-pix_fmt", "yuv420p", "-c:v", "h264", "-b:v", "2M", "-c:a", "aac", "-movflags", "+faststart",
+		"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
+	}, mimeType)
+	if err != nil {
+		return nil, fmt.Errorf("%w: converting %s to mp4: %w", errSendVideoAsFile, mimeType, err)
+	}
+	return converted, nil
 }
