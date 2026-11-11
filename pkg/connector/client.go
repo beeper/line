@@ -834,16 +834,27 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 	// Create/sync group portals before message prefetching or SSE polling can
 	// deliver messages. Otherwise an existing LINE group whose Matrix room
 	// doesn't exist yet may be created by the first message, which makes the
-	// sender's existing membership look like a fresh join.
+	// sender's existing membership look like a fresh join. The revision is taken
+	// first so operations that arrive during the sync are replayed, and with
+	// backfill every chat's catch-up is queued before live events.
+	localRev, ok := lc.seedLocalRevision(ctx)
+	if !ok {
+		return false
+	}
 	lc.syncChatsNow(ctx)
+	if lc.UserLogin.Bridge.Config.Backfill.Enabled {
+		lc.syncMessageBoxes(ctx)
+	} else {
+		lc.wg.Add(2)
+		go lc.syncDMChats(ctx)
+		go lc.prefetchMessages(ctx)
+	}
 	if ctx.Err() != nil {
 		return false
 	}
 
-	lc.wg.Add(3)
-	go lc.syncDMChats(ctx)
-	go lc.prefetchMessages(ctx)
-	go lc.pollLoop(ctx)
+	lc.wg.Add(1)
+	go lc.pollLoopFrom(ctx, localRev)
 	return true
 }
 

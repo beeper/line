@@ -895,6 +895,32 @@ func (c *Client) GetRecentMessagesV2(chatMid string, limit int) ([]*Message, err
 	return wrapper.Data, nil
 }
 
+// GetPreviousMessagesV2WithRequest returns up to count messages delivered
+// before the given message, newest first, like the LINE client's history paging.
+func (c *Client) GetPreviousMessagesV2WithRequest(ctx context.Context, chatMid string, end MessageIDWrapper, count int) ([]*Message, error) {
+	req := struct {
+		MessageBoxID  string           `json:"messageBoxId"`
+		EndMessageID  MessageIDWrapper `json:"endMessageId"`
+		MessagesCount int              `json:"messagesCount"`
+	}{chatMid, end, count}
+	resp, err := c.callRPCContext(ctx, "TalkService", "getPreviousMessagesV2WithRequest", req, 0)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int        `json:"code"`
+		Message string     `json:"message"`
+		Data    []*Message `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, err
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getPreviousMessagesV2WithRequest failed: %s", wrapper.Message)
+	}
+	return wrapper.Data, nil
+}
+
 func (c *Client) UnsendMessage(reqSeq int64, messageID string) error {
 	_, err := c.callRPC("TalkService", "unsendMessage", reqSeq, messageID)
 	return err
