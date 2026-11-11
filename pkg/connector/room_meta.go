@@ -139,7 +139,7 @@ func (lc *LineClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.
 }
 
 func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]byte, error) {
-	if isHEICImage(mimeType, "") {
+	if isHEIFData(data) {
 		converted, err := convertHEICToJPEG(ctx, data)
 		if err != nil {
 			return nil, err
