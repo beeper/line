@@ -1057,6 +1057,31 @@ func (c *Client) FindContactByUserid(userid string) (*Contact, error) {
 	return &wrapper.Data, nil
 }
 
+// FindContactByPhone looks up a LINE user by a phone number formatted as "+<country code> <number>".
+func (c *Client) FindContactByPhone(phone string) (*Contact, error) {
+	resp, err := c.callRPC("TalkService", "findContactsByPhone", []string{phone})
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int                `json:"code"`
+		Message string             `json:"message"`
+		Data    map[string]Contact `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse findContactsByPhone response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("findContactsByPhone failed: %s", wrapper.Message)
+	}
+	for _, contact := range wrapper.Data {
+		if contact.Mid != "" {
+			return &contact, nil
+		}
+	}
+	return nil, nil
+}
+
 // GetAllContactIds returns the MIDs of all contacts.
 func (c *Client) GetAllContactIds() ([]string, error) {
 	resp, err := c.callRPC("TalkService", "getAllContactIds")

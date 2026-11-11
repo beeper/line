@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -304,8 +306,79 @@ func (lc *LineClient) setCachedContact(mid string, contact line.Contact) {
 	lc.cacheMu.Unlock()
 }
 
+var lineUserMIDRegex = regexp.MustCompile(`^[Uu][A-Za-z0-9_-]{32,}$`)
+
+var twoDigitCountryCodes = map[string]bool{
+	"20": true, "27": true, "30": true, "31": true, "32": true, "33": true, "34": true, "36": true, "39": true,
+	"40": true, "41": true, "43": true, "44": true, "45": true, "46": true, "47": true, "48": true, "49": true,
+	"51": true, "52": true, "53": true, "54": true, "55": true, "56": true, "57": true, "58": true,
+	"60": true, "61": true, "62": true, "63": true, "64": true, "65": true, "66": true,
+	"81": true, "82": true, "84": true, "86": true, "90": true, "91": true, "92": true, "93": true, "94": true, "95": true, "98": true,
+}
+
+func linePhoneQuery(identifier string) (string, bool) {
+	rest, ok := strings.CutPrefix(identifier, "+")
+	if !ok {
+		return "", false
+	}
+	digits := strings.Map(func(r rune) rune {
+		switch {
+		case r >= '0' && r <= '9':
+			return r
+		case r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
+			return -1
+		default:
+			return 'x'
+		}
+	}, rest)
+	if strings.Contains(digits, "x") || len(digits) < 6 || len(digits) > 15 {
+		return "", false
+	}
+	ccLength := 3
+	if digits[0] == '1' || digits[0] == '7' {
+		ccLength = 1
+	} else if twoDigitCountryCodes[digits[:2]] {
+		ccLength = 2
+	}
+	return "+" + digits[:ccLength] + " " + digits[ccLength:], true
+}
+
+func isInvalidUseridError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), `"reason":"userid is invalid"`)
+}
+
+func (lc *LineClient) resolveIdentifierMID(ctx context.Context, identifier string) (string, error) {
+	identifier = strings.TrimSpace(identifier)
+	if lineUserMIDRegex.MatchString(identifier) {
+		return identifier, nil
+	}
+	var contact *line.Contact
+	var err error
+	if phone, ok := linePhoneQuery(identifier); ok {
+		_, contact, err = callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByPhone(phone)
+		})
+	} else {
+		userID := strings.ToLower(strings.TrimPrefix(identifier, "@"))
+		_, contact, err = callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByUserid(userID)
+		})
+	}
+	if line.IsTalkExceptionNotFound(err) || isInvalidUseridError(err) || (err == nil && (contact == nil || contact.Mid == "")) {
+		return "", bridgev2.WrapRespErr(fmt.Errorf("no LINE user found for %q", identifier), mautrix.MNotFound)
+	} else if err != nil {
+		return "", fmt.Errorf("failed to look up LINE user: %w", err)
+	}
+	lc.setCachedContact(contact.Mid, *contact)
+	return contact.Mid, nil
+}
+
 func (lc *LineClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
-	userID := makeUserID(strings.TrimSpace(identifier))
+	mid, err := lc.resolveIdentifierMID(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	userID := makeUserID(mid)
 	portalID := networkid.PortalKey{ID: makePortalID(string(userID)), Receiver: lc.UserLogin.ID}
 	ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, userID)
 	if err != nil {
