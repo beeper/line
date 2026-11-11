@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -281,6 +282,7 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		return
 	}
 
+	dmMIDs := make([]string, 0, len(messageBoxes))
 	for _, box := range messageBoxes {
 		mid := box.ID
 		lowerMid := strings.ToLower(mid)
@@ -291,7 +293,12 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		if lc.isUserBlocked(mid) {
 			continue
 		}
-
+		dmMIDs = append(dmMIDs, mid)
+	}
+	if err := lc.fetchContacts(ctx, dmMIDs); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for DM sync")
+	}
+	for _, mid := range dmMIDs {
 		lc.queueDMChatResync(ctx, mid, false, false)
 	}
 }
@@ -909,6 +916,16 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch batch of chats")
 			continue
+		}
+		var memberMIDs []string
+		for _, chat := range chatsResp.Chats {
+			if chat.Extra.GroupExtra != nil {
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.MemberMids))
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.InviteeMids))
+			}
+		}
+		if err := lc.fetchContacts(ctx, memberMIDs); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for batch of chats")
 		}
 
 		for _, chat := range chatsResp.Chats {

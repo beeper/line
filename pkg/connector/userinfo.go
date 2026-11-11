@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mau.fi/util/jsontime"
@@ -235,7 +237,10 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 }
 
 func (lc *LineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
-	contact := lc.getContact(ctx, string(ghost.ID))
+	contact, err := lc.lookupContact(ctx, string(ghost.ID))
+	if err != nil {
+		return nil, err
+	}
 	name := contact.EffectiveDisplayName()
 	return &bridgev2.UserInfo{
 		Identifiers: []string{string(ghost.ID)},
@@ -245,11 +250,26 @@ func (lc *LineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*
 }
 
 func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
+	contact, err := lc.lookupContact(ctx, mid)
+	if err != nil {
+		return line.Contact{Mid: mid, DisplayName: mid}
+	}
+	return contact
+}
+
+func (lc *LineClient) getCachedContact(mid string) (line.Contact, bool) {
 	lc.cacheMu.Lock()
 	cached, ok := lc.contactCache[mid]
 	lc.cacheMu.Unlock()
 	if ok && time.Since(cached.cachedAt) < contactCacheTTL {
-		return cached.Contact
+		return cached.Contact, true
+	}
+	return line.Contact{}, false
+}
+
+func (lc *LineClient) lookupContact(ctx context.Context, mid string) (line.Contact, error) {
+	if contact, ok := lc.getCachedContact(mid); ok {
+		return contact, nil
 	}
 
 	// Use GetProfile for our own user data
@@ -257,41 +277,96 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 		_, profile, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Profile, error) {
 			return client.GetProfile()
 		})
-		if err == nil && profile != nil {
-			contact := line.Contact{Mid: mid, DisplayName: profile.DisplayName, PicturePath: profile.PicturePath}
-			lc.setCachedContact(mid, contact)
-			return contact
+		if err != nil {
+			return line.Contact{}, err
+		} else if profile == nil {
+			return line.Contact{}, fmt.Errorf("getProfile returned no profile")
 		}
-		return line.Contact{Mid: mid, DisplayName: mid}
-	}
-
-	client := lc.newClient()
-	client, res, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.ContactsResponse, error) {
-		return client.GetContactsV2([]string{mid})
-	})
-	if err == nil && res != nil && res.Contacts != nil {
-		if wrapper, ok := res.Contacts[mid]; ok {
-			lc.setCachedContact(mid, wrapper.Contact)
-			return wrapper.Contact
-		}
-	}
-
-	// Fall back to BuddyService for official/business accounts
-	lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Msg("Contact not found via GetContactsV2, trying BuddyService")
-	_, buddy, err := callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.BuddyProfile, error) {
-		return client.GetBuddyProfile(mid)
-	})
-	if err == nil && buddy != nil {
-		lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Str("display_name", buddy.DisplayName).Str("picture_path", buddy.PicturePath).Msg("Got buddy profile")
-		contact := line.Contact{Mid: mid, DisplayName: buddy.DisplayName, PicturePath: buddy.PicturePath}
+		contact := line.Contact{Mid: mid, DisplayName: profile.DisplayName, PicturePath: profile.PicturePath}
 		lc.setCachedContact(mid, contact)
-		return contact
-	}
-	if err != nil {
-		lc.UserLogin.Bridge.Log.Debug().Err(err).Str("mid", mid).Msg("BuddyService lookup also failed")
+		return contact, nil
 	}
 
-	return line.Contact{Mid: mid, DisplayName: mid}
+	if err := lc.fetchContacts(ctx, []string{mid}); err != nil {
+		return line.Contact{}, err
+	}
+	if contact, ok := lc.getCachedContact(mid); ok {
+		return contact, nil
+	}
+	return line.Contact{Mid: mid, DisplayName: mid}, nil
+}
+
+// fetchContacts loads contacts that aren't cached the way the LINE client
+// does: up to 100 MIDs per getContactsV2 call, three calls at a time.
+func (lc *LineClient) fetchContacts(ctx context.Context, mids []string) error {
+	pending := make([]string, 0, len(mids))
+	seen := make(map[string]struct{}, len(mids))
+	for _, mid := range mids {
+		if _, ok := seen[mid]; ok || !isUserMID(mid) || lc.isOwnMID(mid) {
+			continue
+		}
+		seen[mid] = struct{}{}
+		if _, ok := lc.getCachedContact(mid); !ok {
+			pending = append(pending, mid)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	slots := make(chan struct{}, contactFetchConcurrency)
+	for batch := range slices.Chunk(pending, contactFetchBatchSize) {
+		wg.Go(func() {
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			if err := lc.fetchContactBatch(ctx, batch); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	return firstErr
+}
+
+func (lc *LineClient) fetchContactBatch(ctx context.Context, mids []string) error {
+	client, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.ContactsResponse, error) {
+		return client.GetContactsV2(mids)
+	})
+	if err != nil {
+		return err
+	}
+	for _, mid := range mids {
+		if wrapper, ok := res.Contacts[mid]; ok && wrapper.Contact.Mid != "" {
+			lc.setCachedContact(mid, wrapper.Contact)
+			continue
+		}
+		// Fall back to BuddyService for official/business accounts
+		lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Msg("Contact not found via GetContactsV2, trying BuddyService")
+		var buddy *line.BuddyProfile
+		client, buddy, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.BuddyProfile, error) {
+			return client.GetBuddyProfile(mid)
+		})
+		if err == nil && buddy != nil {
+			lc.UserLogin.Bridge.Log.Debug().Str("mid", mid).Str("display_name", buddy.DisplayName).Str("picture_path", buddy.PicturePath).Msg("Got buddy profile")
+			lc.setCachedContact(mid, line.Contact{Mid: mid, DisplayName: buddy.DisplayName, PicturePath: buddy.PicturePath})
+			continue
+		}
+		if err != nil {
+			lc.UserLogin.Bridge.Log.Debug().Err(err).Str("mid", mid).Msg("BuddyService lookup also failed")
+			if isTransientLineError(err) || ctx.Err() != nil {
+				return err
+			}
+		}
+		lc.setCachedContact(mid, line.Contact{Mid: mid, DisplayName: mid})
+	}
+	return nil
 }
 
 // setCachedContact stores a contact in the cache under lc.cacheMu.
@@ -342,7 +417,11 @@ func (lc *LineClient) midToResolveIdentifier(ctx context.Context, mid string) *b
 	}
 }
 
-const maxSearchResults = 20
+const (
+	maxSearchResults        = 20
+	contactFetchBatchSize   = 100
+	contactFetchConcurrency = 3
+)
 
 func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev2.ResolveIdentifierResponse, error) {
 	var results []*bridgev2.ResolveIdentifierResponse
