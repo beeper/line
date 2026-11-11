@@ -2555,6 +2555,14 @@ func makeMemberChangeEvent(
 	}
 }
 
+func withPrevMembership(evt *simplevent.ChatInfoChange, prev event.Membership) *simplevent.ChatInfoChange {
+	for userID, member := range evt.ChatInfoChange.MemberChanges.MemberMap {
+		member.PrevMembership = prev
+		evt.ChatInfoChange.MemberChanges.MemberMap[userID] = member
+	}
+	return evt
+}
+
 func (lc *LineClient) makeSystemMemberChangesEvent(
 	portalKey networkid.PortalKey,
 	mids []string,
@@ -2806,7 +2814,7 @@ func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.Cha
 		lc.UserLogin.Bridge.Log.Debug().Str("loc_key", locKey).Str("chat_mid", msg.To).Str("leaver_mid", msg.From).Msg("System message: member leave")
 		lc.removeGroupMemberFromCache(msg.To, msg.From)
 		leaver := lc.eventSenderForMID(msg.From)
-		return makeMemberChangeEvent(portalKey, leaver, leaver, event.MembershipLeave, ts, false), true
+		return withPrevMembership(makeMemberChangeEvent(portalKey, leaver, leaver, event.MembershipLeave, ts, false), event.MembershipJoin), true
 	case "C_MR", "A_MR":
 		removerMID, removedMID, _ := memberRemovalMIDs(msg)
 		lc.UserLogin.Bridge.Log.Debug().
@@ -2816,14 +2824,14 @@ func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.Cha
 			Str("removed_mid", removedMID).
 			Msg("System message: member removed")
 		lc.removeGroupMemberFromCache(msg.To, removedMID)
-		return makeMemberChangeEvent(
+		return withPrevMembership(makeMemberChangeEvent(
 			portalKey,
 			lc.eventSenderForMID(removedMID),
 			lc.eventSenderForMID(removerMID),
 			event.MembershipLeave,
 			ts,
 			false,
-		), true
+		), event.MembershipJoin), true
 	case "C_GI", "C_MI", "A_MI":
 		// msg.From is the inviter. LOC_ARGS has inviterMid\x1e followed by
 		// one or more invitee MIDs separated by \x1f.
@@ -2856,7 +2864,7 @@ func (lc *LineClient) makeSystemMessageEvent(op line.Operation) (*simplevent.Cha
 		for _, inviteeMID := range invitees {
 			lc.removeGroupMemberFromCache(msg.To, inviteeMID)
 		}
-		return lc.makeSystemMemberChangesEvent(portalKey, invitees, event.MembershipLeave, ts), true
+		return withPrevMembership(lc.makeSystemMemberChangesEvent(portalKey, invitees, event.MembershipLeave, ts), event.MembershipInvite), true
 	case "A_MC":
 		// Auto-join via call / member added. msg.From is the person added.
 		lc.addGroupMembersToCache(msg.To, msg.From)
