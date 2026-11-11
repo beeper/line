@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/simplevent"
 
 	"github.com/beeper/line/pkg/line"
 )
@@ -46,6 +49,46 @@ func (lc *LineClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.
 		return wrapSendError(err)
 	}
 	return lc.saveChatDeletion(context.WithoutCancel(ctx), chatMid, lastDelivered.MessageID)
+}
+
+func (lc *LineClient) handleChatRemovedElsewhere(ctx context.Context, op line.Operation) {
+	chatMid := op.Param1
+	if chatMid == "" {
+		return
+	}
+	ts := time.Now()
+	if createdAt, err := op.CreatedTime.Int64(); err == nil && createdAt > 0 {
+		ts = time.UnixMilli(createdAt)
+	}
+	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
+	log := lc.UserLogin.Log.With().Str("chat_mid", chatMid).Str("last_message_id", op.Param2).Logger()
+	cutoff := op.Param2
+	if id, ok := new(big.Int).SetString(cutoff, 10); !ok || id.Sign() < 0 {
+		cutoff = "0"
+		lastMsg, err := lc.UserLogin.Bridge.DB.Message.GetLastPartAtOrBeforeTime(ctx, portalKey, ts)
+		if err != nil {
+			log.Err(err).Msg("Failed to get last bridged message for chat removed on another device")
+			return
+		} else if lastMsg != nil {
+			if id, ok := new(big.Int).SetString(string(lastMsg.ID), 10); ok && id.Sign() >= 0 {
+				cutoff = string(lastMsg.ID)
+			}
+		}
+	}
+	if err := lc.saveChatDeletion(ctx, chatMid, cutoff); err != nil {
+		log.Err(err).Msg("Failed to save deletion of chat removed on another device")
+		return
+	}
+	log.Info().Str("cutoff", cutoff).Msg("Chat removed on another device")
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatDelete{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventChatDelete,
+			PortalKey: portalKey,
+			Sender:    lc.eventSenderForMID(string(lc.UserLogin.ID)),
+			Timestamp: ts,
+		},
+		OnlyForMe: true,
+	})
 }
 
 func (lc *LineClient) chatDeletionPrefix() string {

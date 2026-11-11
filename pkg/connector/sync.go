@@ -2149,7 +2149,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			return
 		}
 		lc.reqSeqMu.Unlock()
-		lc.handleSelfLeave(op.Param1)
+		lc.handleChatRemovedElsewhere(ctx, op)
 
 	case OpDeleteOtherFromChat:
 		lc.handleMemberLeave(op.Param1, op.Param2)
