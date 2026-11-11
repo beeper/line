@@ -17,6 +17,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,8 +25,13 @@ import (
 	"strings"
 
 	ffmpeg "github.com/u2takey/ffmpeg-go"
+	mauffmpeg "go.mau.fi/util/ffmpeg"
 	"golang.org/x/crypto/hkdf"
+	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
+	"maunium.net/go/mautrix/bridgev2"
 )
 
 const maxLineImagePixels = 100_000_000
@@ -58,21 +64,73 @@ func lineImageSizeAllowed(width, height int) bool {
 	return width > 0 && height > 0 && width <= maxLineImagePixels/height
 }
 
-func isHEICImage(mimeType, fileName string) bool {
-	mimeType, _, _ = strings.Cut(strings.ToLower(mimeType), ";")
-	switch strings.TrimSpace(mimeType) {
-	case "image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence":
-		return true
+var errSendImageAsFile = errors.New("image must be sent to LINE as a file")
+
+func prepareLineImage(ctx context.Context, data []byte, fileName string) ([]byte, string, string, error) {
+	mimeType := http.DetectContentType(data)
+	switch {
+	case isHEIFData(data):
+		converted, err := convertHEICToJPEG(ctx, data)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("%w: %w", bridgev2.ErrMediaConvertFailed, err)
+		}
+		data, mimeType, fileName = converted, "image/jpeg", replaceExtension(fileName, ".jpg")
+	case mimeType == "image/jpeg", mimeType == "image/png", mimeType == "image/gif", mimeType == "image/bmp":
+	case strings.HasPrefix(mimeType, "text/"):
+		return nil, "", "", errSendImageAsFile
+	default:
+		converted, convertedMime, err := reencodeImage(ctx, data)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("%w: %w", errSendImageAsFile, err)
+		}
+		data, mimeType = converted, convertedMime
+		if mimeType == "image/png" {
+			fileName = replaceExtension(fileName, ".png")
+		} else {
+			fileName = replaceExtension(fileName, ".jpg")
+		}
 	}
-	extension := strings.ToLower(filepath.Ext(fileName))
-	return extension == ".heic" || extension == ".heif"
+	if config, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil && !lineImageSizeAllowed(config.Width, config.Height) {
+		return nil, "", "", errSendImageAsFile
+	}
+	return data, mimeType, fileName, nil
 }
 
-func jpegFileName(fileName string) string {
-	if fileName == "" {
-		return "image.jpg"
+func reencodeImage(ctx context.Context, data []byte) ([]byte, string, error) {
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		if !mauffmpeg.Supported() {
+			return nil, "", err
+		}
+		data, err = mauffmpeg.ConvertBytes(ctx, data, ".png", nil, []string{"-frames:v", "1"}, http.DetectContentType(data))
+		if err != nil {
+			return nil, "", err
+		}
+		if config, _, err = image.DecodeConfig(bytes.NewReader(data)); err != nil {
+			return nil, "", err
+		}
 	}
-	return strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+	if config.Width*config.Height > maxLineImagePixels {
+		return nil, "", fmt.Errorf("image is %dx%d", config.Width, config.Height)
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", err
+	}
+	var buf bytes.Buffer
+	if opaque, ok := img.(interface{ Opaque() bool }); ok && !opaque.Opaque() {
+		err = png.Encode(&buf, img)
+		return buf.Bytes(), "image/png", err
+	}
+	err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90})
+	return buf.Bytes(), "image/jpeg", err
+}
+
+func replaceExtension(fileName, extension string) string {
+	if fileName == "" {
+		return "image" + extension
+	}
+	return strings.TrimSuffix(fileName, filepath.Ext(fileName)) + extension
 }
 
 func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
