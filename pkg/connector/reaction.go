@@ -592,7 +592,38 @@ func (lc *LineClient) resolveMatrixReaction(ctx context.Context, msg *bridgev2.M
 	if !ok {
 		return lineReactionRef{}, unsupportedMatrixReactionError(key)
 	}
+	if paid := ref.typ.PaidReactionType; paid != nil {
+		if owned, err := lc.ownsSticonProduct(ctx, paid.ProductID); err != nil {
+			lc.UserLogin.Log.Warn().Err(err).Str("product_id", paid.ProductID).Msg("Failed to check LINE emoji pack ownership for reaction")
+		} else if !owned {
+			return lineReactionRef{}, bridgev2.WrapErrorInStatus(fmt.Errorf("LINE emoji pack %s is not owned", paid.ProductID)).
+				WithStatus(event.MessageStatusFail).
+				WithIsCertain(true).
+				WithMessage("you don't own this LINE emoji, so it can't be used as a reaction").
+				WithErrorReason(event.MessageStatusUnsupported)
+		}
+	}
 	return ref, nil
+}
+
+func (lc *LineClient) ownsSticonProduct(ctx context.Context, productID string) (bool, error) {
+	packURL := linePackURL(productID, true)
+	for _, refresh := range []bool{false, true} {
+		products, err := lc.ownedStickerProducts(ctx, refresh)
+		if err != nil {
+			return false, err
+		}
+		if _, ok := products[packURL]; ok {
+			return true, nil
+		}
+	}
+	lc.stickerPacksMu.Lock()
+	partial := lc.stickerPacksPartial
+	lc.stickerPacksMu.Unlock()
+	if partial {
+		return false, fmt.Errorf("owned LINE emoji packs couldn't be fetched")
+	}
+	return false, nil
 }
 
 func unsupportedMatrixReactionError(key string) error {
