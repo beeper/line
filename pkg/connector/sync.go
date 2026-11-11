@@ -763,6 +763,9 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	}
 	close(jobs)
 	workers.Wait()
+	if ctx.Err() == nil {
+		lc.queueStartupReadReceipts(messageBoxes, chatMIDs)
+	}
 
 	// Historical membership/name events are real state events. Replay them in
 	// timestamp order, then restore LINE's current authoritative chat state in
@@ -1943,6 +1946,13 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 
 	case OpDeleteSelfFromChat:
 		lc.handleSelfLeave(op.Param1)
+
+	case OpSendChatChecked:
+		ts := time.Now()
+		if createdAt, err := op.CreatedTime.Int64(); err == nil && createdAt > 0 {
+			ts = time.UnixMilli(createdAt)
+		}
+		lc.queueOwnReadReceipt(op.Param1, op.Param2, ts)
 
 	case OpSendChatRemoved:
 		lc.reqSeqMu.Lock()
