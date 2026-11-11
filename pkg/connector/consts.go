@@ -36,6 +36,7 @@ const (
 	ContentImage            ContentType = 1
 	ContentVideo            ContentType = 2
 	ContentAudio            ContentType = 3
+	ContentHTML             ContentType = 4
 	ContentSticker          ContentType = 7
 	ContentContact          ContentType = 13
 	ContentFile             ContentType = 14
