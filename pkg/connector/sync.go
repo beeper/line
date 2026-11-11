@@ -38,13 +38,13 @@ const (
 	unblockBackfillFrameworkCompletionTimeout = 2 * time.Minute
 	groupPortalCreateWait                     = 30 * time.Second
 	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
-	defaultReceiveAuthProbeInterval           = 150 * time.Second
 	maxReconnectDelay                         = 5 * time.Minute
 	opRevisionSaveInterval                    = 30 * time.Second
 )
 
 var (
-	errReceiveAuthProbeDue               = errors.New("receive auth probe due")
+	errSSEReconnect                      = errors.New("SSE reconnect requested")
+	errSSEStop                           = errors.New("SSE session ended")
 	errUnblockBackfillHandledByFramework = errors.New("unblock backfill handled by framework")
 )
 
@@ -109,12 +109,7 @@ var (
 	listenSSEWithClient = func(client *line.Client, ctx context.Context, localRev int64, handler func(eventType, data string)) error {
 		return client.ListenSSE(ctx, localRev, handler)
 	}
-	sseReconnectDelay          = 3 * time.Second
-	receiveAuthProbeInterval   = defaultReceiveAuthProbeInterval
-	receiveAuthProbeNow        = time.Now
-	newReceiveAuthProbeContext = func(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
-		return context.WithDeadlineCause(parent, deadline, errReceiveAuthProbeDue)
-	}
+	sseReconnectDelay        = 3 * time.Second
 	runSilentUnblockBackfill = func(ctx context.Context, lc *LineClient, mid string) {
 		lc.silentBackfillRecentMessages(ctx, mid, startupBackfillMessageLimit)
 	}
@@ -1705,26 +1700,6 @@ func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
 	}
 }
 
-func startReceiveAuthProbeContext(parent context.Context, startedAt time.Time) (context.Context, context.CancelFunc, time.Time) {
-	if receiveAuthProbeInterval <= 0 {
-		return parent, func() {}, time.Time{}
-	}
-
-	nextProbeAt := startedAt.Add(receiveAuthProbeInterval)
-	if now := receiveAuthProbeNow(); !nextProbeAt.After(now) {
-		nextProbeAt = now.Add(receiveAuthProbeInterval)
-	}
-	receiveCtx, cancel := newReceiveAuthProbeContext(parent, nextProbeAt)
-	return receiveCtx, cancel, nextProbeAt
-}
-
-func isReceiveAuthProbeDue(receiveCtx context.Context, nextProbeAt time.Time) bool {
-	if receiveAuthProbeInterval <= 0 {
-		return false
-	}
-	return errors.Is(context.Cause(receiveCtx), errReceiveAuthProbeDue) || !receiveAuthProbeNow().Before(nextProbeAt)
-}
-
 type reconnectBackoff struct {
 	delay time.Duration
 }
@@ -1811,20 +1786,8 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 		savedAt = time.Now()
 	}
 
-	receiveCtx, cancelReceive, nextProbeAt := startReceiveAuthProbeContext(ctx, receiveAuthProbeNow())
-	defer func() {
-		cancelReceive()
-	}()
-	probeAndReschedule := func() bool {
-		probeStartedAt := receiveAuthProbeNow()
-		if lc.handleReceiveAuthProbe(ctx) || ctx.Err() != nil {
-			return true
-		}
-		cancelReceive()
-		receiveCtx, cancelReceive, nextProbeAt = startReceiveAuthProbeContext(ctx, probeStartedAt)
-		return false
-	}
-
+	var listenCtx context.Context
+	var cancelListen context.CancelCauseFunc
 	sseDisconnected := false
 	var backoff reconnectBackoff
 	handler := func(eventType, data string) {
@@ -1833,13 +1796,22 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			sseDisconnected = false
 		}
 
-		// handle keep alives
-		if eventType == line.SSEEventOpen || eventType == "ping" || eventType == "connInfoRevision" {
-			return
-		}
-
-		// handle fullsync requests
-		if eventType == "fullSync" {
+		switch eventType {
+		case line.SSEEventOpen, "ping", "connInfoRevision":
+		case "reconnect":
+			lc.UserLogin.Bridge.Log.Debug().Msg("LINE asked to reconnect the operation stream")
+			cancelListen(errSSEReconnect)
+		case "talkException":
+			err := line.NewSSETalkException(data)
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Received talkException on the operation stream")
+			if !line.IsAuthError(err) {
+				return
+			} else if lc.handleReceiveAuthError(ctx, client, err) {
+				cancelListen(errSSEStop)
+			} else {
+				cancelListen(errSSEReconnect)
+			}
+		case "fullSync":
 			lc.UserLogin.Bridge.Log.Info().Msg("Received fullSync request")
 
 			var fsPayload struct {
@@ -1863,17 +1835,14 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			if lc.UserLogin.Bridge.Config.Backfill.Enabled {
 				lc.syncChatsNow(ctx)
 				lc.syncMessageBoxes(ctx)
-				return
+			} else {
+				lc.wg.Add(3)
+				go lc.syncChats(ctx)
+				go lc.syncDMChats(ctx)
+				go lc.prefetchMessages(ctx)
 			}
-			lc.wg.Add(3)
-			go lc.syncChats(ctx)
-			go lc.syncDMChats(ctx)
-			go lc.prefetchMessages(ctx)
-			return
-		}
-
-		// handle operations
-		if eventType == "operation" {
+			cancelListen(errSSEReconnect)
+		case "operation":
 			var op line.Operation
 			if err := json.Unmarshal([]byte(data), &op); err != nil {
 				lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to unmarshal op")
@@ -1887,6 +1856,8 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 
 			lc.handleOperation(ctx, op)
 			saveRevision(false)
+		default:
+			lc.UserLogin.Bridge.Log.Debug().Str("event_type", eventType).Str("data", data).Msg("Unhandled SSE event")
 		}
 	}
 
@@ -1894,25 +1865,18 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 		if ctx.Err() != nil {
 			return
 		}
-		if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
-			if probeAndReschedule() {
-				return
-			}
-			continue
-		}
 
 		client = lc.newClient()
-		err := listenSSEWithClient(client, receiveCtx, localRev, handler)
+		listenCtx, cancelListen = context.WithCancelCause(ctx)
+		err := listenSSEWithClient(client, listenCtx, localRev, handler)
+		cause := context.Cause(listenCtx)
+		cancelListen(nil)
+		if ctx.Err() != nil || errors.Is(cause, errSSEStop) {
+			return
+		} else if errors.Is(cause, errSSEReconnect) {
+			continue
+		}
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
-				if probeAndReschedule() {
-					return
-				}
-				continue
-			}
 			if errors.Is(err, context.Canceled) {
 				return
 			}
@@ -1920,7 +1884,7 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
 
 				if line.IsSSEIdleTimeout(err) {
-					if probeAndReschedule() {
+					if lc.handleReceiveAuthProbe(ctx) || ctx.Err() != nil {
 						return
 					}
 				} else if line.IsAuthError(err) && lc.handleReceiveAuthError(ctx, client, err) {
@@ -1930,9 +1894,7 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 					sseDisconnected = true
 				}
 			}
-			if !waitForSSEReconnect(receiveCtx, backoff.next()) {
-				continue
-			}
+			waitForSSEReconnect(ctx, backoff.next())
 		}
 	}
 }
