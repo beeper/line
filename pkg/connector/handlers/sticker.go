@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"image"
-	_ "image/png"
+	"image/draw"
+	"image/png"
 	"io"
+	"net/http"
+	"net/url"
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -27,21 +30,25 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 	}
 
 	if stkID != "" {
-		isAnimated := strings.Contains(stkOpt, "A")
-		baseURL := "https://stickershop.line-scdn.net/stickershop/v1/sticker/%s/android/sticker_animation.png"
-		fallbackURL := "https://stickershop.line-scdn.net/stickershop/v1/sticker/%s/android/sticker.png"
-		if !isAnimated {
-			baseURL, fallbackURL = fallbackURL, baseURL
+		baseURL := lineStickerBaseURL(stkID, data.ContentMetadata["STKHASH"])
+		stickerURL := baseURL + "/sticker.png"
+		isAnimated := false
+		switch stkOpt {
+		case "A", "AS":
+			stickerURL, isAnimated = baseURL+"/sticker_animation.png", true
+		case "P", "PS":
+			stickerURL, isAnimated = baseURL+"/sticker_popup.png", true
+		case "T":
+			stickerURL = baseURL + "/base/sticker.png"
 		}
 
-		url := fmt.Sprintf(baseURL, stkID)
-		resp, err := h.HTTPClient.Get(url)
-		if (err != nil || resp.StatusCode != 200) && fallbackURL != "" {
+		resp, err := h.HTTPClient.Get(stickerURL)
+		if fallbackURL := lineStickerBaseURL(stkID, "") + "/sticker.png"; (err != nil || resp.StatusCode != 200) && stickerURL != fallbackURL {
 			if resp != nil {
 				resp.Body.Close()
 			}
-			url = fmt.Sprintf(fallbackURL, stkID)
-			resp, err = h.HTTPClient.Get(url)
+			isAnimated = false
+			resp, err = h.HTTPClient.Get(fallbackURL)
 		}
 
 		if err != nil {
@@ -57,6 +64,8 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 			} else {
 				if isAnimated {
 					stkData = forceAPNGLoop(stkData)
+				} else if stkOpt == "T" {
+					stkData = h.overlayStickerNameText(stkID, data.ContentMetadata["STK_IMG_TXT"], stkData)
 				}
 
 				mimeType := resp.Header.Get("Content-Type")
@@ -143,6 +152,49 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 			},
 		},
 	}, nil
+}
+
+func lineStickerBaseURL(stickerID, hash string) string {
+	if hash != "" {
+		return fmt.Sprintf("https://stickershop.line-scdn.net/stickershop/v2/sticker/%s/%s/android", stickerID, url.PathEscape(hash))
+	}
+	return fmt.Sprintf("https://stickershop.line-scdn.net/stickershop/v1/sticker/%s/android", stickerID)
+}
+
+func (h *Handler) overlayStickerNameText(stickerID, text string, baseData []byte) []byte {
+	if text == "" {
+		return baseData
+	}
+	overlayURL := fmt.Sprintf("https://stickershop.line-scdn.net/stickershop/v1/sticker/%s/android/overlay/name/%s/sticker.png", stickerID, url.PathEscape(text))
+	resp, err := h.HTTPClient.Get(overlayURL)
+	if err != nil {
+		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to download sticker name overlay")
+		return baseData
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.Log.Warn().Int("status_code", resp.StatusCode).Str("stk_id", stickerID).Msg("Failed to download sticker name overlay")
+		return baseData
+	}
+	base, err := png.Decode(bytes.NewReader(baseData))
+	if err != nil {
+		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to decode sticker base image")
+		return baseData
+	}
+	overlay, err := png.Decode(resp.Body)
+	if err != nil {
+		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to decode sticker name overlay")
+		return baseData
+	}
+	combined := image.NewNRGBA(base.Bounds())
+	draw.Draw(combined, combined.Bounds(), base, base.Bounds().Min, draw.Src)
+	draw.Draw(combined, combined.Bounds(), overlay, overlay.Bounds().Min, draw.Over)
+	var buf bytes.Buffer
+	if err = png.Encode(&buf, combined); err != nil {
+		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to encode sticker with name overlay")
+		return baseData
+	}
+	return buf.Bytes()
 }
 
 // forceAPNGLoop sets the APNG loop count to 0 (infinite) in an acTL chunk.
