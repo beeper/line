@@ -449,7 +449,7 @@ func (lc *LineClient) convertLineMessageContent(ctx context.Context, portal *bri
 	case ContentSticker:
 		return h.ConvertSticker(ctx, portal, intent, data, replyRelatesTo)
 	case ContentLocation:
-		return h.ConvertLocation(data, replyRelatesTo)
+		return h.ConvertLocation(data, decryptedBody, replyRelatesTo)
 	case ContentContact:
 		return h.ConvertContact(data, replyRelatesTo)
 	case ContentFlex:
