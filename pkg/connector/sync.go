@@ -2214,7 +2214,8 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 					lc.hiddenJoinGroupMessageSender(ctx, portal, op.Param1, op.Param2, time.UnixMilli(ts))
 				},
 			},
-			ReadUpTo: time.UnixMilli(ts),
+			LastTarget: networkid.MessageID(op.Param3),
+			ReadUpTo:   time.UnixMilli(ts),
 		})
 
 	case OpUnsendLocal, OpUnsendRemote:
