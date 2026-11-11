@@ -791,6 +791,27 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	sentMsg, err := sendLineMessage(reqSeq, lineMsg)
 
+	if err != nil && !isGroup && !plainText && line.IsE2EEReceiverKeyRejected(err) {
+		lc.cacheMu.Lock()
+		delete(lc.peerKeys, portalMid)
+		lc.cacheMu.Unlock()
+		myRaw, myKeyID, errKey := lc.E2EE.MyKeyIDs()
+		peerRaw, peerPub, errPeer := lc.ensurePeerKey(ctx, portalMid)
+		if errKey == nil && errPeer == nil {
+			lc.UserLogin.Bridge.Log.Info().Err(err).
+				Str("chat_mid", portalMid).
+				Int("peer_key_id", peerRaw).
+				Msg("LINE rejected the receiver key, retrying with the renegotiated key")
+			if retryChunks, errEnc := lc.E2EE.EncryptMessageV2Raw(portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, payload); errEnc == nil {
+				lineMsg.Chunks = retryChunks
+				contentMetadata["e2eeVersion"] = strconv.Itoa(e2ee.ChunksVersion(retryChunks))
+				retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
+				lc.trackReqSeq(retryReqSeq)
+				sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
+			}
+		}
+	}
+
 	// LINE rejects some file types from the Chrome Extension client.
 	// Retry by wrapping the file in a ZIP archive (matching Chrome Extension behavior).
 	if err != nil && strings.Contains(err.Error(), "Extension does not support file upload") && rawFileData != nil {
