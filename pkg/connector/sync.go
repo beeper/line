@@ -1133,6 +1133,13 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
 	}
+	if chat.Extra.GroupExtra != nil {
+		mutedUntil := bridgev2.Unmuted
+		if chat.NotificationDisabled {
+			mutedUntil = event.MutedForever
+		}
+		info.UserLocal = &bridgev2.UserLocalPortalInfo{MutedUntil: &mutedUntil}
+	}
 	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
 	// out from under an accept that's already in flight.
 	if selfInvitePending {

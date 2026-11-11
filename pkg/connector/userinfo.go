@@ -197,6 +197,9 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 			chat = &res.Chats[0]
 		}
 		info := lc.chatToChatInfo(ctx, chat, true)
+		if strings.HasPrefix(lowerMid, "r") {
+			info.UserLocal = nil
+		}
 		if portal.MXID == "" && lc.shouldSkipDeletedChat(mid, "") {
 			lc.stripRemoteMembersFromInitialChatInfo(info)
 		}
