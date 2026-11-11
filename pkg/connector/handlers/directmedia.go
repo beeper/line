@@ -29,6 +29,7 @@ type DirectMedia struct {
 	Size        int      `json:"-"`
 	FileName    string   `json:"-"`
 	Duration    int      `json:"-"`
+	IsPreview   bool     `json:"-"`
 }
 
 type GenerateDirectMediaURI func(context.Context, string, *DirectMedia) (id.ContentURIString, any, error)
@@ -93,6 +94,18 @@ func (dm *DirectMedia) validate() error {
 	return nil
 }
 
+func (dm *DirectMedia) Preview() *DirectMedia {
+	preview := *dm
+	preview.IsPreview = true
+	preview.ContentType = "image/jpeg"
+	if preview.SID == "m" {
+		preview.TID = "preview"
+	} else {
+		preview.OID += "__ud-preview"
+	}
+	return &preview
+}
+
 func (h *Handler) generateDirectMedia(
 	ctx context.Context,
 	messageID string,
@@ -141,7 +154,8 @@ func directMediaDuration(contentMetadata map[string]string) int {
 func directMediaContent(kind, decryptedBody string, metadata map[string]string) (name, contentType string, err error) {
 	switch kind {
 	case "image":
-		return "image.jpg", "image/jpeg", nil
+		name, contentType = lineImageType(metadata)
+		return name, contentType, nil
 	case "audio":
 		return "audio.m4a", "audio/mp4", nil
 	case "video":
