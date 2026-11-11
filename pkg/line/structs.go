@@ -97,6 +97,7 @@ type Message struct {
 	ToType          int               `json:"toType"`
 	SessionID       int               `json:"sessionId,omitempty"`
 	CreatedTime     json.Number       `json:"createdTime"`
+	DeliveredTime   json.Number       `json:"deliveredTime,omitempty"`
 	ContentType     int               `json:"contentType"`
 	HasContent      bool              `json:"hasContent,omitempty"`
 	ContentMetadata map[string]string `json:"contentMetadata"`

@@ -211,6 +211,7 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 		Name:        &chatName,
 		Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
 		UserBlocked: ptr.Ptr(lc.isUserBlocked(mid)),
+		CanBackfill: true,
 		Members: &bridgev2.ChatMemberList{
 			IsFull: true,
 			MemberMap: chatMemberMapFromList([]bridgev2.ChatMember{
