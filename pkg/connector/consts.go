@@ -7,6 +7,7 @@ const (
 	OpSendMessage            OperationType = 25
 	OpReceiveMessage         OperationType = 26
 	OpSendChatRemoved        OperationType = 41
+	OpSendContent            OperationType = 43
 	OpContactUpdate          OperationType = 49
 	OpReadReceipt            OperationType = 55
 	OpNotifiedJoinChat       OperationType = 60

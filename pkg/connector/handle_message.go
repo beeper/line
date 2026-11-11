@@ -155,7 +155,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 			LogContext:   func(c zerolog.Context) zerolog.Context { return c.Str("msg_id", msg.ID) },
 			PortalKey:    portalKey,
 			CreatePortal: true,
-			Sender:       bridgev2.EventSender{Sender: senderID, IsFromMe: OperationType(opType) == OpSendMessage},
+			Sender:       bridgev2.EventSender{Sender: senderID, IsFromMe: isOwnMessageOp(opType)},
 			Timestamp:    ts,
 			PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
 				lc.hiddenJoinGroupMessageSender(ctx, portal, portalIDStr, msg.From, ts)
@@ -220,8 +220,8 @@ func isPostNotification(msg *line.Message) bool {
 // portalMIDForMessage returns the chat MID that owns a message (the portal key).
 func portalMIDForMessage(msg *line.Message, opType int) string {
 	portalIDStr := msg.From
-	// If I sent it (Type 25), the portal is the recipient (msg.To)
-	if OperationType(opType) == OpSendMessage {
+	// If I sent it (Type 25 or 43), the portal is the recipient (msg.To)
+	if isOwnMessageOp(opType) {
 		portalIDStr = msg.To
 	}
 	// If it's a group (ToType 1 or 2), the portal is msg.To
@@ -229,6 +229,18 @@ func portalMIDForMessage(msg *line.Message, opType int) string {
 		portalIDStr = msg.To
 	}
 	return portalIDStr
+}
+
+func isOwnMessageOp(opType int) bool {
+	return OperationType(opType) == OpSendMessage || OperationType(opType) == OpSendContent
+}
+
+func isOBSMediaContentType(contentType ContentType) bool {
+	switch contentType {
+	case ContentImage, ContentVideo, ContentAudio, ContentFile:
+		return true
+	}
+	return false
 }
 
 // parseMessageTimestamp converts a LINE message's CreatedTime to a time.Time,
