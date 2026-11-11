@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -592,6 +593,21 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 	}
 
 	if res.AuthToken != "" {
+		if ll.Certificate != "" && res.EncryptedKeyChain == "" && !res.NoE2EE && ll.ExistingMetadata != nil &&
+			len(ll.ExistingMetadata.ExportedKeyMap) > 0 && !ll.hasLatestOwnE2EEKey(res) {
+			res.Attempt.Close()
+			ll.Certificate = ""
+			res, err := ll.loginCredentials(ctx, "")
+			if err != nil {
+				ll.logLoginFailure(err, "full_e2ee")
+				reason := loginErrorReason(err)
+				if reason == "" {
+					reason = genericLoginFailureReason
+				}
+				return ll.loginErrorStep(reason), nil
+			}
+			return ll.handleLoginResponse(ctx, res)
+		}
 		return ll.finishLogin(ctx, res)
 	}
 
@@ -966,6 +982,32 @@ func (ll *LineEmailLogin) fetchLoginKeys(res *line.LoginResult, meta *UserLoginM
 
 	ll.User.Bridge.Log.Info().Int("keys", len(exported)).Msg("Login: E2EE keys exported successfully")
 	return mgr, nil
+}
+
+func (ll *LineEmailLogin) hasLatestOwnE2EEKey(res *line.LoginResult) bool {
+	localLatest := 0
+	for keyID := range ll.ExistingMetadata.ExportedKeyMap {
+		if id, err := strconv.Atoi(keyID); err == nil && id > localLatest {
+			localLatest = id
+		}
+	}
+	client := newLineAPIClient(res.AuthToken)
+	client.LoginAttempt = res.Attempt
+	keys, err := client.GetOwnE2EEPublicKeys()
+	serverLatest := 0
+	for _, key := range keys {
+		if id, errID := key.KeyID.Int64(); errID == nil && int(id) > serverLatest {
+			serverLatest = int(id)
+		}
+	}
+	upToDate := err == nil && localLatest > 0 && serverLatest > 0 && serverLatest <= localLatest
+	if !upToDate {
+		ll.User.Log.Info().Err(err).
+			Int("local_key_id", localLatest).
+			Int("server_key_id", serverLatest).
+			Msg("Stored E2EE keys don't include LINE's latest key, switching to full LINE login")
+	}
+	return upToDate
 }
 
 func (ll *LineEmailLogin) admitLogin(ctx context.Context, res *line.LoginResult) error {

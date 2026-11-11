@@ -948,6 +948,25 @@ func (c *Client) CreateChat(mids []string, name string, chatType int) (*Chat, er
 	return &wrapper.Data.Chat, nil
 }
 
+func (c *Client) GetOwnE2EEPublicKeys() ([]E2EEPublicKey, error) {
+	resp, err := c.callRPC("TalkService", "getE2EEPublicKeysEx", false, 1)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    []E2EEPublicKey `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse getE2EEPublicKeysEx response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getE2EEPublicKeysEx failed: %s", resp)
+	}
+	return wrapper.Data, nil
+}
+
 // GetLastE2EEPublicKeys fetches the latest E2EE public keys for all members of a chat.
 // Returns a map of member MID → {keyId, keyData}.
 func (c *Client) GetLastE2EEPublicKeys(chatMid string) (map[string]E2EEPeerPublicKey, error) {
