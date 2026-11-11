@@ -2321,8 +2321,12 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			lc.handlePaidReaction(ctx, op, param2)
 		}()
 
-	case OpSendMessage, OpReceiveMessage:
+	case OpSendMessage, OpReceiveMessage, OpSendContent:
 		if op.Message != nil {
+			isOBSMedia := isOBSMediaContentType(ContentType(op.Message.ContentType))
+			if (opType == OpSendMessage && isOBSMedia) || (opType == OpSendContent && !isOBSMedia) {
+				return
+			}
 			if lc.shouldSkipDeletedChat(portalMIDForMessage(op.Message, op.Type), op.Message.ID) {
 				return
 			}
