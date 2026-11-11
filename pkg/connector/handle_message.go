@@ -433,7 +433,7 @@ func (lc *LineClient) convertLineMessageContent(ctx context.Context, portal *bri
 
 	// Handle call events (ORGCONTP == "CALL")
 	if data.ContentMetadata["ORGCONTP"] == "CALL" {
-		return h.ConvertCall(data, replyRelatesTo)
+		return h.ConvertCall(data, replyRelatesTo, lc.isOwnMID(data.From))
 	}
 
 	// Dispatch to content-type-specific handlers
