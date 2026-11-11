@@ -41,8 +41,9 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 		return nil
 	}
 
+	reqSeq := lc.nextUntrackedReqSeq()
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
-		return client.SendChatChecked(string(read.Portal.ID), targetID)
+		return client.SendChatChecked(int64(reqSeq), string(read.Portal.ID), targetID)
 	})
 	return err
 }
