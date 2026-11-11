@@ -2206,6 +2206,13 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				},
 				Timestamp: time.UnixMilli(ts),
 				Sender:    lc.eventSenderForMID(string(senderID)),
+				PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+					member, err := portal.Bridge.Matrix.GetMemberInfo(ctx, portal.MXID, portal.Bridge.Matrix.FormatGhostMXID(senderID))
+					if err == nil && member != nil && member.Membership == event.MembershipJoin {
+						return
+					}
+					lc.hiddenJoinGroupMessageSender(ctx, portal, op.Param1, op.Param2, time.UnixMilli(ts))
+				},
 			},
 			ReadUpTo: time.UnixMilli(ts),
 		})
