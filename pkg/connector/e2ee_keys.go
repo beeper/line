@@ -28,9 +28,28 @@ func groupKeyFetchError(groupKeyID int, err error) error {
 	return err
 }
 
+// ensureGroupKey mirrors the LINE client: fetch a group key only when it isn't
+// loaded, and remember keys LINE couldn't provide unless the failure was transient.
+func (lc *LineClient) ensureGroupKey(ctx context.Context, chatMid string, groupKeyID int) error {
+	if lc.E2EE == nil {
+		return fmt.Errorf("E2EE manager not initialized")
+	}
+	if lc.E2EE.HasGroupKey(chatMid, groupKeyID) {
+		return nil
+	}
+	if err := lc.E2EE.GroupKeyError(chatMid, groupKeyID); err != nil {
+		return err
+	}
+	err := lc.fetchAndUnwrapGroupKey(ctx, chatMid, groupKeyID)
+	if err != nil && isRecoveryRejected(err) && !line.IsAuthError(err) && !isTerminalCryptoError(err) {
+		lc.E2EE.SetGroupKeyError(chatMid, groupKeyID, err)
+	}
+	return err
+}
+
 // fetchAndUnwrapGroupKey retrieves a specific group key (or the latest when groupKeyID == 0)
 // and unwraps it so the E2EE manager can encrypt/decrypt group messages.
-// If no group key exists yet (TalkException code 5), it auto-registers one and retries.
+// If the chat has no latest group key yet (TalkException code 5), it registers one and retries.
 func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string, groupKeyID int) error {
 	if lc.E2EE == nil {
 		return fmt.Errorf("E2EE manager not initialized")
@@ -49,8 +68,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 	}
 
 	client, sharedKey, err := callLineResultUsing(lc, ctx, client, fetch)
-	// No group key exists yet — auto-register one so the group can use E2EE.
-	if err != nil && line.IsGroupKeyNotFound(err) {
+	if err != nil && groupKeyID == 0 && line.IsGroupKeyNotFound(err) {
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", chatMid).
 			Msg("No group key found, auto-registering")
 		if registerErr := lc.autoRegisterGroupKey(ctx, chatMid); registerErr != nil {

@@ -274,7 +274,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 				// Group Decryption
 				if len(msg.Chunks) >= 5 {
 					if gkID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil && gkID != 0 {
-						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, gkID); errFetch != nil {
+						if errFetch := lc.ensureGroupKey(context.Background(), portalIDStr, gkID); errFetch != nil {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Prefetch group key before decrypt failed")
 						}
@@ -289,7 +289,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
 						Msg("DecryptGroupMessage failed")
 					if !isTerminalCryptoError(err) && keyID != 0 {
-						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
+						if errFetch := lc.ensureGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Failed to fetch/unwrap group key")
 							lc.markMissingE2EEKey(context.Background(), errFetch)
