@@ -32,6 +32,7 @@ func init() {
 		"line-login-failed":     "LINE could not sign you in. Sign in again.",
 		"line-token-expired":    "Your LINE session expired and could not be restored. Sign in again.",
 		"line-sse-disconnected": "Disconnected from LINE, reconnecting",
+		"line-e2ee-init-failed": "LINE encryption failed to start, reconnecting",
 	})
 }
 
@@ -779,14 +780,19 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 	// default. Explicitly clear that setting once per bridge connection so the
 	// user's phone continues receiving notifications.
 	lc.configurePhoneNotifications(ctx)
-	if ctx.Err() != nil || !lc.sendConnectedStateIfCurrent(ctx) {
+	if ctx.Err() != nil {
 		return false
 	}
 
-	// Initialize E2EE manager and load keys
 	mgr, err := e2ee.NewManager()
 	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to init E2EE manager")
+		lc.UserLogin.Bridge.Log.Err(err).Msg("Failed to init E2EE manager")
+		lc.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateUnknownError,
+			Error:      "line-e2ee-init-failed",
+			Info:       map[string]any{"go_error": err.Error()},
+		})
+		return false
 	} else {
 		lc.E2EE = mgr
 		// Storage key is optional for runtime decrypt/encrypt; try it for file support
@@ -812,6 +818,9 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 				lc.UserLogin.Bridge.Log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
 			}
 		}
+	}
+	if ctx.Err() != nil || !lc.sendConnectedStateIfCurrent(ctx) {
+		return false
 	}
 
 	// Seed the last-known block list before fetching a fresh copy, so a
