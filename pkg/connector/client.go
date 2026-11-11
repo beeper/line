@@ -1136,6 +1136,13 @@ func (lc *LineClient) GetUserID() networkid.UserID {
 
 func (lc *LineClient) LogoutRemote(ctx context.Context) {
 	lc.Disconnect()
+	token := lc.getAccessToken()
+	if token == "" {
+		return
+	}
+	if err := lc.newClientWithToken(token).Logout(ctx); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to log out of LINE")
+	}
 }
 
 func (lc *LineClient) midOrFallback() string {
