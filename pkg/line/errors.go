@@ -56,6 +56,7 @@ func IsTalkException(err error) bool {
 type tokenRefreshError struct {
 	code             int
 	loggedOut        bool
+	logout           talkExceptionData
 	invalidSenderKey bool
 	refreshRequired  bool
 	requestNeedLogin bool
@@ -70,6 +71,9 @@ func newTokenRefreshError(code int, response []byte) *tokenRefreshError {
 	}
 	if !result.loggedOut && !result.invalidSenderKey && !result.refreshRequired && !result.requestNeedLogin {
 		result.diagnostic = refreshResponseDiagnostic(response)
+	}
+	if talk, ok := parseTalkException(err); ok && isLogoutTalkException(talk) {
+		result.logout = talk
 	}
 	return result
 }
@@ -131,6 +135,9 @@ func (e *tokenRefreshError) Error() string {
 	case e.requestNeedLogin:
 		return message + ": REQUEST_NEED_LOGIN"
 	case e.loggedOut:
+		if e.logout.Code != 0 {
+			return fmt.Sprintf("%s: TalkException %d %s", message, e.logout.Code, e.logout.Reason)
+		}
 		return message + ": V3_TOKEN_CLIENT_LOGGED_OUT"
 	case e.refreshRequired:
 		return message + ": access token refresh required"
@@ -164,9 +171,31 @@ func IsLoggedOut(err error) bool {
 	if errors.As(err, &refreshErr) && refreshErr.loggedOut {
 		return true
 	}
-	return strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") ||
+	_, _, logout := LogoutReason(err)
+	return logout ||
+		strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") ||
 		IsInvalidSenderKey(err) ||
 		IsRequestNeedLogin(err)
+}
+
+func LogoutReason(err error) (int, string, bool) {
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr.logout.Code != 0 {
+		return refreshErr.logout.Code, refreshErr.logout.Reason, true
+	}
+	talk, ok := parseTalkException(err)
+	if !ok || !isLogoutTalkException(talk) {
+		return 0, "", false
+	}
+	return talk.Code, talk.Reason, true
+}
+
+func isLogoutTalkException(talk talkExceptionData) bool {
+	switch talk.Code {
+	case TalkExceptionAuthenticationFailed, TalkExceptionNotAvailableUser, TalkExceptionNotAuthorizedDevice:
+		return true
+	}
+	return false
 }
 
 func IsInvalidSenderKey(err error) bool {
@@ -272,12 +301,11 @@ func IsNoUsableE2EEGroupKey(err error) bool {
 		return true
 	}
 	// Detect TalkException codes in raw API error strings (HTTP 400 with code 10051).
-	// Code 98 = member has LS off; Code 1 = auth failed;
+	// Code 98 = member has LS off;
 	// Code 100 "exceed max member" = the group is too large for key registration.
 	// NOTE: Code 5 "not found" is handled by IsGroupKeyNotFound (auto-register), NOT here.
 	if hasResponseErrorCode(msg) && strings.Contains(msg, "talkexception") {
 		if strings.Contains(msg, "\"code\":98,") || strings.Contains(msg, "\"code\":98}") ||
-			strings.Contains(msg, "\"code\":1,") || strings.Contains(msg, "\"code\":1}") ||
 			(hasJSONCode(msg, 100) && (strings.Contains(msg, `"reason":"exceed max member"`) ||
 				strings.Contains(msg, `"reason": "exceed max member"`))) {
 			return true
@@ -292,6 +320,12 @@ type talkExceptionData struct {
 	Code    int    `json:"code"`
 	Reason  string `json:"reason"`
 }
+
+const (
+	TalkExceptionAuthenticationFailed = 1
+	TalkExceptionNotAvailableUser     = 7
+	TalkExceptionNotAuthorizedDevice  = 8
+)
 
 const (
 	talkExceptionDBFailed         = 2

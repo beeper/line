@@ -131,6 +131,8 @@ type UserLoginMetadata struct {
 	RefreshToken       string            `json:"refresh_token,omitempty"`
 	SessionInvalidated bool              `json:"session_invalidated,omitempty"`
 	SessionExpired     bool              `json:"session_expired,omitempty"`
+	LogoutCode         int               `json:"logout_code,omitempty"`
+	LogoutReason       string            `json:"logout_reason,omitempty"`
 	Email              string            `json:"email,omitempty"`
 	Password           string            `json:"password,omitempty"`
 	Certificate        string            `json:"certificate,omitempty"`
