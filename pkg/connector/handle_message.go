@@ -38,7 +38,7 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 	connector, ok := lc.UserLogin.Bridge.Network.(*LineConnector)
 	if ok && connector.directMedia.Load() {
 		handler.GenerateDirectMediaURI = func(ctx context.Context, messageID string, metadata *handlers.DirectMedia) (id.ContentURIString, any, error) {
-			mediaID, err := makeLineDirectMediaID(lc.UserLogin.ID, networkid.MessageID(messageID))
+			mediaID, err := makeLineDirectMediaID(lc.UserLogin.ID, networkid.MessageID(messageID), metadata.IsPreview)
 			if err != nil {
 				return "", nil, err
 			}
