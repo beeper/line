@@ -2012,7 +2012,8 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Timestamp: time.UnixMilli(ts),
 				Sender:    lc.eventSenderForMID(string(senderID)),
 			},
-			ReadUpTo: time.UnixMilli(ts),
+			LastTarget: networkid.MessageID(op.Param3),
+			ReadUpTo:   time.UnixMilli(ts),
 		})
 
 	case OpUnsendLocal, OpUnsendRemote:
