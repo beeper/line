@@ -117,7 +117,8 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 	}
 
 	err = unwrap(sharedKey)
-	if groupKeyID == 0 && errors.Is(err, e2ee.ErrMissingOwnPrivateKey) {
+	var missingKey *e2ee.MissingOwnKeyError
+	if groupKeyID == 0 && errors.As(err, &missingKey) && lc.isRetiredOwnKey(missingKey.KeyID) {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMid).
 			Msg("Latest group key targets a missing private key, registering a fresh group key")
 		if registerErr := lc.autoRegisterGroupKey(ctx, chatMid); registerErr != nil {
@@ -134,6 +135,11 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 	}
 
 	return err
+}
+
+func (lc *LineClient) isRetiredOwnKey(keyID int) bool {
+	myRawKeyID, _, err := lc.E2EE.MyKeyIDs()
+	return err == nil && keyID < myRawKeyID
 }
 
 func (lc *LineClient) ensurePeerKey(ctx context.Context, mid string) (int, string, error) {

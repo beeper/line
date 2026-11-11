@@ -556,10 +556,8 @@ func (lc *LineClient) markMissingE2EEKey(ctx context.Context, err error) {
 		return
 	}
 	var missingKey *e2ee.MissingOwnKeyError
-	if errors.As(err, &missingKey) && lc.E2EE != nil {
-		if myRawKeyID, _, errKey := lc.E2EE.MyKeyIDs(); errKey == nil && missingKey.KeyID < myRawKeyID {
-			return
-		}
+	if errors.As(err, &missingKey) && lc.E2EE != nil && lc.isRetiredOwnKey(missingKey.KeyID) {
+		return
 	}
 	lc.missingE2EEKeyMu.Lock()
 	if lc.missingE2EEKeyMarked {
