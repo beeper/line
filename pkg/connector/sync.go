@@ -1998,6 +1998,16 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			lc.syncSingleChat(context.Background(), op)
 		}()
 
+	case OpSendChatChecked:
+		receipt, ok := lc.makeOwnReadReceiptEvent(op)
+		if !ok {
+			lc.UserLogin.Bridge.Log.Warn().
+				Int("op_type", op.Type).
+				Msg("Ignoring malformed own read receipt")
+			return
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, receipt)
+
 	case OpReadReceipt:
 		chatMID := op.Param1
 		readerMID := op.Param2
@@ -2415,6 +2425,28 @@ func (lc *LineClient) handleMemberLeave(chatMid, leaverMid string) {
 
 func (lc *LineClient) handleMemberLeft(chatMid, leaverMid string) {
 	lc.handleMemberLeaveWithSender(chatMid, leaverMid, lc.eventSenderForMID(leaverMid))
+}
+
+// makeOwnReadReceiptEvent converts SEND_CHAT_CHECKED, where param1 is the chat
+// MID and param2 is the last message this account read.
+func (lc *LineClient) makeOwnReadReceiptEvent(op line.Operation) (*simplevent.Receipt, bool) {
+	if OperationType(op.Type) != OpSendChatChecked || op.Param1 == "" || op.Param2 == "" {
+		return nil, false
+	}
+
+	ts := time.Now()
+	if timestamp, err := op.CreatedTime.Int64(); err == nil && timestamp > 0 {
+		ts = time.UnixMilli(timestamp)
+	}
+	return &simplevent.Receipt{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventReadReceipt,
+			PortalKey: networkid.PortalKey{ID: makePortalID(op.Param1), Receiver: lc.UserLogin.ID},
+			Timestamp: ts,
+			Sender:    bridgev2.EventSender{IsFromMe: true, Sender: networkid.UserID(lc.UserLogin.ID)},
+		},
+		LastTarget: networkid.MessageID(op.Param2),
+	}, true
 }
 
 func (lc *LineClient) makeNotifiedMemberRemovalEvent(op line.Operation) (*simplevent.ChatInfoChange, bool) {
