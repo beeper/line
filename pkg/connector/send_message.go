@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"image"
 	"image/jpeg"
 	"maps"
@@ -1111,7 +1112,7 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 	if formattedBody != "" {
 		for _, m := range mentionLinkRegex.FindAllStringSubmatch(formattedBody, -1) {
 			if len(m) >= 3 {
-				nameByUserID[m[1]] = m[2]
+				nameByUserID[m[1]] = strings.TrimPrefix(html.UnescapeString(m[2]), "@")
 			}
 		}
 	}
