@@ -1998,8 +1998,10 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}()
 
 	case OpReadReceipt:
-		portalID := makePortalID(op.Param1)
-		senderID := makeUserID(op.Param2)
+		chatMID := op.Param1
+		readerMID := op.Param2
+		portalID := makePortalID(chatMID)
+		senderID := makeUserID(readerMID)
 
 		ts, _ := op.CreatedTime.Int64()
 		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
@@ -2011,6 +2013,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				},
 				Timestamp: time.UnixMilli(ts),
 				Sender:    lc.eventSenderForMID(string(senderID)),
+				PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+					lc.hiddenJoinGroupMessageSender(ctx, portal, chatMID, readerMID, time.UnixMilli(ts))
+				},
 			},
 			ReadUpTo: time.UnixMilli(ts),
 		})
