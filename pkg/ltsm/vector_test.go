@@ -7,8 +7,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/crypto/curve25519"
@@ -17,6 +17,7 @@ import (
 // TestGenerateV2TestVector generates a complete V2 encryption test vector
 // with all intermediate values exposed for cross-validation.
 func TestGenerateV2TestVector(t *testing.T) {
+	t.Parallel()
 	// Use deterministic keys so the test vector is reproducible
 	senderPriv, _ := hex.DecodeString("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
 	receiverPriv, _ := hex.DecodeString("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d")
@@ -196,17 +197,13 @@ func TestGenerateV2TestVector(t *testing.T) {
 	jsonBytes, _ := json.MarshalIndent(vec, "", "  ")
 	t.Logf("\n--- JSON Test Vector ---\n%s", string(jsonBytes))
 
-	// Write to file
-	if err := os.WriteFile("/tmp/ltsm_v2_test_vector.json", jsonBytes, 0644); err != nil {
-		t.Logf("Warning: could not write test vector file: %v", err)
-	} else {
-		t.Logf("Test vector written to /tmp/ltsm_v2_test_vector.json")
-	}
+	writeTestVector(t, "ltsm_v2_test_vector.json", jsonBytes)
 }
 
 // TestGenerateV2DeterministicVector generates a V2 vector with a deterministic
 // salt and nonce (by encrypting manually) for truly reproducible test vectors.
 func TestGenerateV2DeterministicVector(t *testing.T) {
+	t.Parallel()
 	// Deterministic keys
 	senderPriv, _ := hex.DecodeString("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
 	receiverPriv, _ := hex.DecodeString("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d")
@@ -367,12 +364,16 @@ func TestGenerateV2DeterministicVector(t *testing.T) {
 	}
 
 	jsonBytes, _ := json.MarshalIndent(vec, "", "  ")
-	fmt.Println(string(jsonBytes))
+	t.Logf("\n--- JSON Test Vector ---\n%s", jsonBytes)
 
-	// Write to file
-	if err := os.WriteFile("/tmp/ltsm_v2_deterministic_vector.json", jsonBytes, 0644); err != nil {
-		t.Logf("Warning: could not write test vector file: %v", err)
-	} else {
-		t.Logf("Test vector written to /tmp/ltsm_v2_deterministic_vector.json")
+	writeTestVector(t, "ltsm_v2_deterministic_vector.json", jsonBytes)
+}
+
+func writeTestVector(t *testing.T, name string, data []byte) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("write test vector: %v", err)
 	}
+	t.Logf("Test vector written to %s (JSON is also retained in test output)", path)
 }

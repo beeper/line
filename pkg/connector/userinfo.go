@@ -204,6 +204,10 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 	}
 
 	contact := lc.getContact(ctx, string(portal.ID))
+	return lc.directChatInfo(mid, contact), nil
+}
+
+func (lc *LineClient) directChatInfo(mid string, contact line.Contact) *bridgev2.ChatInfo {
 	dmType := database.RoomTypeDM
 	chatName := contact.EffectiveDisplayName()
 	return &bridgev2.ChatInfo{
@@ -224,14 +228,14 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 				},
 				{
 					EventSender: bridgev2.EventSender{
-						Sender: networkid.UserID(portal.ID),
+						Sender: networkid.UserID(mid),
 					},
 					Membership: event.MembershipJoin,
 					PowerLevel: ptr.Ptr(0),
 				},
 			}),
 		},
-	}, nil
+	}
 }
 
 func (lc *LineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
@@ -305,24 +309,30 @@ func (lc *LineClient) setCachedContact(mid string, contact line.Contact) {
 }
 
 func (lc *LineClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
-	userID := makeUserID(strings.TrimSpace(identifier))
-	portalID := networkid.PortalKey{ID: makePortalID(string(userID)), Receiver: lc.UserLogin.ID}
+	contact, err := lc.resolveContactIdentifier(ctx, identifier)
+	if err != nil || contact == nil {
+		return nil, err
+	}
+	userID := makeUserID(contact.Mid)
 	ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ghost: %w", err)
 	}
-	portal, err := lc.UserLogin.Bridge.GetPortalByKey(ctx, portalID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get portal: %w", err)
-	}
-	ghostInfo, _ := lc.GetUserInfo(ctx, ghost)
-	portalInfo, _ := lc.GetChatInfo(ctx, portal)
-	return &bridgev2.ResolveIdentifierResponse{
+	name := contact.EffectiveDisplayName()
+	resp := &bridgev2.ResolveIdentifierResponse{
 		Ghost:    ghost,
 		UserID:   userID,
-		UserInfo: ghostInfo,
-		Chat:     &bridgev2.CreateChatResponse{Portal: portal, PortalKey: portalID, PortalInfo: portalInfo},
-	}, nil
+		UserInfo: &bridgev2.UserInfo{Identifiers: []string{contact.Mid}, Name: &name, Avatar: lc.avatarFromPicturePath(contact.PicturePath)},
+	}
+	if createChat {
+		// Resolve and validate before bridgev2 persists anything. Its canonical
+		// portal cache and room-creation event loop handle reuse and concurrency.
+		resp.Chat = &bridgev2.CreateChatResponse{
+			PortalKey:  networkid.PortalKey{ID: makePortalID(contact.Mid), Receiver: lc.UserLogin.ID},
+			PortalInfo: lc.directChatInfo(contact.Mid, *contact),
+		}
+	}
+	return resp, nil
 }
 
 func (lc *LineClient) midToResolveIdentifier(ctx context.Context, mid string) *bridgev2.ResolveIdentifierResponse {
@@ -346,27 +356,36 @@ const maxSearchResults = 20
 
 func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev2.ResolveIdentifierResponse, error) {
 	var results []*bridgev2.ResolveIdentifierResponse
+	var exactErr, validationErr error
 
-	// Try by LINE user ID first
+	// Exact public ID and MID lookup is shared with start-chat. Only search
+	// falls back to non-unique display-name matches.
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
+	if lowerQuery == "" {
+		return nil, nil
+	}
 	if lowerQuery != "" {
-		_, contact, err := callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
-			return client.FindContactByUserid(lowerQuery)
-		})
-		if err == nil && contact != nil && contact.Mid != "" {
+		contact, err := lc.resolveContactIdentifier(ctx, query)
+		exactErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err == nil && contact != nil {
 			if r := lc.midToResolveIdentifier(ctx, contact.Mid); r != nil {
-				results = append(results, r)
+				return []*bridgev2.ResolveIdentifierResponse{r}, nil
 			}
 		}
 	}
 
 	// Search contacts by display name
 	client, allMids, err := callLineResult(lc, ctx, func(client *line.Client) ([]string, error) {
-		return client.GetAllContactIds()
+		return client.GetAllContactIdsContext(ctx)
 	})
 	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get all contact IDs for search")
-		return results, nil
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("LINE contact search failed: %w", err)
 	}
 
 	// Fetch contacts in batches to check display names
@@ -379,13 +398,26 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 			end = len(allMids)
 		}
 		batch := allMids[i:end]
-		contactsResp, err := client.GetContactsV2(batch)
-		if err != nil {
-			continue
+		requested := make(map[string]bool, len(batch))
+		for _, mid := range batch {
+			requested[normalizeUserMID(mid)] = true
 		}
-		for _, wrapper := range contactsResp.Contacts {
+		contactsResp, err := client.GetContactsV2Context(ctx, batch)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("LINE contact search failed: %w", err)
+		}
+		keyCounts := make(map[string]int, len(contactsResp.Contacts))
+		for key := range contactsResp.Contacts {
+			keyCounts[normalizeUserMID(key)]++
+		}
+		for key, wrapper := range contactsResp.Contacts {
 			c := wrapper.Contact
-			if c.Mid == "" {
+			c.Mid = normalizeUserMID(c.Mid)
+			if !isCanonicalUserMID(c.Mid) || normalizeUserMID(key) != c.Mid || !requested[c.Mid] || keyCounts[c.Mid] != 1 {
+				validationErr = fmt.Errorf("LINE contact search returned invalid or ambiguous user MIDs")
 				continue
 			}
 			lc.setCachedContact(c.Mid, c)
@@ -398,6 +430,14 @@ func (lc *LineClient) SearchUsers(ctx context.Context, query string) ([]*bridgev
 					}
 				}
 			}
+		}
+	}
+	if len(results) == 0 {
+		if exactErr != nil {
+			return nil, fmt.Errorf("exact LINE lookup failed and no matching contacts were found: %w", exactErr)
+		}
+		if validationErr != nil {
+			return nil, validationErr
 		}
 	}
 
@@ -424,12 +464,21 @@ func (lc *LineClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveId
 			end = len(allMids)
 		}
 		batch := allMids[i:end]
+		requested := make(map[string]bool, len(batch))
+		for _, mid := range batch {
+			requested[normalizeUserMID(mid)] = true
+		}
 		contactsResp, err := client.GetContactsV2(batch)
 		if err != nil {
 			continue
 		}
-		for mid, wrapper := range contactsResp.Contacts {
-			if wrapper.Contact.Mid == "" {
+		keyCounts := make(map[string]int, len(contactsResp.Contacts))
+		for key := range contactsResp.Contacts {
+			keyCounts[normalizeUserMID(key)]++
+		}
+		for key, wrapper := range contactsResp.Contacts {
+			mid := normalizeUserMID(wrapper.Contact.Mid)
+			if !isCanonicalUserMID(mid) || normalizeUserMID(key) != mid || !requested[mid] || keyCounts[mid] != 1 {
 				continue
 			}
 			lc.setCachedContact(mid, wrapper.Contact)

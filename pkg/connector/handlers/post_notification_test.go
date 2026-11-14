@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -177,6 +178,10 @@ func TestConvertPostNotificationUploadsAlbumPreviewImages(t *testing.T) {
 }
 
 func TestConvertPostNotificationProcessesAlbumPreviewsConcurrentlyInOrder(t *testing.T) {
+	synctest.Test(t, testAlbumPreviewConcurrencyAndOrder)
+}
+
+func testAlbumPreviewConcurrencyAndOrder(t *testing.T) {
 	const previewCount = 6
 
 	matrix := &postNotificationTestMatrix{}
@@ -248,10 +253,13 @@ func TestConvertPostNotificationProcessesAlbumPreviewsConcurrentlyInOrder(t *tes
 	if len(initialStarted) != albumPreviewWorkerLimit {
 		t.Fatalf("initial workers started %d unique previews, want %d", len(initialStarted), albumPreviewWorkerLimit)
 	}
+	// Quiescence gives every worker a scheduling opportunity before asserting
+	// that no fifth download can start while all four slots are occupied.
+	synctest.Wait()
 	select {
 	case oid := <-started:
 		t.Fatalf("preview %q started before a worker slot was released", oid)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 
 	close(release["oid-4"])
