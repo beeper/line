@@ -1998,6 +1998,21 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			lc.syncSingleChat(context.Background(), op)
 		}()
 
+	case OpSendChatChecked:
+		ts, _ := op.CreatedTime.Int64()
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
+			EventMeta: simplevent.EventMeta{
+				Type: bridgev2.RemoteEventReadReceipt,
+				PortalKey: networkid.PortalKey{
+					ID:       makePortalID(op.Param1),
+					Receiver: lc.UserLogin.ID,
+				},
+				Timestamp: time.UnixMilli(ts),
+				Sender:    lc.eventSenderForMID(lc.Mid),
+			},
+			LastTarget: networkid.MessageID(op.Param2),
+		})
+
 	case OpReadReceipt:
 		chatMID := op.Param1
 		readerMID := op.Param2
