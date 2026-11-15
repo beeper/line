@@ -2011,6 +2011,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Sender:    lc.eventSenderForMID(lc.Mid),
 			},
 			LastTarget: networkid.MessageID(op.Param2),
+			ReadUpTo:   time.UnixMilli(ts),
 		})
 
 	case OpReadReceipt:
