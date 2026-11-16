@@ -702,6 +702,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	if canceled || ctx.Err() != nil || (processCtx != nil && processCtx.Err() != nil) {
 		return nil, context.Canceled
 	}
+	parentCtx := ctx
 	finishCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if processCtx != nil {
@@ -764,7 +765,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	}
 	if sameAccount && shouldPreserveExistingE2EEKeys(exportedKeys, ll.ExistingMetadata) {
 		if currentKeyID, stale := ll.storedE2EEKeysOutdated(client, mid); stale {
-			return ll.restartLoginForNewE2EEKey(ctx, currentKeyID)
+			return ll.restartLoginForNewE2EEKey(parentCtx, currentKeyID)
 		}
 		copyLoginE2EEKeyMetadata(meta, ll.ExistingMetadata)
 		ll.User.Bridge.Log.Info().Int("keys", len(meta.ExportedKeyMap)).Msg("Preserved existing E2EE keys after re-login")
