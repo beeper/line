@@ -2009,11 +2009,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		})
 
 	case OpInviteIntoChat, OpNotifiedInviteIntoChat:
-		lc.wg.Add(1)
-		go func() {
-			defer lc.wg.Done()
-			lc.handleInvite(context.Background(), op.Param1, OperationType(op.Type))
-		}()
+		lc.handleInvite(ctx, op.Param1, OperationType(op.Type))
 
 	case OpChatUpdate, OpChatUpdate2:
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", op.Param1).Int("op_type", op.Type).Msg("Received chat update operation")
