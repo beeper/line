@@ -172,6 +172,18 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
+		if effectiveMsgType == event.MsgVideo {
+			var videoData []byte
+			videoData, err = prepareLineVideo(ctx, mediaData, msg.Content.Info)
+			if errors.Is(err, errSendVideoAsFile) {
+				lc.UserLogin.Bridge.Log.Info().Err(err).Msg("LINE can't play this video, sending it as a file")
+				effectiveMsgType = event.MsgFile
+			} else if err != nil {
+				return nil, err
+			} else {
+				mediaData = videoData
+			}
+		}
 		if sizeLimit, ok := lineMediaSizeLimits[effectiveMsgType]; ok && len(mediaData) > sizeLimit {
 			lc.UserLogin.Bridge.Log.Info().
 				Str("msg_type", string(effectiveMsgType)).
@@ -179,19 +191,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Int("limit", sizeLimit).
 				Msg("Media exceeds LINE's limit for its type, sending as a file")
 			effectiveMsgType = event.MsgFile
-		}
-	}
-
-	if effectiveMsgType == event.MsgVideo {
-		var videoData []byte
-		videoData, err = prepareLineVideo(ctx, mediaData, msg.Content.Info)
-		if errors.Is(err, errSendVideoAsFile) {
-			lc.UserLogin.Bridge.Log.Info().Err(err).Msg("LINE can't play this video, sending it as a file")
-			effectiveMsgType = event.MsgFile
-		} else if err != nil {
-			return nil, err
-		} else {
-			mediaData = videoData
 		}
 	}
 
