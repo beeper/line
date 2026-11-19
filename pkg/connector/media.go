@@ -443,7 +443,10 @@ func generateChunkHashes(encryptedData []byte) []byte {
 	return allHashes
 }
 
-const maxLineVideoDuration = 300 * time.Second
+const (
+	maxLineVideoDuration    = 300 * time.Second
+	maxLineVideoConvertTime = 5 * time.Minute
+)
 
 var errSendVideoAsFile = errors.New("video must be sent to LINE as a file")
 
@@ -457,6 +460,9 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	if mimeType == "" {
 		mimeType, _, _ = strings.Cut(http.DetectContentType(data), ";")
 	}
+	if duration == 0 {
+		duration = probeVideoDuration(ctx, data)
+	}
 	if duration > maxLineVideoDuration {
 		return nil, fmt.Errorf("%w: %s is longer than %s", errSendVideoAsFile, duration, maxLineVideoDuration)
 	}
@@ -467,6 +473,8 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	if !mauffmpeg.Supported() {
 		return nil, fmt.Errorf("%w: %s needs ffmpeg", errSendVideoAsFile, mimeType)
 	}
+	ctx, cancel := context.WithTimeout(ctx, maxLineVideoConvertTime)
+	defer cancel()
 	converted, err := mauffmpeg.ConvertBytes(ctx, data, ".mp4", nil, []string{
 		"-pix_fmt", "yuv420p", "-c:v", "h264", "-b:v", "2M", "-c:a", "aac", "-movflags", "+faststart",
 		"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
@@ -475,4 +483,24 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 		return nil, fmt.Errorf("%w: converting %s to mp4: %w", errSendVideoAsFile, mimeType, err)
 	}
 	return converted, nil
+}
+
+func probeVideoDuration(ctx context.Context, data []byte) time.Duration {
+	if !mauffmpeg.ProbeSupported() {
+		return 0
+	}
+	file, err := os.CreateTemp("", "line-video-probe-*")
+	if err != nil {
+		return 0
+	}
+	defer os.Remove(file.Name())
+	_, err = file.Write(data)
+	if closeErr := file.Close(); err != nil || closeErr != nil {
+		return 0
+	}
+	probe, err := mauffmpeg.Probe(ctx, file.Name())
+	if err != nil || probe.Format == nil {
+		return 0
+	}
+	return time.Duration(probe.Format.Duration * float64(time.Second))
 }
