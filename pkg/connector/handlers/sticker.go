@@ -42,12 +42,21 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 			stickerURL = baseURL + "/base/sticker.png"
 		}
 
+		var nameOverlay []byte
+		if stkOpt == "T" {
+			nameOverlay = h.downloadStickerNameOverlay(stkID, data.ContentMetadata["STK_IMG_TXT"])
+			if nameOverlay == nil {
+				stickerURL = baseURL + "/sticker.png"
+			}
+		}
+
 		resp, err := h.HTTPClient.Get(stickerURL)
 		if fallbackURL := lineStickerBaseURL(stkID, "") + "/sticker.png"; (err != nil || resp.StatusCode != 200) && stickerURL != fallbackURL {
 			if resp != nil {
 				resp.Body.Close()
 			}
 			isAnimated = false
+			nameOverlay = nil
 			resp, err = h.HTTPClient.Get(fallbackURL)
 		}
 
@@ -64,8 +73,8 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 			} else {
 				if isAnimated {
 					stkData = forceAPNGLoop(stkData)
-				} else if stkOpt == "T" {
-					stkData = h.overlayStickerNameText(stkID, data.ContentMetadata["STK_IMG_TXT"], stkData)
+				} else if nameOverlay != nil {
+					stkData = h.overlayStickerNameText(stkID, stkData, nameOverlay)
 				}
 
 				mimeType := resp.Header.Get("Content-Type")
@@ -161,27 +170,36 @@ func lineStickerBaseURL(stickerID, hash string) string {
 	return fmt.Sprintf("https://stickershop.line-scdn.net/stickershop/v1/sticker/%s/android", stickerID)
 }
 
-func (h *Handler) overlayStickerNameText(stickerID, text string, baseData []byte) []byte {
+func (h *Handler) downloadStickerNameOverlay(stickerID, text string) []byte {
 	if text == "" {
-		return baseData
+		return nil
 	}
 	overlayURL := fmt.Sprintf("https://stickershop.line-scdn.net/stickershop/v1/sticker/%s/android/overlay/name/%s/sticker.png", stickerID, url.PathEscape(text))
 	resp, err := h.HTTPClient.Get(overlayURL)
 	if err != nil {
 		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to download sticker name overlay")
-		return baseData
+		return nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		h.Log.Warn().Int("status_code", resp.StatusCode).Str("stk_id", stickerID).Msg("Failed to download sticker name overlay")
-		return baseData
+		return nil
 	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to read sticker name overlay")
+		return nil
+	}
+	return data
+}
+
+func (h *Handler) overlayStickerNameText(stickerID string, baseData, overlayData []byte) []byte {
 	base, err := png.Decode(bytes.NewReader(baseData))
 	if err != nil {
 		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to decode sticker base image")
 		return baseData
 	}
-	overlay, err := png.Decode(resp.Body)
+	overlay, err := png.Decode(bytes.NewReader(overlayData))
 	if err != nil {
 		h.Log.Warn().Err(err).Str("stk_id", stickerID).Msg("Failed to decode sticker name overlay")
 		return baseData
