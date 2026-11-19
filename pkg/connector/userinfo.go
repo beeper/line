@@ -155,7 +155,7 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 	if portal != nil && portal.RoomType == database.RoomTypeDM && !lc.isOwnMID(string(portal.ID)) {
 		caps.ID += "+dm"
 		caps.BlockUser = true
-	} else if portal != nil && strings.HasPrefix(string(portal.ID), "R") {
+	} else if portal != nil && strings.HasPrefix(strings.ToLower(string(portal.ID)), "r") {
 		caps.ID += "+room"
 		caps.MemberActions = event.MemberFeatureMap{
 			event.MemberActionInvite: event.CapLevelFullySupported,

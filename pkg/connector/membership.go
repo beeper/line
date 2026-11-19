@@ -38,7 +38,7 @@ func (lc *LineClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.
 	default:
 		return nil, fmt.Errorf("unknown membership target type %T", target)
 	}
-	legacyRoom := strings.HasPrefix(chatMid, "R")
+	legacyRoom := strings.HasPrefix(strings.ToLower(chatMid), "r")
 	reqSeq := int64(lc.nextUntrackedReqSeq())
 	var call func(client *line.Client) error
 	switch msg.Type {
