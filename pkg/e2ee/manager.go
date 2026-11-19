@@ -69,6 +69,7 @@ type Manager struct {
 	groupKeyLRU        []groupKeyRef
 	groupNativeObjects int
 	groupKeyErrors     map[groupKeyRef]error
+	groupKeyGeneration uint64
 }
 
 type groupKeyRef struct {
@@ -251,6 +252,7 @@ func (m *Manager) LoadMyKeyFromSecureData(data map[string]any) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	clear(m.groupKeyErrors)
+	m.groupKeyGeneration++
 	return m.errLocked()
 }
 
@@ -594,6 +596,8 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 		m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
 		m.groupSpecVersion[chatMid] = sharedKey.SpecVersion
 		m.touchGroupKeyLocked(ref)
+		delete(m.groupKeyErrors, ref)
+		m.groupKeyGeneration++
 		return id, nil
 	}
 
@@ -630,6 +634,7 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 	}
 	m.groupKeys[chatMid][sharedKey.GroupKeyID] = unwrappedKeyID
 	delete(m.groupKeyErrors, ref)
+	m.groupKeyGeneration++
 
 	m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
 	m.groupSpecVersion[chatMid] = sharedKey.SpecVersion
@@ -937,15 +942,18 @@ func (m *Manager) HasGroupKey(chatMid string, groupKeyID int) bool {
 	return m.errLocked() == nil && m.groupKeys[chatMid][groupKeyID] != 0
 }
 
-func (m *Manager) GroupKeyError(chatMid string, groupKeyID int) error {
+func (m *Manager) GroupKeyError(chatMid string, groupKeyID int) (error, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.groupKeyErrors[groupKeyRef{chatMid, groupKeyID}]
+	return m.groupKeyErrors[groupKeyRef{chatMid, groupKeyID}], m.groupKeyGeneration
 }
 
-func (m *Manager) SetGroupKeyError(chatMid string, groupKeyID int, err error) {
+func (m *Manager) SetGroupKeyError(chatMid string, groupKeyID int, err error, generation uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if generation != m.groupKeyGeneration || m.groupKeys[chatMid][groupKeyID] != 0 {
+		return
+	}
 	m.groupKeyErrors[groupKeyRef{chatMid, groupKeyID}] = err
 }
 
