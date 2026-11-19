@@ -43,6 +43,7 @@ const (
 
 var (
 	errSSEReconnect                      = errors.New("SSE reconnect requested")
+	errSSEResync                         = errors.New("SSE resync with new revision")
 	errSSEStop                           = errors.New("SSE session ended")
 	errUnblockBackfillHandledByFramework = errors.New("unblock backfill handled by framework")
 )
@@ -1620,7 +1621,9 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	sseDisconnected := false
 	var backoff reconnectBackoff
 	handler := func(eventType, data string) {
-		backoff.reset()
+		if eventType != line.SSEEventOpen && eventType != "reconnect" && eventType != "talkException" {
+			backoff.reset()
+		}
 		if sseDisconnected && lc.sendSSEConnectedIfCurrent(ctx) {
 			sseDisconnected = false
 		}
@@ -1667,7 +1670,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			go lc.syncDMChats(ctx)
 			go lc.prefetchMessages(ctx)
 			if revUpdated {
-				cancelListen(errSSEReconnect)
+				cancelListen(errSSEResync)
 			}
 		case "operation":
 			var op line.Operation
@@ -1699,7 +1702,10 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		cancelListen(nil)
 		if ctx.Err() != nil || errors.Is(cause, errSSEStop) {
 			return
+		} else if errors.Is(cause, errSSEResync) {
+			continue
 		} else if errors.Is(cause, errSSEReconnect) {
+			waitForSSEReconnect(ctx, backoff.next())
 			continue
 		}
 		if err != nil {
