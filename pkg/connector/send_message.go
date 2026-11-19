@@ -880,9 +880,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			if retryChunks, errEnc := lc.E2EE.EncryptMessageV2Raw(portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, payload); errEnc == nil {
 				lineMsg.Chunks = retryChunks
 				contentMetadata["e2eeVersion"] = strconv.Itoa(e2ee.ChunksVersion(retryChunks))
-				retryReqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-				lc.trackReqSeq(retryReqSeq)
-				sentMsg, err = sendLineMessage(retryReqSeq, lineMsg)
+				sentMsg, err = sendLineMessage(lc.nextReqSeq(), lineMsg)
 			}
 		}
 	}
