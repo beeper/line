@@ -568,12 +568,12 @@ func (lc *LineClient) convertLineMessageContent(ctx context.Context, portal *bri
 					lastEnd := 0
 					for _, entry := range entries {
 						if entry.start >= lastEnd && entry.start >= 0 && entry.end <= len(unwrappedText) && entry.start < entry.end {
-							fb.WriteString(html.EscapeString(unwrappedText[lastEnd:entry.start]))
+							fb.WriteString(event.TextToHTML(unwrappedText[lastEnd:entry.start]))
 							fb.WriteString(fmt.Sprintf(`<a href="https://matrix.to/#/%s">%s</a>`, html.EscapeString(entry.mxid), html.EscapeString(unwrappedText[entry.start:entry.end])))
 							lastEnd = entry.end
 						}
 					}
-					fb.WriteString(html.EscapeString(unwrappedText[lastEnd:]))
+					fb.WriteString(event.TextToHTML(unwrappedText[lastEnd:]))
 					formattedBody = fb.String()
 				}
 				// Replace room mention text in body with @room for client-side highlighting.
