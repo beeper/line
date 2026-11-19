@@ -43,16 +43,17 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 	}
 
 	lc.noteOwnRead(string(read.Portal.ID), targetID)
+	reqSeq := lc.nextUntrackedReqSeq()
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
-		return client.SendChatChecked(string(read.Portal.ID), targetID)
+		return client.SendChatChecked(int64(reqSeq), string(read.Portal.ID), targetID)
 	})
 	return err
 }
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_11_01",
-		MaxTextLength:    5000,
+		ID:               "dev.highest.matrix.line.capabilities.2026_11_11_1",
+		MaxTextLength:    10000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
 		ReactionCount:    1,
@@ -159,6 +160,12 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 	if portal != nil && portal.RoomType == database.RoomTypeDM && !lc.isOwnMID(string(portal.ID)) {
 		caps.ID += "+dm"
 		caps.BlockUser = true
+	} else if portal != nil && isEditableGroupMID(string(portal.ID)) {
+		caps.ID += "+group"
+		caps.State = event.StateFeatureMap{
+			event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
+			event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
+		}
 	}
 	return caps
 }

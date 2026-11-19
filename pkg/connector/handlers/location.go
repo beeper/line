@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -11,8 +12,28 @@ import (
 )
 
 // ConvertLocation converts a LINE location message to a Matrix location message.
-func (h *Handler) ConvertLocation(data line.Message, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
-	if data.Location == nil {
+func (h *Handler) ConvertLocation(data line.Message, decryptedBody string, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+	location := data.Location
+	if location == nil && strings.HasPrefix(strings.TrimSpace(decryptedBody), "{") {
+		var payload struct {
+			Location *struct {
+				Title     string   `json:"title"`
+				Address   string   `json:"address"`
+				Latitude  *float64 `json:"latitude"`
+				Longitude *float64 `json:"longitude"`
+			} `json:"location"`
+		}
+		if err := json.Unmarshal([]byte(decryptedBody), &payload); err != nil {
+			h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to parse encrypted location payload")
+		} else if loc := payload.Location; loc != nil && loc.Latitude != nil && loc.Longitude != nil &&
+			*loc.Latitude >= -90 && *loc.Latitude <= 90 && *loc.Longitude >= -180 && *loc.Longitude <= 180 {
+			location = &line.MessageLocation{
+				Title: loc.Title, Address: loc.Address,
+				Latitude: *loc.Latitude, Longitude: *loc.Longitude,
+			}
+		}
+	}
+	if location == nil {
 		return &bridgev2.ConvertedMessage{
 			Parts: []*bridgev2.ConvertedMessagePart{
 				{
@@ -26,15 +47,15 @@ func (h *Handler) ConvertLocation(data line.Message, relatesTo *event.RelatesTo)
 		}, nil
 	}
 
-	geoURI := fmt.Sprintf("geo:%.6f,%.6f", data.Location.Latitude, data.Location.Longitude)
-	mapsURL := fmt.Sprintf("https://maps.google.com/maps?q=%.6f%%2C%.6f", data.Location.Latitude, data.Location.Longitude)
+	geoURI := fmt.Sprintf("geo:%.6f,%.6f", location.Latitude, location.Longitude)
+	mapsURL := fmt.Sprintf("https://maps.google.com/maps?q=%.6f%%2C%.6f", location.Latitude, location.Longitude)
 
 	var bodyParts []string
-	if data.Location.Title != "" {
-		bodyParts = append(bodyParts, data.Location.Title)
+	if location.Title != "" {
+		bodyParts = append(bodyParts, location.Title)
 	}
-	if data.Location.Address != "" {
-		bodyParts = append(bodyParts, data.Location.Address)
+	if location.Address != "" {
+		bodyParts = append(bodyParts, location.Address)
 	}
 	bodyParts = append(bodyParts, mapsURL)
 	body := strings.Join(bodyParts, "\n")

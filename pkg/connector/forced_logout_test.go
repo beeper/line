@@ -130,7 +130,7 @@ func TestInvalidSenderKeyReconnectPersistsFullVerification(t *testing.T) {
 			select {
 			case state := <-matrix.states:
 				wantRestartError := status.BridgeStateErrorCode("line-logged-out")
-				wantRestartMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
+				wantRestartMessage := "LINE logged this session out. Click Reconnect in Beeper to reconnect LINE."
 				if invalidKey {
 					wantRestartError = "line-e2ee-key-missing"
 					wantRestartMessage = lineMissingE2EEKeyMessage
@@ -213,7 +213,6 @@ func TestEnsureValidTokenDoesNotReloginAfterLoggedOutRefresh(t *testing.T) {
 			Bridge: &bridgev2.Bridge{Log: zerolog.New(io.Discard)},
 		},
 	}
-	var reloginCalls int
 	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
 		if token != "expired" {
 			t.Fatalf("profile token = %q, want expired", token)
@@ -224,19 +223,12 @@ func TestEnsureValidTokenDoesNotReloginAfterLoggedOutRefresh(t *testing.T) {
 		return lc.recoverTokenWith(
 			ctx,
 			func(context.Context) error { return errLoggedOut },
-			func(context.Context) error {
-				reloginCalls++
-				return nil
-			},
 		)
 	}
 
 	err := lc.ensureValidToken(context.Background())
 	if !line.IsAuthError(err) {
 		t.Fatalf("ensureValidToken error = %v, want auth error", err)
-	}
-	if reloginCalls != 0 {
-		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
 	}
 	if lc.hasAccessToken() || !lc.isSessionInvalidated() {
 		t.Fatal("logged-out refresh did not invalidate the session")
@@ -260,7 +252,6 @@ func TestForcedLogoutWinsOverEnsureValidTokenRefresh(t *testing.T) {
 	refreshStarted := make(chan struct{})
 	allowRefresh := make(chan struct{})
 	ensureDone := make(chan error, 1)
-	var reloginCalls int
 	getProfileWithToken = func(_ context.Context, token string) (*line.Profile, error) {
 		if token == "recovered-token" {
 			return &line.Profile{}, nil
@@ -279,10 +270,6 @@ func TestForcedLogoutWinsOverEnsureValidTokenRefresh(t *testing.T) {
 				lc.setTokens("recovered-token", "")
 				return nil
 			},
-			func(context.Context) error {
-				reloginCalls++
-				return nil
-			},
 		)
 	}
 	go func() {
@@ -299,9 +286,6 @@ func TestForcedLogoutWinsOverEnsureValidTokenRefresh(t *testing.T) {
 
 	if err := <-ensureDone; err != nil {
 		t.Fatalf("ensureValidToken returned error: %v", err)
-	}
-	if reloginCalls != 0 {
-		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
 	}
 	select {
 	case <-logoutDone:

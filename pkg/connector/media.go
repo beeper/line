@@ -9,6 +9,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -18,12 +20,43 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/image/draw"
 )
+
+const maxLineImagePixels = 100_000_000
+
+func isHEIFData(data []byte) bool {
+	if len(data) < 16 || string(data[4:8]) != "ftyp" {
+		return false
+	}
+	boxSize := int(binary.BigEndian.Uint32(data))
+	if boxSize < 16 || boxSize > len(data) {
+		return false
+	}
+	brands := []string{string(data[8:12])}
+	for i := 16; i+4 <= boxSize; i += 4 {
+		brands = append(brands, string(data[i:i+4]))
+	}
+	if slices.Contains(brands, "avif") || slices.Contains(brands, "avis") {
+		return false
+	}
+	return slices.ContainsFunc(brands, func(brand string) bool {
+		switch brand {
+		case "heic", "heix", "heim", "heis", "hevc", "hevx", "mif1", "msf1":
+			return true
+		}
+		return false
+	})
+}
+
+func lineImageSizeAllowed(width, height int) bool {
+	return width > 0 && height > 0 && width <= maxLineImagePixels/height
+}
 
 func isHEICImage(mimeType, fileName string) bool {
 	mimeType, _, _ = strings.Cut(strings.ToLower(mimeType), ";")
@@ -57,6 +90,31 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 		return nil, fmt.Errorf("failed to write temporary HEIC file: %w", err)
 	}
 
+	info, err := exec.CommandContext(ctx, "heif-info", inputPath).Output()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("failed to inspect HEIF dimensions: %w", ctxErr)
+		}
+		return nil, fmt.Errorf("failed to inspect HEIF dimensions: %w", err)
+	}
+	pixels := 0
+	for infoLine := range strings.SplitSeq(string(info), "\n") {
+		if !strings.HasPrefix(infoLine, "image:") {
+			continue
+		}
+		var width, height int
+		if _, err = fmt.Sscanf(infoLine, "image: %dx%d", &width, &height); err != nil || !lineImageSizeAllowed(width, height) {
+			return nil, fmt.Errorf("invalid or oversized HEIF image: %s", infoLine)
+		}
+		pixels += width * height
+		if pixels > maxLineImagePixels {
+			return nil, errors.New("HEIF images exceed the pixel limit")
+		}
+	}
+	if pixels == 0 {
+		return nil, errors.New("HEIF image dimensions are unknown")
+	}
+
 	// iPhone photos are HEIF grids of tiles. The ffmpeg CLI only decodes the
 	// first tile, while libheif assembles the full image.
 	jpegData, err := runHEIFDec(ctx, dir, inputPath, "jpg")
@@ -70,7 +128,7 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 	// writer skips the block and writes the image.
 	pngData, pngErr := runHEIFDec(ctx, dir, inputPath, "png")
 	if pngErr != nil {
-		return nil, err
+		return nil, errors.Join(err, pngErr)
 	}
 	img, imgErr := png.Decode(bytes.NewReader(pngData))
 	if imgErr != nil {
@@ -106,7 +164,7 @@ func runHEIFDec(ctx context.Context, dir, inputPath, extension string) ([]byte, 
 	}
 	// heif-dec exits 0 even when its writer fails, leaving an empty file.
 	config, _, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil || config.Width <= 0 || config.Height <= 0 {
+	if err != nil || !lineImageSizeAllowed(config.Width, config.Height) {
 		return nil, fmt.Errorf("heif-dec produced invalid %s output: %s", extension, strings.TrimSpace(stderr.String()))
 	}
 	return data, nil

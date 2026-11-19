@@ -353,6 +353,7 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	meta.AccessToken = accessToken
 	meta.RefreshToken = refreshToken
 	meta.SessionInvalidated = false
+	meta.LogoutCode, meta.LogoutReason = 0, ""
 	err = lc.UserLogin.Save(ctx)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save refreshed tokens to DB")
@@ -409,11 +410,7 @@ func (lc *LineClient) invalidateSessionLocked(ctx context.Context, err error, ex
 	sendState := lc.claimForcedLogoutState()
 	lc.invalidateAccessToken()
 	lc.obsTokenCache.Invalidate()
-	stateError := status.BridgeStateErrorCode("line-logged-out")
-	stateMessage := "LINE logged this Chrome Extension session out because another LINE client connected. Click Reconnect in Beeper to reconnect LINE."
-	if expired {
-		stateError, stateMessage = "line-token-expired", ""
-	}
+	logoutCode, logoutReason, _ := line.LogoutReason(err)
 	invalidSenderKey := line.IsInvalidSenderKey(err)
 	needsFullE2EELogin := invalidSenderKey
 	lc.missingE2EEKeyMu.Lock()
@@ -424,27 +421,63 @@ func (lc *LineClient) invalidateSessionLocked(ctx context.Context, err error, ex
 				meta.Certificate = ""
 			}
 			needsFullE2EELogin = meta.ForceFullE2EELogin
+			if logoutCode != 0 {
+				meta.LogoutCode, meta.LogoutReason = logoutCode, logoutReason
+			}
+			logoutCode, logoutReason = meta.LogoutCode, meta.LogoutReason
 		}
 	}
 	lc.missingE2EEKeyMu.Unlock()
+	stateError := status.BridgeStateErrorCode("line-logged-out")
+	stateMessage := lineLogoutMessage(logoutCode, logoutReason)
+	if expired {
+		stateError, stateMessage = "line-token-expired", ""
+	}
 	if needsFullE2EELogin {
 		stateError = "line-e2ee-key-missing"
 		stateMessage = lineMissingE2EEKeyMessage
 	}
 	lc.saveSessionInvalidated(ctx, expired)
 	if sendState && lc.UserLogin.Bridge != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("LINE session invalidated; marking login bad credentials")
+		lc.UserLogin.Bridge.Log.Warn().Err(err).
+			Int("logout_code", logoutCode).
+			Str("logout_reason", logoutReason).
+			Msg("LINE session invalidated; marking login bad credentials")
 	}
 	if sendState && lc.UserLogin.BridgeState != nil {
+		info := map[string]any{"go_error": err.Error()}
+		if logoutCode != 0 {
+			info["line_error_code"] = logoutCode
+			info["line_error_reason"] = logoutReason
+		}
 		lc.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      stateError,
 			Message:    stateMessage,
 			UserAction: status.UserActionRelogin,
-			Info:       map[string]any{"go_error": err.Error()},
+			Info:       info,
 		})
 	}
 	lc.cancelActiveRun()
+}
+
+func lineLogoutMessage(code int, reason string) string {
+	const reconnect = " Click Reconnect in Beeper to reconnect LINE."
+	switch {
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "AUTHENTICATION_DIVESTED_BY_OTHER_DEVICE":
+		return "LINE logged this session out because you logged in to LINE on another PC." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "IDENTIFY_MODIFIED":
+		return "LINE logged this session out because the account's email or password changed." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "REVOKE":
+		return "LINE logged this session out because it was blocked from your phone." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "EXPIRED":
+		return "LINE logged this session out after a long period of inactivity." + reconnect
+	case code == line.TalkExceptionNotAuthorizedDevice && reason == "DEVICE_LOSE":
+		return "LINE needs you to verify your account. Log in to LINE on your phone with your registered email, then click Reconnect in Beeper."
+	case code == line.TalkExceptionNotAvailableUser && reason == "DELETED_ACCOUNT":
+		return "LINE logged this session out because the LINE account was deleted."
+	}
+	return "LINE logged this session out." + reconnect
 }
 
 func (lc *LineClient) sendConnectedStateIfCurrent(ctx context.Context) bool {
@@ -526,10 +559,8 @@ func (lc *LineClient) markMissingE2EEKey(ctx context.Context, err error) {
 		return
 	}
 	var missingKey *e2ee.MissingOwnKeyError
-	if errors.As(err, &missingKey) && lc.E2EE != nil {
-		if myRawKeyID, _, errKey := lc.E2EE.MyKeyIDs(); errKey == nil && missingKey.KeyID < myRawKeyID {
-			return
-		}
+	if errors.As(err, &missingKey) && lc.E2EE != nil && lc.isRetiredOwnKey(missingKey.KeyID) {
+		return
 	}
 	lc.missingE2EEKeyMu.Lock()
 	if lc.missingE2EEKeyMarked {
@@ -571,34 +602,23 @@ func (lc *LineClient) applyRefreshedLoginE2EEKeys(meta *UserLoginMetadata, res *
 	lc.missingE2EEKeyMarked = false
 }
 
-// recoverToken attempts to restore a valid session by refreshing, then re-logging in.
+// recoverToken attempts to restore a valid session by refreshing the access token.
 func (lc *LineClient) recoverToken(ctx context.Context) error {
-	return lc.recoverTokenWith(ctx, lc.refreshAndSave, lc.tryLogin)
+	return lc.recoverTokenWith(ctx, lc.refreshAndSave)
 }
 
-func (lc *LineClient) recoverTokenWith(
-	ctx context.Context,
-	refresh func(context.Context) error,
-	relogin func(context.Context) error,
-) error {
+func (lc *LineClient) recoverTokenWith(ctx context.Context, refresh func(context.Context) error) error {
 	return lc.runTokenRecovery(ctx, func(ctx context.Context) error {
-		if err := refresh(ctx); err == nil {
+		if err := refresh(ctx); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			lc.UserLogin.Bridge.Log.Info().Msg("Token recovered via refresh")
-			return nil
+			return err
 		} else if ctx.Err() != nil {
 			return ctx.Err()
-		} else if lc.isLoggedOut(err) || isTransientLineError(err) || errors.Is(err, errLineSessionInvalidated) || errors.Is(err, errLineClientSuperseded) || errors.Is(err, context.Canceled) {
-			return err
 		}
-		lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
-		err := relogin(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return err
+		lc.UserLogin.Bridge.Log.Info().Msg("Token recovered via refresh")
+		return nil
 	})
 }
 
@@ -971,6 +991,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		staged.RefreshToken = refreshToken
 	}
 	staged.SessionInvalidated = false
+	staged.LogoutCode, staged.LogoutReason = 0, ""
 	if res.Mid != "" {
 		staged.Mid = res.Mid
 	}
@@ -1139,6 +1160,13 @@ func (lc *LineClient) GetUserID() networkid.UserID {
 
 func (lc *LineClient) LogoutRemote(ctx context.Context) {
 	lc.Disconnect()
+	token := lc.getAccessToken()
+	if token == "" {
+		return
+	}
+	if err := lc.newClientWithToken(token).Logout(ctx); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to log out of LINE")
+	}
 }
 
 func (lc *LineClient) midOrFallback() string {
