@@ -23,6 +23,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/line/pkg/line"
 )
@@ -2027,9 +2028,27 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			lc.syncSingleChat(context.Background(), op)
 		}()
 
+	case OpSendChatChecked:
+		ts, _ := op.CreatedTime.Int64()
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
+			EventMeta: simplevent.EventMeta{
+				Type: bridgev2.RemoteEventReadReceipt,
+				PortalKey: networkid.PortalKey{
+					ID:       makePortalID(op.Param1),
+					Receiver: lc.UserLogin.ID,
+				},
+				Timestamp: time.UnixMilli(ts),
+				Sender:    lc.eventSenderForMID(lc.Mid),
+			},
+			LastTarget: networkid.MessageID(op.Param2),
+			ReadUpTo:   time.UnixMilli(ts),
+		})
+
 	case OpReadReceipt:
-		portalID := makePortalID(op.Param1)
-		senderID := makeUserID(op.Param2)
+		chatMID := op.Param1
+		readerMID := op.Param2
+		portalID := makePortalID(chatMID)
+		senderID := makeUserID(readerMID)
 
 		ts, _ := op.CreatedTime.Int64()
 		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
@@ -2041,6 +2060,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				},
 				Timestamp: time.UnixMilli(ts),
 				Sender:    lc.eventSenderForMID(string(senderID)),
+				PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+					lc.hiddenJoinGroupMessageSender(ctx, portal, chatMID, readerMID, time.UnixMilli(ts))
+				},
 			},
 			ReadUpTo: time.UnixMilli(ts),
 		})
@@ -2391,6 +2413,30 @@ func (lc *LineClient) makeSystemMemberChangesEvent(
 	}
 }
 
+func dropLeavesOfNonMembers(ctx context.Context, portal *bridgev2.Portal, members *bridgev2.ChatMemberList) {
+	if members == nil || portal.MXID == "" {
+		return
+	}
+	var current map[id.UserID]*event.MemberEventContent
+	for userID, member := range members.MemberMap {
+		if member.Membership != event.MembershipLeave || member.IsFromMe {
+			continue
+		}
+		if current == nil {
+			var err error
+			current, err = portal.Bridge.Matrix.GetMembers(ctx, portal.MXID)
+			if err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get room members to filter historical leaves")
+				return
+			}
+		}
+		existing, ok := current[portal.Bridge.Matrix.GhostIntent(member.Sender).GetMXID()]
+		if !ok || existing.Membership == event.MembershipLeave {
+			delete(members.MemberMap, userID)
+		}
+	}
+}
+
 func (lc *LineClient) handleSelfLeave(chatMid string) {
 	selfID := string(lc.UserLogin.ID)
 	lc.handleSelfLeaveWithSender(chatMid, lc.eventSenderForMID(selfID))
@@ -2738,7 +2784,10 @@ func (lc *LineClient) queueHistoricalSystemMessage(msg *line.Message, opType int
 				if err != nil {
 					return nil, fmt.Errorf("get historical system message change: %w", err)
 				}
-				portal.ProcessChatInfoChange(ctx, systemEvent.GetSender(), lc.UserLogin, change, systemEvent.GetTimestamp())
+				dropLeavesOfNonMembers(ctx, portal, change.MemberChanges)
+				if change.ChatInfo != nil || change.MemberChanges == nil || len(change.MemberChanges.MemberMap) > 0 {
+					portal.ProcessChatInfoChange(ctx, systemEvent.GetSender(), lc.UserLogin, change, systemEvent.GetTimestamp())
+				}
 			}
 			return &bridgev2.ConvertedMessage{
 				Parts: []*bridgev2.ConvertedMessagePart{{
