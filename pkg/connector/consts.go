@@ -6,6 +6,7 @@ type OperationType int
 const (
 	OpSendMessage            OperationType = 25
 	OpReceiveMessage         OperationType = 26
+	OpSendChatChecked        OperationType = 40
 	OpSendChatRemoved        OperationType = 41
 	OpContactUpdate          OperationType = 49
 	OpReadReceipt            OperationType = 55
