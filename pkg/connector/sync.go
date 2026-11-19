@@ -1619,10 +1619,11 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 	var listenCtx context.Context
 	var cancelListen context.CancelCauseFunc
 	sseDisconnected := false
-	var backoff reconnectBackoff
+	var backoff, requestedBackoff reconnectBackoff
 	handler := func(eventType, data string) {
+		backoff.reset()
 		if eventType != line.SSEEventOpen && eventType != "reconnect" && eventType != "talkException" {
-			backoff.reset()
+			requestedBackoff.reset()
 		}
 		if sseDisconnected && lc.sendSSEConnectedIfCurrent(ctx) {
 			sseDisconnected = false
@@ -1651,7 +1652,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 				NextRevision string `json:"nextRevision"`
 			}
 			if err := json.Unmarshal([]byte(data), &fsPayload); err == nil && fsPayload.NextRevision != "" {
-				if newRev, err := strconv.ParseInt(fsPayload.NextRevision, 10, 64); err == nil {
+				if newRev, err := strconv.ParseInt(fsPayload.NextRevision, 10, 64); err == nil && newRev != localRev {
 					lc.UserLogin.Bridge.Log.Info().Int64("old", localRev).Int64("new", newRev).Msg("Updating local revision from fullSync")
 
 					localRev = newRev
@@ -1705,7 +1706,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		} else if errors.Is(cause, errSSEResync) {
 			continue
 		} else if errors.Is(cause, errSSEReconnect) {
-			waitForSSEReconnect(ctx, backoff.next())
+			waitForSSEReconnect(ctx, requestedBackoff.next())
 			continue
 		}
 		if err != nil {
