@@ -310,7 +310,7 @@ func buildSticonMessageBodies(stkTxt string, replacements []sticonReplacement) (
 		if r.start > pos {
 			seg := stkTxt[pos:r.start]
 			plainBuf.WriteString(seg)
-			htmlBuf.WriteString(htmlEscape(seg))
+			htmlBuf.WriteString(event.TextToHTML(seg))
 		}
 
 		placeholder := stkTxt[r.start:r.end]
@@ -329,7 +329,7 @@ func buildSticonMessageBodies(stkTxt string, replacements []sticonReplacement) (
 	if pos < len(stkTxt) {
 		seg := stkTxt[pos:]
 		plainBuf.WriteString(seg)
-		htmlBuf.WriteString(htmlEscape(seg))
+		htmlBuf.WriteString(event.TextToHTML(seg))
 	}
 
 	return plainBuf.String(), htmlBuf.String()
