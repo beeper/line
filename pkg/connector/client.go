@@ -32,7 +32,7 @@ func init() {
 		"line-login-failed":     "LINE could not sign you in. Sign in again.",
 		"line-token-expired":    "Your LINE session expired and could not be restored. Sign in again.",
 		"line-sse-disconnected": "Disconnected from LINE, reconnecting",
-		"line-e2ee-init-failed": "LINE encryption failed to start, reconnecting",
+		"line-e2ee-init-failed": "LINE encryption failed to start",
 	})
 }
 
