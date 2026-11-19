@@ -604,7 +604,7 @@ func (lc *LineClient) convertLineMessageContent(ctx context.Context, portal *bri
 }
 
 func (lc *LineClient) contactCardMXID(mid string) id.UserID {
-	if !strings.HasPrefix(mid, "u") {
+	if !isUserMID(mid) {
 		return ""
 	} else if lc.isOwnMID(mid) {
 		return lc.UserLogin.UserMXID
