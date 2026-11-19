@@ -201,6 +201,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var payload []byte
 	var plainTextBody string // used when plainText == true for text messages
 	textBody := msg.Content.Body
+	sticonBodies := make(map[id.ContentURIString]string)
 
 	// For plain media: we send the message first, then upload media to r/talk/m/{msgId}.
 	var plainMediaData []byte // raw media data to upload after sending
@@ -239,6 +240,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			sticon, err := lc.resolveSticker(resolveCtx, mxc, nil, true)
 			if err != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE emoji, sending alt text")
+			}
+			if sticon != nil {
+				sticonBodies[mxc] = sticon.Body
 			}
 			return sticon
 		})
@@ -651,7 +655,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		_, _, legacyRoomMention := findRoomMention(msg.Content.Body)
 		mentions = &event.Mentions{Room: legacyRoomMention}
 	}
-	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, mentions)
+	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, mentions, sticonBodies)
 	for k, v := range mentionMeta {
 		contentMetadata[k] = v
 	}
@@ -1070,7 +1074,7 @@ func (lc *LineClient) HandleMatrixAcceptMessageRequest(ctx context.Context, msg 
 	return wrapSendError(err)
 }
 
-func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedBody string, mentions *event.Mentions) map[string]string {
+func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedBody string, mentions *event.Mentions, imageBodies ...map[id.ContentURIString]string) map[string]string {
 	if mentions == nil || (len(mentions.UserIDs) == 0 && !mentions.Room) {
 		return nil
 	}
@@ -1109,7 +1113,23 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 		mentioned[userID] = true
 	}
 	pillUsers := make(map[id.UserID]bool, len(mentions.UserIDs))
-	for _, pill := range parseUserPills(ctx, body, formattedBody) {
+	pills := parseUserPills(ctx, body, formattedBody, imageBodies...)
+	labelOwners := make(map[string]id.UserID)
+	ambiguousLabels := make(map[string]bool)
+	for _, pill := range pills {
+		if pill.start >= 0 || !mentioned[pill.userID] {
+			continue
+		}
+		if _, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(pill.userID); !ok {
+			continue
+		}
+		label := strings.TrimPrefix(strings.TrimSpace(pill.text), "@")
+		if owner, ok := labelOwners[label]; ok && owner != pill.userID {
+			ambiguousLabels[label] = true
+		}
+		labelOwners[label] = pill.userID
+	}
+	for _, pill := range pills {
 		pillUsers[pill.userID] = true
 		if !mentioned[pill.userID] {
 			continue
@@ -1118,7 +1138,16 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 		if !ok {
 			continue
 		}
-		addMentionee(pill.start, pill.end, mentionEntry{M: string(mid)})
+		if pill.start < 0 {
+			if ambiguousLabels[strings.TrimPrefix(strings.TrimSpace(pill.text), "@")] {
+				continue
+			}
+			if start, end, ok := findUniquePillText(body, pill.text); ok {
+				addMentionee(start, end, mentionEntry{M: string(mid)})
+			}
+		} else {
+			addMentionee(pill.start, pill.end, mentionEntry{M: string(mid)})
+		}
 	}
 
 	for _, userID := range mentions.UserIDs {
@@ -1167,7 +1196,7 @@ type userPill struct {
 	end    int
 }
 
-func parseUserPills(ctx context.Context, body, formattedBody string) []userPill {
+func parseUserPills(ctx context.Context, body, formattedBody string, imageBodies ...map[id.ContentURIString]string) []userPill {
 	if formattedBody == "" {
 		return nil
 	}
@@ -1177,7 +1206,16 @@ func parseUserPills(ctx context.Context, body, formattedBody string) []userPill 
 	}
 	var pills []userPill
 	parser := *format.TextHTMLParser
-	parser.LinkConverter = func(text, _ string, _ format.Context) string { return text }
+	if len(imageBodies) > 0 && len(imageBodies[0]) > 0 {
+		parser.ImageConverter = func(src, alt, _, _, _ string, isEmoji bool) string {
+			if text, ok := imageBodies[0][id.ContentURIString(src)]; ok && isEmoji {
+				return text
+			}
+			return alt
+		}
+	} else {
+		parser.LinkConverter = func(text, _ string, _ format.Context) string { return text }
+	}
 	parser.PillConverter = func(displayname, mxid, eventID string, _ format.Context) string {
 		if strings.HasPrefix(mxid, "@") && eventID == "" {
 			token := marker + strconv.Itoa(len(pills)) + marker
@@ -1216,6 +1254,40 @@ func unpositionedPills(pills []userPill) []userPill {
 		pills[i].start = -1
 	}
 	return pills
+}
+
+func findUniquePillText(body, text string) (start, end int, ok bool) {
+	text = strings.TrimPrefix(strings.TrimSpace(text), "@")
+	if text == "" {
+		return 0, 0, false
+	}
+	for offset := 0; offset < len(body); {
+		pos := strings.Index(body[offset:], text)
+		if pos < 0 {
+			break
+		}
+		candidateStart := offset + pos
+		candidateEnd := candidateStart + len(text)
+		hasAt := candidateStart > 0 && body[candidateStart-1] == '@'
+		if hasAt {
+			candidateStart--
+		}
+		before, _ := utf8.DecodeLastRuneInString(body[:candidateStart])
+		after, _ := utf8.DecodeRuneInString(body[candidateEnd:])
+		bounded := !isMentionWordRune(before) && !isMentionWordRune(after)
+		if hasAt {
+			isLatinWord := func(r rune) bool { return unicode.In(r, unicode.Latin) || unicode.IsDigit(r) || r == '_' }
+			bounded = !isLatinWord(before) && !strings.ContainsRune("._-+@", before) && !isLatinWord(after)
+		}
+		if bounded {
+			if ok {
+				return 0, 0, false
+			}
+			start, end, ok = candidateStart, candidateEnd, true
+		}
+		offset = candidateEnd
+	}
+	return
 }
 
 func findWholeWord(body string, from int, text string) (int, int, bool) {
