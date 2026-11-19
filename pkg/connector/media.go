@@ -458,15 +458,14 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	if info != nil && int64(info.Duration) > maxLineVideoDuration.Milliseconds() {
 		return nil, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
 	}
-	duration := probeVideoDuration(ctx, data)
+	duration, formatName := probeLineVideo(ctx, data)
 	if duration <= 0 {
 		return nil, fmt.Errorf("%w: video duration is unknown", errSendVideoAsFile)
 	}
 	if duration > maxLineVideoDuration {
 		return nil, fmt.Errorf("%w: %s is longer than %s", errSendVideoAsFile, duration, maxLineVideoDuration)
 	}
-	switch strings.TrimSpace(mimeType) {
-	case "video/mp4", "video/quicktime", "video/x-m4v", "video/3gpp":
+	if strings.Contains(","+formatName+",", ",mov,") {
 		return data, nil
 	}
 	if !mauffmpeg.Supported() {
@@ -482,29 +481,29 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	return converted, nil
 }
 
-func probeVideoDuration(ctx context.Context, data []byte) time.Duration {
+func probeLineVideo(ctx context.Context, data []byte) (time.Duration, string) {
 	if !mauffmpeg.ProbeSupported() {
-		return 0
+		return 0, ""
 	}
 	file, err := os.CreateTemp("", "line-video-probe-*")
 	if err != nil {
-		return 0
+		return 0, ""
 	}
 	defer os.Remove(file.Name())
 	_, err = file.Write(data)
 	if closeErr := file.Close(); err != nil || closeErr != nil {
-		return 0
+		return 0, ""
 	}
 	probe, err := mauffmpeg.Probe(ctx, file.Name())
 	if err != nil || probe.Format == nil {
-		return 0
+		return 0, ""
 	}
 	seconds := probe.Format.Duration
 	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
-		return 0
+		return 0, ""
 	}
 	if seconds > maxLineVideoDuration.Seconds() {
-		return maxLineVideoDuration + time.Second
+		return maxLineVideoDuration + time.Second, probe.Format.FormatName
 	}
-	return time.Duration(seconds * float64(time.Second))
+	return time.Duration(seconds * float64(time.Second)), probe.Format.FormatName
 }
