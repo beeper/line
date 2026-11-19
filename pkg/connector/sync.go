@@ -703,12 +703,6 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	lc.cacheMu.Lock()
-	versions := make(map[string]uint64, len(lc.ownReadVersions))
-	for mid, version := range lc.ownReadVersions {
-		versions[mid] = version
-	}
-	lc.cacheMu.Unlock()
 
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
@@ -785,7 +779,7 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	close(jobs)
 	workers.Wait()
 	if ctx.Err() == nil && len(caughtUp) > 0 {
-		lc.queueStartupReadReceipts(ctx, caughtUp, versions)
+		lc.queueStartupReadReceipts(ctx, caughtUp)
 	}
 
 	// Historical membership/name events are real state events. Replay them in
@@ -2025,7 +2019,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}()
 
 	case OpSendChatChecked:
-		lc.noteOwnRead(op.Param1)
+		lc.noteOwnRead(op.Param1, op.Param2)
 		ts, _ := op.CreatedTime.Int64()
 		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
 			EventMeta: simplevent.EventMeta{

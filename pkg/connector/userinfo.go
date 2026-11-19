@@ -23,7 +23,6 @@ import (
 var _ bridgev2.IdentifierResolvingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev2.MatrixReadReceipt) error {
-	lc.noteOwnRead(string(read.Portal.ID))
 	if read.ReadUpTo.IsZero() && read.EventID == "" {
 		return nil
 	}
@@ -32,6 +31,9 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 	if read.EventID != "" {
 		msg, err := lc.UserLogin.Bridge.DB.Message.GetPartByMXID(ctx, read.EventID)
 		if err == nil && msg != nil && msg.ID != "" {
+			if msg.Room != read.Portal.PortalKey {
+				return nil
+			}
 			targetID = string(msg.ID)
 		}
 	}
@@ -40,6 +42,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 		return nil
 	}
 
+	lc.noteOwnRead(string(read.Portal.ID), targetID)
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
 		return client.SendChatChecked(string(read.Portal.ID), targetID)
 	})

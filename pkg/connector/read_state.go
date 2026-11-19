@@ -2,33 +2,41 @@ package connector
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"math/big"
 	"slices"
 
 	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 
 	"github.com/beeper/line/pkg/line"
 )
 
-func (lc *LineClient) ownReadVersion(mid string) uint64 {
+func (lc *LineClient) ownReadTarget(mid string) string {
 	lc.cacheMu.Lock()
 	defer lc.cacheMu.Unlock()
-	return lc.ownReadVersions[mid]
+	return lc.ownReadTargets[mid]
 }
 
-func (lc *LineClient) noteOwnRead(mid string) {
-	lc.cacheMu.Lock()
-	defer lc.cacheMu.Unlock()
-	if lc.ownReadVersions == nil {
-		lc.ownReadVersions = make(map[string]uint64)
+func (lc *LineClient) noteOwnRead(mid, target string) {
+	readID, ok := new(big.Int).SetString(target, 10)
+	if !ok || readID.Sign() <= 0 {
+		return
 	}
-	lc.ownReadVersions[mid]++
+	lc.cacheMu.Lock()
+	defer lc.cacheMu.Unlock()
+	if previous, valid := new(big.Int).SetString(lc.ownReadTargets[mid], 10); valid && previous.Cmp(readID) >= 0 {
+		return
+	}
+	if lc.ownReadTargets == nil {
+		lc.ownReadTargets = make(map[string]string)
+	}
+	lc.ownReadTargets[mid] = readID.String()
 }
 
-func (lc *LineClient) queueStartupReadReceipts(ctx context.Context, caughtUp map[string][]networkid.MessageID, versions map[string]uint64) {
+func (lc *LineClient) queueStartupReadReceipts(ctx context.Context, caughtUp map[string][]networkid.MessageID) {
 	chatMIDs := make([]string, 0, len(caughtUp))
 	for mid := range caughtUp {
 		chatMIDs = append(chatMIDs, mid)
@@ -42,18 +50,12 @@ func (lc *LineClient) queueStartupReadReceipts(ctx context.Context, caughtUp map
 			continue
 		}
 		for _, mid := range chunk {
-			if receipt := lc.startupReadReceipt(mid, boxes[mid].LastSeenMessageID, caughtUp[mid], versions[mid]); receipt != nil {
-				lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, receipt)
-			}
+			lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, lc.startupReadReceipt(mid, boxes[mid].LastSeenMessageID, caughtUp[mid]))
 		}
 	}
 }
 
-func (lc *LineClient) startupReadReceipt(mid, lastSeen string, caughtUp []networkid.MessageID, version uint64) *simplevent.Receipt {
-	readID, ok := new(big.Int).SetString(lastSeen, 10)
-	if !ok || readID.Sign() <= 0 {
-		return nil
-	}
+func (lc *LineClient) startupReadReceipt(mid, lastSeen string, caughtUp []networkid.MessageID) *simplevent.Receipt {
 	receipt := &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReadReceipt,
@@ -62,26 +64,65 @@ func (lc *LineClient) startupReadReceipt(mid, lastSeen string, caughtUp []networ
 		},
 	}
 	receipt.PreHandleWithResultFunc = func(ctx context.Context, portal *bridgev2.Portal) *bridgev2.EventHandlingResult {
-		var target *database.Message
-		var targetID *big.Int
+		ignore := bridgev2.EventHandlingResultIgnored
+		fail := func(err error) *bridgev2.EventHandlingResult {
+			result := bridgev2.EventHandlingResultFailed.WithError(err)
+			return &result
+		}
+		readID, valid := new(big.Int).SetString(lastSeen, 10)
+		if !valid || readID.Sign() <= 0 {
+			readID = new(big.Int)
+		}
+		if ownReadID, ok := new(big.Int).SetString(lc.ownReadTarget(mid), 10); ok && ownReadID.Cmp(readID) > 0 {
+			readID = ownReadID
+		}
+		if readID.Sign() <= 0 {
+			return &ignore
+		}
+		hasReadCatchUp := false
 		for _, msgID := range caughtUp {
-			candidateID, valid := new(big.Int).SetString(string(msgID), 10)
-			if !valid || candidateID.Sign() <= 0 || candidateID.Cmp(readID) > 0 {
+			candidateID, ok := new(big.Int).SetString(string(msgID), 10)
+			if !ok || candidateID.Sign() <= 0 || candidateID.Cmp(readID) > 0 {
 				continue
 			}
 			msg, err := lc.UserLogin.Bridge.DB.Message.GetLastPartByID(ctx, lc.UserLogin.ID, msgID)
 			if err != nil {
-				result := bridgev2.EventHandlingResultFailed.WithError(err)
-				return &result
+				return fail(err)
 			}
-			if msg != nil && msg.Room == portal.PortalKey && !msg.HasFakeMXID() && (targetID == nil || candidateID.Cmp(targetID) > 0) {
-				target = msg
-				targetID = candidateID
+			if msg != nil && msg.Room == portal.PortalKey && !msg.HasFakeMXID() {
+				hasReadCatchUp = true
+				break
 			}
 		}
-		if target == nil || lc.ownReadVersion(mid) != version {
-			result := bridgev2.EventHandlingResultIgnored
-			return &result
+		if !hasReadCatchUp {
+			return &ignore
+		}
+		target, err := lc.UserLogin.Bridge.DB.Message.GetLastPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(readID.String()))
+		if err != nil {
+			return fail(err)
+		}
+		if target == nil || target.Room != portal.PortalKey || target.HasFakeMXID() {
+			var rowID int64
+			err = lc.UserLogin.Bridge.DB.QueryRow(ctx, `
+				SELECT rowid FROM message
+				WHERE bridge_id=$1 AND room_id=$2 AND room_receiver=$3
+				  AND ltrim(id, '0123456789')='' AND ltrim(id, '0')<>''
+				  AND (length(ltrim(id, '0'))<length($4)
+				       OR (length(ltrim(id, '0'))=length($4) AND ltrim(id, '0')<=$4))
+				  AND mxid NOT LIKE '~fake:%'
+				ORDER BY length(ltrim(id, '0')) DESC, ltrim(id, '0') DESC, part_id DESC LIMIT 1
+			`, lc.UserLogin.Bridge.ID, portal.ID, portal.Receiver, readID.String()).Scan(&rowID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return &ignore
+			} else if err != nil {
+				return fail(err)
+			}
+			target, err = lc.UserLogin.Bridge.DB.Message.GetByRowID(ctx, rowID)
+			if err != nil {
+				return fail(err)
+			} else if target == nil {
+				return &ignore
+			}
 		}
 		receipt.LastTarget = target.ID
 		receipt.Timestamp = target.Timestamp
