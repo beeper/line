@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -845,6 +846,11 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 }
 
 func (lc *LineClient) prefetchMessageBoxes(ctx context.Context, messageBoxes []line.MessageBox) {
+	lc.prefetchMessagesMu.Lock()
+	defer lc.prefetchMessagesMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	latestMessageIDs := make(map[string]string, len(messageBoxes))
 	for _, box := range messageBoxes {
 		if box.LastDeliveredMessageID != nil {
@@ -869,6 +875,9 @@ func (lc *LineClient) prefetchMessageBoxes(ctx context.Context, messageBoxes []l
 		Int("concurrency", workerCount).
 		Msg("Prefetching recent messages")
 
+	caughtUp := make(map[string][]networkid.MessageID)
+	var caughtUpMu sync.Mutex
+
 	jobs := make(chan string)
 	var workers sync.WaitGroup
 	var backfilledSystemEvents atomic.Bool
@@ -880,8 +889,14 @@ func (lc *LineClient) prefetchMessageBoxes(ctx context.Context, messageBoxes []l
 				if ctx.Err() != nil {
 					return
 				}
-				if lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit) {
+				systemEvents, queuedMessages := lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit)
+				if systemEvents {
 					backfilledSystemEvents.Store(true)
+				}
+				if len(queuedMessages) > 0 {
+					caughtUpMu.Lock()
+					caughtUp[chatMID] = queuedMessages
+					caughtUpMu.Unlock()
 				}
 			}
 		}()
@@ -898,6 +913,9 @@ func (lc *LineClient) prefetchMessageBoxes(ctx context.Context, messageBoxes []l
 	}
 	close(jobs)
 	workers.Wait()
+	if ctx.Err() == nil && len(caughtUp) > 0 {
+		lc.queueStartupReadReceipts(ctx, caughtUp)
+	}
 
 	// Historical membership/name events are real state events. Replay them in
 	// timestamp order, then restore LINE's current authoritative chat state in
@@ -935,15 +953,16 @@ func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMI
 
 // backfillRecentMessages reconciles recent reactions and system events. When
 // backfill is disabled, it also queues unbridged messages through the live path.
-func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) bool {
+func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) (bool, []networkid.MessageID) {
 	start := time.Now()
 	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
 		return client.GetRecentMessagesV2(chatMID, limit)
 	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
-		return false
+		return false, nil
 	}
+	var queuedMessages []networkid.MessageID
 	queued := 0
 	skippedExisting := 0
 	reactionSyncs := 0
@@ -980,11 +999,15 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 			didQueue = lc.queueHistoricalSystemMessage(msg, int(opType))
 		} else if !lc.UserLogin.Bridge.Config.Backfill.Enabled {
 			didQueue = lc.queueIncomingMessage(msg, int(opType))
+		} else {
+			queuedMessages = append(queuedMessages, networkid.MessageID(msg.ID))
 		}
 		if didQueue {
 			queued++
 			if ContentType(msg.ContentType) == ContentSystem {
 				systemEvents++
+			} else {
+				queuedMessages = append(queuedMessages, networkid.MessageID(msg.ID))
 			}
 			if lc.queueMessageReactionSync(ctx, chatMID, msg) {
 				reactionSyncs++
@@ -1000,7 +1023,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 		Int("skipped_existing", skippedExisting).
 		Dur("duration", time.Since(start)).
 		Msg("Finished recent-message backfill")
-	return systemEvents > 0
+	return systemEvents > 0, queuedMessages
 }
 
 func (lc *LineClient) syncChats(ctx context.Context) {
@@ -1267,6 +1290,9 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 			ExcludeChangesFromTimeline: excludeFromTimeline,
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
+	}
+	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
+		info.Members.PowerLevels = lineGroupPowerLevels()
 	}
 	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
 	// out from under an accept that's already in flight.
@@ -1696,6 +1722,16 @@ func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
 				Type:      bridgev2.RemoteEventChatInfoChange,
 				PortalKey: portalKey,
 				Timestamp: time.Now(),
+				PreHandleWithResultFunc: func(ctx context.Context, portal *bridgev2.Portal) *bridgev2.EventHandlingResult {
+					lc.cacheMu.Lock()
+					generatedName := lc.generatedGroupNameCache[update.chatMid]
+					lc.cacheMu.Unlock()
+					if !generatedName {
+						result := bridgev2.EventHandlingResultIgnored
+						return &result
+					}
+					return nil
+				},
 			},
 			ChatInfoChange: &bridgev2.ChatInfoChange{
 				ChatInfo: &bridgev2.ChatInfo{
@@ -2151,8 +2187,9 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}()
 
 	case OpSendChatChecked:
+		lc.noteOwnRead(op.Param1, op.Param2)
 		ts, _ := op.CreatedTime.Int64()
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
+		receipt := &simplevent.Receipt{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventReadReceipt,
 				PortalKey: networkid.PortalKey{
@@ -2163,8 +2200,11 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Sender:    lc.eventSenderForMID(lc.Mid),
 			},
 			LastTarget: networkid.MessageID(op.Param2),
-			ReadUpTo:   time.UnixMilli(ts),
-		})
+		}
+		receipt.PreHandleFunc = func(ctx context.Context, portal *bridgev2.Portal) {
+			lc.prepareReadReceiptFallback(ctx, portal, receipt)
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, receipt)
 
 	case OpReadReceipt:
 		chatMID := op.Param1
@@ -2173,7 +2213,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		senderID := makeUserID(readerMID)
 
 		ts, _ := op.CreatedTime.Int64()
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
+		receipt := &simplevent.Receipt{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventReadReceipt,
 				PortalKey: networkid.PortalKey{
@@ -2182,12 +2222,14 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				},
 				Timestamp: time.UnixMilli(ts),
 				Sender:    lc.eventSenderForMID(string(senderID)),
-				PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
-					lc.hiddenJoinGroupMessageSender(ctx, portal, chatMID, readerMID, time.UnixMilli(ts))
-				},
 			},
-			ReadUpTo: time.UnixMilli(ts),
-		})
+			LastTarget: networkid.MessageID(op.Param3),
+		}
+		receipt.PreHandleFunc = func(ctx context.Context, portal *bridgev2.Portal) {
+			lc.hiddenJoinGroupMessageSender(ctx, portal, chatMID, readerMID, time.UnixMilli(ts))
+			lc.prepareReadReceiptFallback(ctx, portal, receipt)
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, receipt)
 
 	case OpUnsendLocal, OpUnsendRemote:
 		chatMid := op.Param1
@@ -2303,6 +2345,24 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Interface("msg_metadata", op.Message.ContentMetadata)
 		}
 		logEvt.Msg("Unhandled SSE operation")
+	}
+}
+
+func (lc *LineClient) prepareReadReceiptFallback(ctx context.Context, portal *bridgev2.Portal, receipt *simplevent.Receipt) {
+	targetID, ok := new(big.Int).SetString(string(receipt.LastTarget), 10)
+	if !ok || targetID.Sign() < 0 {
+		return
+	}
+	latest, err := lc.UserLogin.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(ctx, portal.PortalKey, receipt.Timestamp)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to find read receipt fallback")
+		return
+	} else if latest == nil {
+		return
+	}
+	latestID, ok := new(big.Int).SetString(string(latest.ID), 10)
+	if ok && latestID.Sign() >= 0 && latestID.Cmp(targetID) <= 0 {
+		receipt.Targets = []networkid.MessageID{latest.ID}
 	}
 }
 
