@@ -1177,7 +1177,16 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 	}
 
 	var mentionees []mentionEntry
+	var occupied [][2]int
 	addMentionee := func(start, end int, entry mentionEntry) bool {
+		if start < 0 || start >= end || end > len(body) {
+			return false
+		}
+		for _, span := range occupied {
+			if start < span[1] && end > span[0] {
+				return false
+			}
+		}
 		startUTF16, startOK := byteIndexToUTF16Offset(body, start)
 		endUTF16, endOK := byteIndexToUTF16Offset(body, end)
 		if !startOK || !endOK {
@@ -1186,6 +1195,7 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 		entry.S = strconv.Itoa(startUTF16)
 		entry.E = strconv.Itoa(endUTF16)
 		mentionees = append(mentionees, entry)
+		occupied = append(occupied, [2]int{start, end})
 		return true
 	}
 
@@ -1199,9 +1209,9 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 	for _, userID := range mentions.UserIDs {
 		mentioned[userID] = true
 	}
-	added := make(map[id.UserID]bool, len(mentions.UserIDs))
-	cursor := 0
-	for _, pill := range parseUserPills(ctx, formattedBody) {
+	pillUsers := make(map[id.UserID]bool, len(mentions.UserIDs))
+	for _, pill := range parseUserPills(ctx, body, formattedBody) {
+		pillUsers[pill.userID] = true
 		if !mentioned[pill.userID] {
 			continue
 		}
@@ -1209,15 +1219,11 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 		if !ok {
 			continue
 		}
-		start, end, ok := findMentionText(body, cursor, pill.text)
-		if ok && addMentionee(start, end, mentionEntry{M: string(mid)}) {
-			cursor = end
-			added[pill.userID] = true
-		}
+		addMentionee(pill.start, pill.end, mentionEntry{M: string(mid)})
 	}
 
 	for _, userID := range mentions.UserIDs {
-		if added[userID] {
+		if pillUsers[userID] {
 			continue
 		}
 		mid, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(userID)
@@ -1229,8 +1235,12 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 			continue
 		}
 		searchStr := "@" + existingGhost.Name
-		if pos := strings.Index(body, searchStr); pos >= 0 {
-			addMentionee(pos, pos+len(searchStr), mentionEntry{M: string(mid)})
+		for cursor := 0; cursor < len(body); {
+			start, end, ok := findWholeWord(body, cursor, searchStr)
+			if !ok || addMentionee(start, end, mentionEntry{M: string(mid)}) {
+				break
+			}
+			cursor = end
 		}
 	}
 
@@ -1254,37 +1264,59 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 type userPill struct {
 	userID id.UserID
 	text   string
+	start  int
+	end    int
 }
 
-func parseUserPills(ctx context.Context, formattedBody string) []userPill {
+func parseUserPills(ctx context.Context, body, formattedBody string) []userPill {
 	if formattedBody == "" {
 		return nil
 	}
+	marker := "\x00"
+	for strings.Contains(body, marker) || strings.Contains(formattedBody, marker) {
+		marker += "\x00"
+	}
 	var pills []userPill
 	parser := *format.TextHTMLParser
+	parser.LinkConverter = func(text, _ string, _ format.Context) string { return text }
 	parser.PillConverter = func(displayname, mxid, eventID string, _ format.Context) string {
 		if strings.HasPrefix(mxid, "@") && eventID == "" {
-			pills = append(pills, userPill{userID: id.UserID(mxid), text: displayname})
+			token := marker + strconv.Itoa(len(pills)) + marker
+			pills = append(pills, userPill{userID: id.UserID(mxid), text: displayname, start: -1})
+			return token
 		}
 		return displayname
 	}
-	parser.Parse(formattedBody, format.NewContext(ctx))
+	rendered := parser.Parse(formattedBody, format.NewContext(ctx))
+	cursor := len(body) - len(strings.TrimLeftFunc(body, unicode.IsSpace))
+	for i := range pills {
+		prefix, rest, ok := strings.Cut(rendered, marker+strconv.Itoa(i)+marker)
+		if !ok || !strings.HasPrefix(body[cursor:], prefix) {
+			return unpositionedPills(pills)
+		}
+		cursor += len(prefix)
+		text := pills[i].text
+		if !strings.HasPrefix(text, "@") && strings.HasPrefix(body[cursor:], "@"+text) {
+			text = "@" + text
+		}
+		if text == "" || !strings.HasPrefix(body[cursor:], text) {
+			return unpositionedPills(pills)
+		}
+		pills[i].start, pills[i].end = cursor, cursor+len(text)
+		cursor += len(text)
+		rendered = rest
+	}
+	if strings.TrimRightFunc(body[cursor:], unicode.IsSpace) != rendered {
+		return unpositionedPills(pills)
+	}
 	return pills
 }
 
-func findMentionText(body string, from int, text string) (int, int, bool) {
-	text = strings.TrimSpace(text)
-	if text == "" || from > len(body) {
-		return 0, 0, false
+func unpositionedPills(pills []userPill) []userPill {
+	for i := range pills {
+		pills[i].start = -1
 	}
-	if !strings.HasPrefix(text, "@") {
-		if start, end, ok := findWholeWord(body, from, "@"+text); ok {
-			return start, end, true
-		} else if pos := strings.Index(body[from:], "@"+text); pos >= 0 {
-			return from + pos, from + pos + 1 + len(text), true
-		}
-	}
-	return findWholeWord(body, from, text)
+	return pills
 }
 
 func findWholeWord(body string, from int, text string) (int, int, bool) {
