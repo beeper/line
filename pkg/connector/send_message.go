@@ -1176,16 +1176,32 @@ func findMentionText(body string, from int, text string) (int, int, bool) {
 	if text == "" || from > len(body) {
 		return 0, 0, false
 	}
-	pos := strings.Index(body[from:], text)
-	if pos < 0 {
-		return 0, 0, false
+	if !strings.HasPrefix(text, "@") {
+		if start, end, ok := findWholeWord(body, from, "@"+text); ok {
+			return start, end, true
+		} else if pos := strings.Index(body[from:], "@"+text); pos >= 0 {
+			return from + pos, from + pos + 1 + len(text), true
+		}
 	}
-	start := from + pos
-	end := start + len(text)
-	if !strings.HasPrefix(text, "@") && start > 0 && body[start-1] == '@' {
-		start--
+	return findWholeWord(body, from, text)
+}
+
+func findWholeWord(body string, from int, text string) (int, int, bool) {
+	for offset := from; offset < len(body); {
+		pos := strings.Index(body[offset:], text)
+		if pos < 0 {
+			break
+		}
+		start := offset + pos
+		end := start + len(text)
+		before, _ := utf8.DecodeLastRuneInString(body[:start])
+		after, _ := utf8.DecodeRuneInString(body[end:])
+		if !isMentionWordRune(before) && !isMentionWordRune(after) {
+			return start, end, true
+		}
+		offset = start + 1
 	}
-	return start, end, true
+	return 0, 0, false
 }
 
 var roomMentionTexts = []string{"@room", "@all", "@everyone"}
