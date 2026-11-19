@@ -226,6 +226,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
+		originalData := mediaData
 		if effectiveMsgType == event.MsgImage {
 			var imageData []byte
 			imageData, imageMimeType, imageFileName, err = prepareLineImage(ctx, mediaData, msg.Content.GetFileName())
@@ -245,6 +246,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Int("limit", sizeLimit).
 				Msg("Media exceeds LINE's limit for its type, sending as a file")
 			effectiveMsgType = event.MsgFile
+			mediaData = originalData
 		}
 	}
 
