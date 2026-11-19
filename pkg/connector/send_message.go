@@ -41,6 +41,7 @@ var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/
 var lineMediaSizeLimits = map[event.MessageType]int{
 	event.MsgImage: 20 * 1024 * 1024,
 	event.MsgAudio: 30 * 1024 * 1024,
+	event.MsgVideo: 200 * 1024 * 1024,
 }
 
 const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
