@@ -62,6 +62,9 @@ var getProfileWithToken = func(ctx context.Context, token string) (*line.Profile
 }
 
 type LineClient struct {
+	backfillRetryMu      sync.Mutex
+	backfillRetryReady   bool
+	backfillRetryActive  map[networkid.PortalKey]bool
 	stickerPacksMu       sync.Mutex
 	stickerPacksFetching chan struct{}
 	stickerPacks         map[string]line.ShopProduct

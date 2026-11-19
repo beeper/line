@@ -315,6 +315,7 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 	}
 	if backfillEnabled {
 		lc.prefetchMessageBoxes(ctx, messageBoxes)
+		lc.queueBackfillRetryChats(ctx)
 	}
 }
 
@@ -654,6 +655,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 			return &bridgev2.FetchMessagesResponse{HasMore: false, MarkRead: true}, nil
 		}
 	}
+	lc.retryBackfillMessages(ctx, params.Portal)
 	limit := params.Count
 	if limit <= 0 {
 		limit = startupBackfillMessageLimit
@@ -690,42 +692,31 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 			hasMore = false
 			continue
 		}
+		if params.Forward && params.AnchorMessage != nil && (msg.ID == string(params.AnchorMessage.ID) || lc.parseMessageTimestamp(msg).Before(params.AnchorMessage.Timestamp)) {
+			continue
+		}
 		lc.cacheGroupMembersFromMessage(chatMID, msg)
 		if !isBridgeableContentType(msg) {
 			continue
 		}
 
-		sender := bridgev2.EventSender{
-			Sender:   makeUserID(msg.From),
-			IsFromMe: msg.From == lc.Mid,
-		}
-		intent, ok := params.Portal.GetIntentFor(ctx, sender, lc.UserLogin, bridgev2.RemoteEventMessage)
-		if !ok {
-			continue
-		}
-
-		opType := OpReceiveMessage
-		if msg.From == lc.Mid {
-			opType = OpSendMessage
-		}
-		bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, chatMID, int(opType))
-		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText, decryptionFailed)
+		converted, err := lc.convertBackfillMessage(ctx, params.Portal, msg)
 		if err != nil {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
-			continue
+			stored, saveErr := lc.storeBackfillRetry(ctx, chatMID, msg)
+			if saveErr != nil {
+				if unblockState != nil {
+					unblockState.complete()
+				}
+				return nil, saveErr
+			} else if stored {
+				continue
+			}
+			converted = lc.backfillRetryOverflow(msg)
 		}
-		if converted == nil {
-			continue
+		if converted != nil {
+			backfillMsgs = append(backfillMsgs, converted)
 		}
-
-		reactions, _ := lc.convertMessageReactions(ctx, msg)
-		backfillMsgs = append(backfillMsgs, &bridgev2.BackfillMessage{
-			ConvertedMessage: converted,
-			Sender:           sender,
-			ID:               networkid.MessageID(msg.ID),
-			Timestamp:        lc.parseMessageTimestamp(msg),
-			Reactions:        reactions,
-		})
 	}
 
 	var completeCallback func()
@@ -1809,6 +1800,9 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 
 		// handle keep alives
 		if eventType == line.SSEEventOpen || eventType == "ping" || eventType == "connInfoRevision" {
+			if eventType == line.SSEEventOpen && lc.UserLogin.Bridge.Config != nil && lc.UserLogin.Bridge.Config.Backfill.Enabled {
+				lc.queueBackfillRetryChats(ctx)
+			}
 			return
 		}
 
@@ -2190,6 +2184,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpUnsendLocal, OpUnsendRemote:
 		chatMid := op.Param1
 		msgID := op.Param2
+		lc.discardBackfillRetry(ctx, msgID)
 		lc.UserLogin.Bridge.Log.Info().Str("msg_id", msgID).Str("chat_mid", chatMid).Int("op_type", op.Type).Msg("Received unsend operation")
 
 		ts, _ := op.CreatedTime.Int64()
