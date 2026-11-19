@@ -392,43 +392,27 @@ func TestRunTokenRecoveryRejectsSupersededClient(t *testing.T) {
 
 func TestRecoverTokenDoesNotReloginAfterForcedLogoutRefresh(t *testing.T) {
 	lc := &LineClient{}
-	var reloginCalls int
 	err := lc.recoverTokenWith(
 		context.Background(),
 		func(context.Context) error { return errLoggedOut },
-		func(context.Context) error {
-			reloginCalls++
-			return nil
-		},
 	)
 	if !line.IsLoggedOut(err) {
 		t.Fatalf("recoverTokenWith error = %v, want logged-out error", err)
-	}
-	if reloginCalls != 0 {
-		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
 	}
 }
 
 func TestRecoverTokenDoesNotReloginAfterCancellation(t *testing.T) {
 	lc := &LineClient{}
 	ctx, cancel := context.WithCancel(context.Background())
-	var reloginCalls int
 	err := lc.recoverTokenWith(
 		ctx,
 		func(context.Context) error {
 			cancel()
 			return context.Canceled
 		},
-		func(context.Context) error {
-			reloginCalls++
-			return nil
-		},
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("recoverTokenWith error = %v, want context.Canceled", err)
-	}
-	if reloginCalls != 0 {
-		t.Fatalf("relogin calls = %d, want 0", reloginCalls)
 	}
 }
 

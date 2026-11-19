@@ -599,34 +599,23 @@ func (lc *LineClient) applyRefreshedLoginE2EEKeys(meta *UserLoginMetadata, res *
 	lc.missingE2EEKeyMarked = false
 }
 
-// recoverToken attempts to restore a valid session by refreshing, then re-logging in.
+// recoverToken attempts to restore a valid session by refreshing the access token.
 func (lc *LineClient) recoverToken(ctx context.Context) error {
-	return lc.recoverTokenWith(ctx, lc.refreshAndSave, lc.tryLogin)
+	return lc.recoverTokenWith(ctx, lc.refreshAndSave)
 }
 
-func (lc *LineClient) recoverTokenWith(
-	ctx context.Context,
-	refresh func(context.Context) error,
-	relogin func(context.Context) error,
-) error {
+func (lc *LineClient) recoverTokenWith(ctx context.Context, refresh func(context.Context) error) error {
 	return lc.runTokenRecovery(ctx, func(ctx context.Context) error {
-		if err := refresh(ctx); err == nil {
+		if err := refresh(ctx); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			lc.UserLogin.Bridge.Log.Info().Msg("Token recovered via refresh")
-			return nil
+			return err
 		} else if ctx.Err() != nil {
 			return ctx.Err()
-		} else if lc.isLoggedOut(err) || isTransientLineError(err) || errors.Is(err, errLineSessionInvalidated) || errors.Is(err, errLineClientSuperseded) || errors.Is(err, context.Canceled) {
-			return err
 		}
-		lc.UserLogin.Bridge.Log.Info().Msg("Refresh failed, attempting re-login with stored credentials...")
-		err := relogin(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return err
+		lc.UserLogin.Bridge.Log.Info().Msg("Token recovered via refresh")
+		return nil
 	})
 }
 
