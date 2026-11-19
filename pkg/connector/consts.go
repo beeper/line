@@ -29,8 +29,6 @@ const (
 
 const OpNotifiedDeleteOtherFromChat OperationType = 133
 
-const OpSendChatChecked OperationType = 40
-
 // ContentType values for LINE messages.
 type ContentType int
 

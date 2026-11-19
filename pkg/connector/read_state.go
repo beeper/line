@@ -11,29 +11,25 @@ import (
 	"github.com/beeper/line/pkg/line"
 )
 
-func (lc *LineClient) queueOwnReadReceipt(chatMid, lastSeenMessageID string, ts time.Time) {
-	if chatMid == "" || lastSeenMessageID == "" || lastSeenMessageID == "0" || strings.HasPrefix(lastSeenMessageID, "-") {
-		return
-	}
-	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventReadReceipt,
-			PortalKey: networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID},
-			Sender:    lc.eventSenderForMID(string(lc.UserLogin.ID)),
-			Timestamp: ts,
-		},
-		LastTarget: networkid.MessageID(lastSeenMessageID),
-	})
-}
-
 func (lc *LineClient) queueStartupReadReceipts(messageBoxes []line.MessageBox, chatMIDs []string) {
 	prefetched := make(map[string]struct{}, len(chatMIDs))
 	for _, mid := range chatMIDs {
 		prefetched[mid] = struct{}{}
 	}
+	now := time.Now()
 	for _, box := range messageBoxes {
-		if _, ok := prefetched[box.ID]; ok {
-			lc.queueOwnReadReceipt(box.ID, box.LastSeenMessageID, time.Now())
+		lastSeen := box.LastSeenMessageID
+		if _, ok := prefetched[box.ID]; !ok || lastSeen == "" || lastSeen == "0" || strings.HasPrefix(lastSeen, "-") {
+			continue
 		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventReadReceipt,
+				PortalKey: networkid.PortalKey{ID: makePortalID(box.ID), Receiver: lc.UserLogin.ID},
+				Sender:    lc.eventSenderForMID(lc.Mid),
+				Timestamp: now,
+			},
+			LastTarget: networkid.MessageID(lastSeen),
+		})
 	}
 }

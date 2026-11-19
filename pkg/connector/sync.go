@@ -1948,13 +1948,6 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpDeleteSelfFromChat:
 		lc.handleSelfLeave(op.Param1)
 
-	case OpSendChatChecked:
-		ts := time.Now()
-		if createdAt, err := op.CreatedTime.Int64(); err == nil && createdAt > 0 {
-			ts = time.UnixMilli(createdAt)
-		}
-		lc.queueOwnReadReceipt(op.Param1, op.Param2, ts)
-
 	case OpSendChatRemoved:
 		lc.reqSeqMu.Lock()
 		_, ok := lc.sentReqSeqs[op.ReqSeq]
