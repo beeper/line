@@ -20,8 +20,9 @@ func (h *Handler) ConvertLocation(data line.Message, decryptedBody string, relat
 		}
 		if err := json.Unmarshal([]byte(decryptedBody), &payload); err != nil {
 			h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to parse encrypted location payload")
+		} else {
+			location = payload.Location
 		}
-		location = payload.Location
 	}
 	if location == nil {
 		return &bridgev2.ConvertedMessage{
