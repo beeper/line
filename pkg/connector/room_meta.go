@@ -33,9 +33,8 @@ var (
 )
 
 const (
-	maxLineGroupNameLength    = 50
-	maxLineGroupPictureDim    = 1280
-	maxLineGroupPicturePixels = 100_000_000
+	maxLineGroupNameLength = 50
+	maxLineGroupPictureDim = 1280
 )
 
 var (
@@ -153,7 +152,7 @@ func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]b
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if isHEICImage(mimeType, "") {
+	if isHEIFData(data) {
 		converted, err := convertHEICToJPEG(ctx, data)
 		if err != nil {
 			return nil, err
@@ -166,7 +165,7 @@ func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]b
 			return nil, err
 		}
 		converted, convErr := ffmpeg.ConvertBytes(ctx, data, ".png",
-			[]string{"-max_pixels", fmt.Sprint(maxLineGroupPicturePixels)},
+			[]string{"-max_pixels", fmt.Sprint(maxLineImagePixels)},
 			[]string{"-frames:v", "1", "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease"}, mimeType)
 		if convErr != nil {
 			return nil, fmt.Errorf("%w (ffmpeg: %w)", err, convErr)
@@ -176,7 +175,7 @@ func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]b
 			return nil, err
 		}
 	}
-	if config.Width <= 0 || config.Height <= 0 || config.Width > maxLineGroupPicturePixels/config.Height {
+	if !lineImageSizeAllowed(config.Width, config.Height) {
 		return nil, errors.New("group photo has too many pixels")
 	}
 	if err = ctx.Err(); err != nil {
