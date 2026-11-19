@@ -1648,7 +1648,10 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			lc.UserLogin.Bridge.Log.Info().Int64("local_rev", localRev).Msg("Seeded local revision from getLastOpRevision")
 		}
 	}
-	savedRev := localRev
+	var savedRev int64
+	if meta != nil {
+		savedRev = meta.OpRevision
+	}
 	var savedAt time.Time
 	saveRevision := func(force bool) {
 		if meta == nil || localRev == savedRev || (!force && time.Since(savedAt) < opRevisionSaveInterval) ||
@@ -1663,6 +1666,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		savedRev = localRev
 		savedAt = time.Now()
 	}
+	saveRevision(true)
 
 	receiveCtx, cancelReceive, nextProbeAt := startReceiveAuthProbeContext(ctx, receiveAuthProbeNow())
 	defer func() {
