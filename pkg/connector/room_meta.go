@@ -10,6 +10,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"github.com/disintegration/imaging"
@@ -32,8 +33,9 @@ var (
 )
 
 const (
-	maxLineGroupNameLength = 50
-	maxLineGroupPictureDim = 1280
+	maxLineGroupNameLength    = 50
+	maxLineGroupPictureDim    = 1280
+	maxLineGroupPicturePixels = 100_000_000
 )
 
 var (
@@ -143,6 +145,14 @@ func (lc *LineClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.
 }
 
 func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]byte, error) {
+	if len(data) > lineMediaSizeLimits[event.MsgImage] {
+		return nil, errors.New("group photo exceeds LINE's image size limit")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if isHEICImage(mimeType, "") {
 		converted, err := convertHEICToJPEG(ctx, data)
 		if err != nil {
@@ -150,18 +160,34 @@ func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]b
 		}
 		data = converted
 	}
-	img, err := imaging.Decode(bytes.NewReader(data), imaging.AutoOrientation(true))
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		if !ffmpeg.Supported() {
 			return nil, err
 		}
-		png, convErr := ffmpeg.ConvertBytes(ctx, data, ".png", nil, []string{"-frames:v", "1"}, mimeType)
+		converted, convErr := ffmpeg.ConvertBytes(ctx, data, ".png",
+			[]string{"-max_pixels", fmt.Sprint(maxLineGroupPicturePixels)},
+			[]string{"-frames:v", "1", "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease"}, mimeType)
 		if convErr != nil {
 			return nil, fmt.Errorf("%w (ffmpeg: %w)", err, convErr)
 		}
-		if img, err = imaging.Decode(bytes.NewReader(png), imaging.AutoOrientation(true)); err != nil {
+		data = converted
+		if config, _, err = image.DecodeConfig(bytes.NewReader(data)); err != nil {
 			return nil, err
 		}
+	}
+	if config.Width <= 0 || config.Height <= 0 || config.Width > maxLineGroupPicturePixels/config.Height {
+		return nil, errors.New("group photo has too many pixels")
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	img, err := imaging.Decode(bytes.NewReader(data), imaging.AutoOrientation(true))
+	if err != nil {
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
 	}
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
