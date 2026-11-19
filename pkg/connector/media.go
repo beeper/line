@@ -128,7 +128,7 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 	// writer skips the block and writes the image.
 	pngData, pngErr := runHEIFDec(ctx, dir, inputPath, "png")
 	if pngErr != nil {
-		return nil, err
+		return nil, errors.Join(err, pngErr)
 	}
 	img, imgErr := png.Decode(bytes.NewReader(pngData))
 	if imgErr != nil {
