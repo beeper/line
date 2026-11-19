@@ -154,7 +154,11 @@ func (c *Client) LoginContext(ctx context.Context, email, pass, certificate stri
 	// Identifier is KeyName when using RSA; certificate allows skipping PIN verification
 	noE2EE := false
 	respBytes, err := c.LoginV2(rsaKey.KeyName, encryptedPass, certificate, secretRes.Secret)
-	if err != nil && isLoginNotSupported(err) {
+	unsupported := err == nil && isLoginNotSupported(errors.New(string(respBytes)))
+	if err != nil && HTTPStatusCode(err) == http.StatusBadRequest {
+		unsupported = isLoginNotSupported(err)
+	}
+	if unsupported {
 		// LSOFF: E2EE login not supported, retry without secret using fresh RSA key
 		log.Printf("[LINE] E2EE login not supported, retrying without secret (LSOFF)")
 		noE2EE = true
@@ -209,11 +213,8 @@ func (c *Client) LoginContext(ctx context.Context, email, pass, certificate stri
 }
 
 func isLoginNotSupported(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "\"code\":89") || strings.Contains(msg, "not supported")
+	talk, ok := parseTalkException(err)
+	return ok && talk.Code == 89
 }
 
 func (c *Client) WaitForLogin(verifier string, noE2EE bool) (res *LoginResult, err error) {

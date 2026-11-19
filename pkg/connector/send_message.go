@@ -75,6 +75,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if err := lc.checkLineCall(ctx); err != nil {
 		return nil, err
 	}
+	noE2EE := lc.noE2EE.Load()
 	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
 		var err error
@@ -91,6 +92,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		var err error
 		var sentMsg *line.Message
 		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
+			if lc.noE2EE.Load() != noE2EE {
+				message := "LINE encryption settings changed while sending. Try again"
+				return nil, bridgev2.WrapErrorInStatus(errors.New(message)).
+					WithIsCertain(true).
+					WithSendNotice(true).
+					WithMessage(message)
+			}
 			return client.SendMessage(int64(reqSeq), lineMsg)
 		})
 		return sentMsg, err
@@ -125,6 +133,8 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		plainText = true
 	} else if lc.E2EE == nil {
 		return nil, wrapConvertError(errors.New("LINE encryption is not initialized"))
+	} else if noE2EE {
+		plainText = true
 	} else if isGroup {
 		if lc.isGroupNoE2EE(portalMid) {
 			plainText = true

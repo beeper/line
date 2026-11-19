@@ -76,6 +76,7 @@ type LineClient struct {
 	Mid          string
 	HTTPClient   *http.Client
 	E2EE         *e2ee.Manager
+	noE2EE       atomic.Bool
 	peerKeys     map[string]peerKeyInfo
 
 	reqSeqMu    sync.Mutex
@@ -818,6 +819,28 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 				lc.UserLogin.Bridge.Log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
 			}
 		}
+		if ctx.Err() != nil {
+			return false
+		}
+		lc.recoverMu.Lock()
+		_, _, keyErr := mgr.MyKeyIDs()
+		if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || !lc.hasAccessToken() {
+			lc.recoverMu.Unlock()
+			return false
+		}
+		if isTerminalCryptoError(keyErr) {
+			lc.UserLogin.BridgeState.Send(status.BridgeState{
+				StateEvent: status.StateUnknownError,
+				Error:      "line-e2ee-init-failed",
+				Info:       map[string]any{"go_error": keyErr.Error()},
+			})
+			lc.recoverMu.Unlock()
+			return false
+		}
+		if keyErr != nil && !lc.noE2EE.Load() {
+			lc.markMissingE2EEKey(ctx, fmt.Errorf("%w: %w", e2ee.ErrMissingOwnPrivateKey, keyErr))
+		}
+		lc.recoverMu.Unlock()
 	}
 	if ctx.Err() != nil || !lc.sendConnectedStateIfCurrent(ctx) {
 		return false
@@ -977,6 +1000,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		staged.RefreshToken = refreshToken
 	}
 	staged.SessionInvalidated = false
+	staged.NoE2EE = res.NoE2EE
 	if res.Mid != "" {
 		staged.Mid = res.Mid
 	}
@@ -1028,6 +1052,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		*meta = previous
 		return fmt.Errorf("save recovered LINE login: %w", err)
 	}
+	lc.noE2EE.Store(staged.NoE2EE)
 	lc.setTokens(accessToken, refreshToken)
 	lc.Mid = staged.Mid
 	lc.obsTokenCache.Invalidate()
