@@ -1191,7 +1191,12 @@ func findMentionText(body string, from int, text string) (int, int, bool) {
 var roomMentionTexts = []string{"@room", "@all", "@everyone"}
 
 func findRoomMention(body string) (int, int, bool) {
-	lowerBody := strings.ToLower(body)
+	lowerBody := strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, body)
 	for _, text := range roomMentionTexts {
 		for offset := 0; offset < len(lowerBody); {
 			pos := strings.Index(lowerBody[offset:], text)
