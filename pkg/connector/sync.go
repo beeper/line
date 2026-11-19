@@ -2110,6 +2110,8 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 }
 
 func (lc *LineClient) refreshContact(ctx context.Context, mid string) {
+	lc.contactRefreshMu.Lock()
+	defer lc.contactRefreshMu.Unlock()
 	lc.cacheMu.Lock()
 	delete(lc.contactCache, mid)
 	lc.cacheMu.Unlock()

@@ -107,6 +107,8 @@ type LineClient struct {
 	forcedLogoutMu         sync.Mutex
 	forcedLogoutSent       bool
 
+	contactRefreshMu sync.Mutex
+
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
 	// noE2EEGroups, groupMemberCache, generatedGroupNameCache, and knownMemberChatMIDs.
 	// Hold it only around map accesses; never across network calls.
