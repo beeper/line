@@ -62,19 +62,12 @@ func (lc *LineClient) handleChatRemovedElsewhere(ctx context.Context, op line.Op
 	}
 	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
 	log := lc.UserLogin.Log.With().Str("chat_mid", chatMid).Str("last_message_id", op.Param2).Logger()
-	cutoff := op.Param2
-	if id, ok := new(big.Int).SetString(cutoff, 10); !ok || id.Sign() < 0 {
-		cutoff = "0"
-		lastMsg, err := lc.UserLogin.Bridge.DB.Message.GetLastPartAtOrBeforeTime(ctx, portalKey, ts)
-		if err != nil {
-			log.Err(err).Msg("Failed to get last bridged message for chat removed on another device")
-			return
-		} else if lastMsg != nil {
-			if id, ok := new(big.Int).SetString(string(lastMsg.ID), 10); ok && id.Sign() >= 0 {
-				cutoff = string(lastMsg.ID)
-			}
-		}
+	cutoffID, ok := new(big.Int).SetString(op.Param2, 10)
+	if !ok || cutoffID.Sign() <= 0 {
+		log.Warn().Msg("Skipping chat removal without a positive deletion cutoff")
+		return
 	}
+	cutoff := cutoffID.String()
 	if err := lc.saveChatDeletion(ctx, chatMid, cutoff); err != nil {
 		log.Err(err).Msg("Failed to save deletion of chat removed on another device")
 		return
