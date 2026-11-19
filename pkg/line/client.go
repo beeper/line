@@ -571,8 +571,6 @@ func (c *Client) postWithHMAC(fullURL string, body []byte) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// UploadChatPicture sets a group's picture. The extension posts the image as the raw request
-// body, which its gateway client sends without an X-Hmac header.
 func (c *Client) UploadChatPicture(ctx context.Context, chatMid string, data []byte, contentType string) error {
 	fullURL := "https://line-chrome-gw.line-apps.com/api/obs/uploadProfile?mid=" + url.QueryEscape(chatMid)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(data))

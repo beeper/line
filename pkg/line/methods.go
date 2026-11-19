@@ -654,8 +654,6 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 	return &wrapper.Data, nil
 }
 
-// GetChatRaw returns a chat exactly as getChats sent it, so updateChat can send it back with
-// only the edited field changed, like the Chrome extension does.
 func (c *Client) GetChatRaw(ctx context.Context, chatMid string) (map[string]any, error) {
 	resp, err := c.callRPCContext(ctx, "TalkService", "getChats", GetChatsRequest{
 		ChatMids:     []string{chatMid},
