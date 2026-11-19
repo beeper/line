@@ -1774,7 +1774,7 @@ func (lc *LineClient) seedLocalRevision(ctx context.Context) (int64, bool) {
 func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 	defer lc.wg.Done()
 
-	client := lc.newClient()
+	var client *line.Client
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
 
 	receiveCtx, cancelReceive, nextProbeAt := startReceiveAuthProbeContext(ctx, receiveAuthProbeNow())
