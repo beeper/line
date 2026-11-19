@@ -348,6 +348,7 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 						EventSender: bridgev2.EventSender{
 							Sender: makeUserID(mid),
 						},
+						UserInfo:   lc.cachedUserInfo(mid),
 						Membership: event.MembershipJoin,
 						PowerLevel: ptr.Ptr(0),
 					},
@@ -1073,6 +1074,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
+				UserInfo:         lc.cachedUserInfo(m),
 				Membership:       event.MembershipJoin,
 				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
@@ -1090,6 +1092,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
+				UserInfo:         lc.cachedUserInfo(m),
 				Membership:       membership,
 				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
@@ -1105,6 +1108,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 					EventSender: bridgev2.EventSender{
 						Sender: makeUserID(m),
 					},
+					UserInfo:         lc.cachedUserInfo(m),
 					Membership:       event.MembershipJoin,
 					MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 				})

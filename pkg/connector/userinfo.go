@@ -260,6 +260,22 @@ func (lc *LineClient) getContact(ctx context.Context, mid string) line.Contact {
 	return contact
 }
 
+func (lc *LineClient) cachedUserInfo(mid string) *bridgev2.UserInfo {
+	contact, ok := lc.getCachedContact(mid)
+	if !ok {
+		return nil
+	}
+	name := contact.EffectiveDisplayName()
+	if name == mid {
+		return nil
+	}
+	return &bridgev2.UserInfo{
+		Identifiers: []string{mid},
+		Name:        &name,
+		Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
+	}
+}
+
 func (lc *LineClient) getCachedContact(mid string) (line.Contact, bool) {
 	lc.cacheMu.Lock()
 	cached, ok := lc.contactCache[mid]
