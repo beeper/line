@@ -187,23 +187,22 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 }
 
 // isBridgeableContentType reports whether an inbound LINE message should be
-// bridged to Matrix. System messages (group created, member invited, etc.) are
-// skipped, but post, call, and contact notifications are let through regardless
-// of content type because LINE may wrap them in non-standard content types.
+// bridged to Matrix. System messages (group created, member invited, etc.),
+// group call events and presence are skipped, but post and call notifications
+// are let through regardless of content type because LINE may wrap them in
+// non-standard content types.
 func isBridgeableContentType(msg *line.Message) bool {
 	if msg == nil {
 		return false
 	}
-	if isPostNotification(msg) {
+	if isPostNotification(msg) || msg.ContentMetadata["ORGCONTP"] == "CALL" {
 		return true
 	}
 	switch ContentType(msg.ContentType) {
-	case ContentText, ContentImage, ContentVideo, ContentAudio,
-		ContentSticker, ContentContact, ContentFile, ContentLocation, ContentFlex:
-		return true
-	default:
-		return msg.ContentMetadata["ORGCONTP"] == "CALL" || msg.ContentMetadata["ORGCONTP"] == "CONTACT"
+	case ContentSystem, ContentCall, ContentPresence:
+		return false
 	}
+	return true
 }
 
 // isPostNotification reports whether a LINE message represents a note, album,
@@ -445,11 +444,16 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 		return h.ConvertContact(data, replyRelatesTo)
 	case ContentFlex:
 		return h.ConvertFlex(data, replyRelatesTo)
+	case ContentHTML:
+		return h.ConvertHTML(ctx, data, replyRelatesTo)
 	}
 
 	// Handle device/phone contact shared via ORGCONTP (contentType 0 with vCard)
 	if data.ContentMetadata["ORGCONTP"] == "CONTACT" {
 		return h.ConvertDeviceContact(ctx, portal, intent, data, unwrappedText, replyRelatesTo)
+	}
+	if ContentType(data.ContentType) != ContentText {
+		return h.ConvertUnsupported(data, unwrappedText, replyRelatesTo)
 	}
 
 	var converted *bridgev2.ConvertedMessage
