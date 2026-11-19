@@ -42,7 +42,7 @@ var (
 )
 
 func isEditableGroupMID(mid string) bool {
-	return isChatMID(mid) && !strings.HasPrefix(mid, "R")
+	return isChatMID(mid) && !strings.HasPrefix(strings.ToLower(mid), "r")
 }
 
 func lineGroupPowerLevels() *bridgev2.PowerLevelOverrides {
@@ -80,6 +80,9 @@ func (lc *LineClient) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.Ma
 	if err := lc.updateChatAttribute(ctx, chatMid, line.ChatAttributeName, "chatName", name); err != nil {
 		return false, wrapSendError(err)
 	}
+	lc.cacheMu.Lock()
+	delete(lc.generatedGroupNameCache, chatMid)
+	lc.cacheMu.Unlock()
 	msg.Portal.Name = name
 	msg.Portal.NameSet = true
 	return true, nil
