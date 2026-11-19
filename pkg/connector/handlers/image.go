@@ -206,13 +206,20 @@ func lineMediaCategory(metadata map[string]string) string {
 
 func lineMediaDimensions(metadata map[string]string) (width, height int) {
 	for _, key := range []string{"MEDIA_CONTENT_INFO", "MEDIA_THUMB_INFO"} {
-		var info struct {
-			Width  int `json:"width"`
-			Height int `json:"height"`
+		if width, height := lineMediaInfoDimensions(metadata[key]); width > 0 && height > 0 {
+			return width, height
 		}
-		if json.Unmarshal([]byte(metadata[key]), &info) == nil && info.Width > 0 && info.Height > 0 {
-			return info.Width, info.Height
-		}
+	}
+	return 0, 0
+}
+
+func lineMediaInfoDimensions(raw string) (width, height int) {
+	var info struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+	if json.Unmarshal([]byte(raw), &info) == nil && info.Width > 0 && info.Height > 0 {
+		return info.Width, info.Height
 	}
 	return 0, 0
 }
