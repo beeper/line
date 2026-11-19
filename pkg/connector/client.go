@@ -350,6 +350,7 @@ func (lc *LineClient) refreshAndSave(ctx context.Context) error {
 	meta.AccessToken = accessToken
 	meta.RefreshToken = refreshToken
 	meta.SessionInvalidated = false
+	meta.LogoutCode, meta.LogoutReason = 0, ""
 	err = lc.UserLogin.Save(ctx)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save refreshed tokens to DB")
@@ -1000,6 +1001,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		staged.RefreshToken = refreshToken
 	}
 	staged.SessionInvalidated = false
+	staged.LogoutCode, staged.LogoutReason = 0, ""
 	if res.Mid != "" {
 		staged.Mid = res.Mid
 	}
