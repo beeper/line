@@ -3,6 +3,7 @@ module github.com/beeper/line
 go 1.26.0
 
 require (
+	github.com/disintegration/imaging v1.6.2
 	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/rs/zerolog v1.35.1
 	github.com/u2takey/ffmpeg-go v0.5.0
