@@ -16,6 +16,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -451,17 +452,15 @@ const (
 var errSendVideoAsFile = errors.New("video must be sent to LINE as a file")
 
 func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([]byte, error) {
-	var mimeType string
-	var duration time.Duration
-	if info != nil {
-		mimeType, _, _ = strings.Cut(info.MimeType, ";")
-		duration = time.Duration(info.Duration) * time.Millisecond
+	ctx, cancel := context.WithTimeout(ctx, maxLineVideoConvertTime)
+	defer cancel()
+	mimeType := http.DetectContentType(data)
+	if info != nil && int64(info.Duration) > maxLineVideoDuration.Milliseconds() {
+		return nil, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
 	}
-	if mimeType == "" {
-		mimeType, _, _ = strings.Cut(http.DetectContentType(data), ";")
-	}
-	if duration == 0 {
-		duration = probeVideoDuration(ctx, data)
+	duration := probeVideoDuration(ctx, data)
+	if duration <= 0 {
+		return nil, fmt.Errorf("%w: video duration is unknown", errSendVideoAsFile)
 	}
 	if duration > maxLineVideoDuration {
 		return nil, fmt.Errorf("%w: %s is longer than %s", errSendVideoAsFile, duration, maxLineVideoDuration)
@@ -473,8 +472,6 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	if !mauffmpeg.Supported() {
 		return nil, fmt.Errorf("%w: %s needs ffmpeg", errSendVideoAsFile, mimeType)
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxLineVideoConvertTime)
-	defer cancel()
 	converted, err := mauffmpeg.ConvertBytes(ctx, data, ".mp4", nil, []string{
 		"-pix_fmt", "yuv420p", "-c:v", "h264", "-b:v", "2M", "-c:a", "aac", "-movflags", "+faststart",
 		"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
@@ -502,5 +499,12 @@ func probeVideoDuration(ctx context.Context, data []byte) time.Duration {
 	if err != nil || probe.Format == nil {
 		return 0
 	}
-	return time.Duration(probe.Format.Duration * float64(time.Second))
+	seconds := probe.Format.Duration
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+		return 0
+	}
+	if seconds > maxLineVideoDuration.Seconds() {
+		return maxLineVideoDuration + time.Second
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
