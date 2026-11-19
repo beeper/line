@@ -242,6 +242,9 @@ func (lc *LineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*
 		return nil, err
 	}
 	name := contact.EffectiveDisplayName()
+	if name == string(ghost.ID) {
+		return &bridgev2.UserInfo{Identifiers: []string{string(ghost.ID)}}, nil
+	}
 	return &bridgev2.UserInfo{
 		Identifiers: []string{string(ghost.ID)},
 		Name:        &name,
@@ -296,8 +299,6 @@ func (lc *LineClient) lookupContact(ctx context.Context, mid string) (line.Conta
 	return line.Contact{Mid: mid, DisplayName: mid}, nil
 }
 
-// fetchContacts loads contacts that aren't cached the way the LINE client
-// does: up to 100 MIDs per getContactsV2 call, three calls at a time.
 func (lc *LineClient) fetchContacts(ctx context.Context, mids []string) error {
 	pending := make([]string, 0, len(mids))
 	seen := make(map[string]struct{}, len(mids))
