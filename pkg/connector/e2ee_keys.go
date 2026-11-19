@@ -39,7 +39,8 @@ func (lc *LineClient) ensureGroupKey(ctx context.Context, chatMid string, groupK
 		return err
 	}
 	err := lc.fetchAndUnwrapGroupKey(ctx, chatMid, groupKeyID)
-	if err != nil && isRecoveryRejected(err) && !line.IsAuthError(err) && !isTerminalCryptoError(err) {
+	if errors.Is(err, e2ee.ErrMissingOwnPrivateKey) || (line.IsTalkException(err) && !line.IsAuthError(err) &&
+		!line.IsTalkExceptionRateLimited(err) && !line.IsTalkExceptionServerError(err)) {
 		lc.E2EE.SetGroupKeyError(chatMid, groupKeyID, err)
 	}
 	return err
