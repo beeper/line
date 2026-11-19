@@ -28,8 +28,6 @@ func groupKeyFetchError(groupKeyID int, err error) error {
 	return err
 }
 
-// ensureGroupKey mirrors the LINE client: fetch a group key only when it isn't
-// loaded, and remember keys LINE couldn't provide unless the failure was transient.
 func (lc *LineClient) ensureGroupKey(ctx context.Context, chatMid string, groupKeyID int) error {
 	if lc.E2EE == nil {
 		return fmt.Errorf("E2EE manager not initialized")

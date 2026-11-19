@@ -250,6 +250,7 @@ func (m *Manager) LoadMyKeyFromSecureData(data map[string]any) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	clear(m.groupKeyErrors)
 	return m.errLocked()
 }
 
