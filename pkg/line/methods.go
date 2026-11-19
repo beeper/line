@@ -70,6 +70,23 @@ func (c *Client) LoginV2WithType(loginType int, email, password, certificate, se
 	return c.callRPC("AuthService", "loginV2", req)
 }
 
+func (c *Client) Logout(ctx context.Context) error {
+	resp, err := c.callRPCContext(ctx, "AuthService", "logoutV2")
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse logoutV2 response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("logoutV2 failed: %s", resp)
+	}
+	return nil
+}
+
 // LoginV2WithVerifier finalizes login using the verifier (post-E2EE confirm flow)
 func (c *Client) LoginV2WithVerifier(verifier string) (*LoginResult, error) {
 	req := LoginRequest{
@@ -481,9 +498,21 @@ func (c *Client) CancelReaction(reqSeq int64, messageID string) error {
 }
 
 // SendChatChecked sends a read receipt for a message in a chat
-func (c *Client) SendChatChecked(chatMid, messageID string) error {
-	_, err := c.callRPC("TalkService", "sendChatChecked", 0, chatMid, messageID)
-	return err
+func (c *Client) SendChatChecked(reqSeq int64, chatMid, messageID string) error {
+	resp, err := c.callRPC("TalkService", "sendChatChecked", reqSeq, chatMid, messageID, 0)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse sendChatChecked response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("sendChatChecked failed: %s", resp)
+	}
+	return nil
 }
 
 // GetContactsV2 fetches contact details for a list of MIDs.

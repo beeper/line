@@ -31,6 +31,9 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 	if read.EventID != "" {
 		msg, err := lc.UserLogin.Bridge.DB.Message.GetPartByMXID(ctx, read.EventID)
 		if err == nil && msg != nil && msg.ID != "" {
+			if msg.Room != read.Portal.PortalKey {
+				return nil
+			}
 			targetID = string(msg.ID)
 		}
 	}
@@ -39,16 +42,18 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 		return nil
 	}
 
+	lc.noteOwnRead(string(read.Portal.ID), targetID)
+	reqSeq := lc.nextUntrackedReqSeq()
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
-		return client.SendChatChecked(string(read.Portal.ID), targetID)
+		return client.SendChatChecked(int64(reqSeq), string(read.Portal.ID), targetID)
 	})
 	return err
 }
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_11_11",
-		MaxTextLength:    5000,
+		ID:               "dev.highest.matrix.line.capabilities.2026_11_11_1",
+		MaxTextLength:    10000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
 		ReactionCount:    1,

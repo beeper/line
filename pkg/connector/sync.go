@@ -699,6 +699,11 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 
 func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	defer lc.wg.Done()
+	lc.prefetchMessagesMu.Lock()
+	defer lc.prefetchMessagesMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
@@ -736,6 +741,9 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 		Int("concurrency", workerCount).
 		Msg("Prefetching recent messages")
 
+	caughtUp := make(map[string][]networkid.MessageID)
+	var caughtUpMu sync.Mutex
+
 	jobs := make(chan string)
 	var workers sync.WaitGroup
 	var backfilledSystemEvents atomic.Bool
@@ -747,8 +755,14 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				if lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit) {
+				systemEvents, queuedMessages := lc.backfillRecentMessages(ctx, chatMID, startupBackfillMessageLimit)
+				if systemEvents {
 					backfilledSystemEvents.Store(true)
+				}
+				if len(queuedMessages) > 0 {
+					caughtUpMu.Lock()
+					caughtUp[chatMID] = queuedMessages
+					caughtUpMu.Unlock()
 				}
 			}
 		}()
@@ -765,6 +779,9 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	}
 	close(jobs)
 	workers.Wait()
+	if ctx.Err() == nil && len(caughtUp) > 0 {
+		lc.queueStartupReadReceipts(ctx, caughtUp)
+	}
 
 	// Historical membership/name events are real state events. Replay them in
 	// timestamp order, then restore LINE's current authoritative chat state in
@@ -803,15 +820,16 @@ func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMI
 // backfillRecentMessages fetches up to limit recent messages for a single
 // chat and queues any not already in the local DB through the normal inbound
 // (live) message path. Used by prefetchMessages on startup.
-func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) bool {
+func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) (bool, []networkid.MessageID) {
 	start := time.Now()
 	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
 		return client.GetRecentMessagesV2(chatMID, limit)
 	})
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("chat_mid", chatMID).Msg("Failed to fetch recent messages")
-		return false
+		return false, nil
 	}
+	var queuedMessages []networkid.MessageID
 	queued := 0
 	skippedExisting := 0
 	reactionSyncs := 0
@@ -853,6 +871,8 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 			queued++
 			if ContentType(msg.ContentType) == ContentSystem {
 				systemEvents++
+			} else {
+				queuedMessages = append(queuedMessages, networkid.MessageID(msg.ID))
 			}
 			if lc.queueMessageReactionSync(ctx, chatMID, msg) {
 				reactionSyncs++
@@ -868,7 +888,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 		Int("skipped_existing", skippedExisting).
 		Dur("duration", time.Since(start)).
 		Msg("Finished recent-message backfill")
-	return systemEvents > 0
+	return systemEvents > 0, queuedMessages
 }
 
 func (lc *LineClient) syncChats(ctx context.Context) {
@@ -1988,6 +2008,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}()
 
 	case OpSendChatChecked:
+		lc.noteOwnRead(op.Param1, op.Param2)
 		ts, _ := op.CreatedTime.Int64()
 		receipt := &simplevent.Receipt{
 			EventMeta: simplevent.EventMeta{
