@@ -188,6 +188,10 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
 		}
 	}
+	if lc.UserLogin == nil || lc.UserLogin.Bridge == nil || lc.UserLogin.Bridge.Config == nil || !lc.UserLogin.Bridge.Config.BridgeMatrixLeave {
+		delete(caps.MemberActions, event.MemberActionLeave)
+		caps.ID += "+no-leave"
+	}
 	return caps
 }
 
