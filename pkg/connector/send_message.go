@@ -1224,12 +1224,34 @@ func parseUserPills(ctx context.Context, body, formattedBody string, imageBodies
 		}
 		return displayname
 	}
-	rendered := parser.Parse(formattedBody, format.NewContext(ctx))
+	plain := func(text string, _ format.Context) string { return text }
+	for candidate := range 3 {
+		if candidate == 1 {
+			parser.LinkConverter = format.MarkdownHTMLParser.LinkConverter
+		} else if candidate == 2 {
+			parser.LinkConverter = func(text, _ string, _ format.Context) string { return text }
+			parser.BoldConverter = plain
+			parser.ItalicConverter = plain
+			parser.StrikethroughConverter = plain
+			parser.UnderlineConverter = plain
+			parser.MonospaceConverter = plain
+			parser.MonospaceBlockConverter = func(text, _ string, _ format.Context) string { return text }
+		}
+		pills = nil
+		rendered := parser.Parse(formattedBody, format.NewContext(ctx))
+		if positionUserPills(body, rendered, marker, pills) {
+			return pills
+		}
+	}
+	return unpositionedPills(pills)
+}
+
+func positionUserPills(body, rendered, marker string, pills []userPill) bool {
 	cursor := len(body) - len(strings.TrimLeftFunc(body, unicode.IsSpace))
 	for i := range pills {
 		prefix, rest, ok := strings.Cut(rendered, marker+strconv.Itoa(i)+marker)
 		if !ok || !strings.HasPrefix(body[cursor:], prefix) {
-			return unpositionedPills(pills)
+			return false
 		}
 		cursor += len(prefix)
 		text := pills[i].text
@@ -1237,16 +1259,16 @@ func parseUserPills(ctx context.Context, body, formattedBody string, imageBodies
 			text = "@" + text
 		}
 		if text == "" || !strings.HasPrefix(body[cursor:], text) {
-			return unpositionedPills(pills)
+			return false
 		}
 		pills[i].start, pills[i].end = cursor, cursor+len(text)
 		cursor += len(text)
 		rendered = rest
 	}
 	if strings.TrimRightFunc(body[cursor:], unicode.IsSpace) != rendered {
-		return unpositionedPills(pills)
+		return false
 	}
-	return pills
+	return true
 }
 
 func unpositionedPills(pills []userPill) []userPill {
