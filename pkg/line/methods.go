@@ -895,8 +895,6 @@ func (c *Client) GetRecentMessagesV2(chatMid string, limit int) ([]*Message, err
 	return wrapper.Data, nil
 }
 
-// GetPreviousMessagesV2WithRequest returns up to count messages delivered
-// before the given message, newest first, like the LINE client's history paging.
 func (c *Client) GetPreviousMessagesV2WithRequest(ctx context.Context, chatMid string, end MessageIDWrapper, count int) ([]*Message, error) {
 	req := struct {
 		MessageBoxID  string           `json:"messageBoxId"`

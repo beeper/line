@@ -271,9 +271,6 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 	lc.syncMessageBoxes(ctx)
 }
 
-// syncMessageBoxes walks the message box list once, like the LINE client. DMs
-// get a resync, and when backfill is enabled every chat whose newest message
-// isn't bridged yet catches up through forward backfill.
 func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
@@ -766,8 +763,6 @@ func backfillCursorEnd(params bridgev2.FetchMessagesParams) (line.MessageIDWrapp
 	}, true
 }
 
-// fetchMessagesSince returns the newest messages (newest first) back to the
-// anchor message, or the newest limit messages when there's no anchor.
 func (lc *LineClient) fetchMessagesSince(ctx context.Context, chatMID string, anchor *database.Message, limit int) ([]*line.Message, error) {
 	client, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
 		return client.GetRecentMessagesV2(chatMID, min(limit, backfillPageSize))
@@ -801,7 +796,6 @@ func (lc *LineClient) fetchMessagesSince(ctx context.Context, chatMID string, an
 	return msgs, nil
 }
 
-// fetchMessagesBefore returns up to limit messages (newest first) older than end.
 func (lc *LineClient) fetchMessagesBefore(ctx context.Context, chatMID string, end line.MessageIDWrapper, limit int) (msgs []*line.Message, hasMore bool, err error) {
 	var client *line.Client
 	for len(msgs) < limit {
