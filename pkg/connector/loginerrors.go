@@ -28,6 +28,11 @@ var (
 		Err:        "LINE finished signing in without sending the encryption keychain. Please reconnect and complete the verification prompt in the LINE app.",
 		StatusCode: http.StatusBadRequest,
 	}
+	ErrLoginE2EEKeysChanged = bridgev2.RespError{
+		ErrCode:    "DEV.HIGHEST.LINE.E2EE_KEYS_CHANGED",
+		Err:        "Your LINE encryption keys changed since Beeper last connected. Please log in again and confirm the PIN in the LINE app.",
+		StatusCode: http.StatusBadRequest,
+	}
 	ErrLoginTooManyAttempts = bridgev2.RespError{
 		ErrCode:    "DEV.HIGHEST.LINE.TOO_MANY_ATTEMPTS",
 		Err:        loginTooManyAttemptsReason,
