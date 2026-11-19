@@ -3,6 +3,8 @@ package connector
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -17,10 +19,16 @@ type LineQRLogin struct {
 	qr      *line.QRCodeResponse
 	poll    chan error
 	pin     bool
+
+	emailMu sync.Mutex
+	email   *LineEmailLogin
 }
 
 var _ bridgev2.LoginProcessDisplayAndWait = (*LineQRLogin)(nil)
+var _ bridgev2.LoginProcessUserInput = (*LineQRLogin)(nil)
 var _ bridgev2.LoginProcessWithOverride = (*LineQRLogin)(nil)
+
+const qrSessionRevokedInstructions = "LINE signed this QR login out right away. Log in with your LINE email and password instead."
 
 func (lq *LineQRLogin) StartWithOverride(ctx context.Context, override *bridgev2.UserLogin) (*bridgev2.LoginStep, error) {
 	meta, ok := override.Metadata.(*UserLoginMetadata)
@@ -101,6 +109,9 @@ func (lq *LineQRLogin) startPoll(check func(context.Context, string) error, retr
 }
 
 func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
+	if email := lq.emailLogin(); email != nil {
+		return email.Wait(ctx)
+	}
 	if lq.poll == nil {
 		return nil, fmt.Errorf("QR login has not started")
 	}
@@ -146,7 +157,27 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 }
 
 func (lq *LineQRLogin) finish(ctx context.Context) (*bridgev2.LoginStep, error) {
-	defer lq.Cancel()
+	step, err := lq.completeQR(ctx)
+	if err == nil || !strings.Contains(err.Error(), "V3_TOKEN_CLIENT_LOGGED_OUT") {
+		return step, err
+	}
+	lq.login.User.Bridge.Log.Warn().Err(err).Msg("LINE logged out the new QR session, asking for email login")
+	email := &LineEmailLogin{
+		User:             lq.login.User,
+		ExistingLogin:    lq.login.ExistingLogin,
+		ExistingMetadata: lq.login.ExistingMetadata,
+		finalizeMu:       lq.login.finalizeMu,
+	}
+	lq.emailMu.Lock()
+	lq.email = email
+	lq.emailMu.Unlock()
+	step = email.loginErrorStep("")
+	step.Instructions = qrSessionRevokedInstructions
+	return step, nil
+}
+
+func (lq *LineQRLogin) completeQR(ctx context.Context) (*bridgev2.LoginStep, error) {
+	defer lq.login.Cancel()
 	res, err := lq.client.QRCodeLoginV2(ctx, lq.session)
 	if err != nil {
 		return nil, wrapLineLoginError(err)
@@ -154,6 +185,23 @@ func (lq *LineQRLogin) finish(ctx context.Context) (*bridgev2.LoginStep, error) 
 	return lq.login.finishLogin(ctx, res)
 }
 
+func (lq *LineQRLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	email := lq.emailLogin()
+	if email == nil {
+		return nil, fmt.Errorf("QR login isn't waiting for input")
+	}
+	return email.SubmitUserInput(ctx, input)
+}
+
+func (lq *LineQRLogin) emailLogin() *LineEmailLogin {
+	lq.emailMu.Lock()
+	defer lq.emailMu.Unlock()
+	return lq.email
+}
+
 func (lq *LineQRLogin) Cancel() {
 	lq.login.Cancel()
+	if email := lq.emailLogin(); email != nil {
+		email.Cancel()
+	}
 }

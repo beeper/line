@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -1134,6 +1135,9 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
 	}
+	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
+		info.Members.PowerLevels = lineGroupPowerLevels()
+	}
 	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
 	// out from under an accept that's already in flight.
 	if selfInvitePending {
@@ -1562,6 +1566,16 @@ func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
 				Type:      bridgev2.RemoteEventChatInfoChange,
 				PortalKey: portalKey,
 				Timestamp: time.Now(),
+				PreHandleWithResultFunc: func(ctx context.Context, portal *bridgev2.Portal) *bridgev2.EventHandlingResult {
+					lc.cacheMu.Lock()
+					generatedName := lc.generatedGroupNameCache[update.chatMid]
+					lc.cacheMu.Unlock()
+					if !generatedName {
+						result := bridgev2.EventHandlingResultIgnored
+						return &result
+					}
+					return nil
+				},
 			},
 			ChatInfoChange: &bridgev2.ChatInfoChange{
 				ChatInfo: &bridgev2.ChatInfo{
@@ -2000,7 +2014,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 
 	case OpSendChatChecked:
 		ts, _ := op.CreatedTime.Int64()
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
+		receipt := &simplevent.Receipt{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventReadReceipt,
 				PortalKey: networkid.PortalKey{
@@ -2011,8 +2025,11 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Sender:    lc.eventSenderForMID(lc.Mid),
 			},
 			LastTarget: networkid.MessageID(op.Param2),
-			ReadUpTo:   time.UnixMilli(ts),
-		})
+		}
+		receipt.PreHandleFunc = func(ctx context.Context, portal *bridgev2.Portal) {
+			lc.prepareReadReceiptFallback(ctx, portal, receipt)
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, receipt)
 
 	case OpReadReceipt:
 		chatMID := op.Param1
@@ -2021,7 +2038,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		senderID := makeUserID(readerMID)
 
 		ts, _ := op.CreatedTime.Int64()
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.Receipt{
+		receipt := &simplevent.Receipt{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventReadReceipt,
 				PortalKey: networkid.PortalKey{
@@ -2030,12 +2047,14 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				},
 				Timestamp: time.UnixMilli(ts),
 				Sender:    lc.eventSenderForMID(string(senderID)),
-				PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
-					lc.hiddenJoinGroupMessageSender(ctx, portal, chatMID, readerMID, time.UnixMilli(ts))
-				},
 			},
-			ReadUpTo: time.UnixMilli(ts),
-		})
+			LastTarget: networkid.MessageID(op.Param3),
+		}
+		receipt.PreHandleFunc = func(ctx context.Context, portal *bridgev2.Portal) {
+			lc.hiddenJoinGroupMessageSender(ctx, portal, chatMID, readerMID, time.UnixMilli(ts))
+			lc.prepareReadReceiptFallback(ctx, portal, receipt)
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, receipt)
 
 	case OpUnsendLocal, OpUnsendRemote:
 		chatMid := op.Param1
@@ -2150,6 +2169,24 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 				Interface("msg_metadata", op.Message.ContentMetadata)
 		}
 		logEvt.Msg("Unhandled SSE operation")
+	}
+}
+
+func (lc *LineClient) prepareReadReceiptFallback(ctx context.Context, portal *bridgev2.Portal, receipt *simplevent.Receipt) {
+	targetID, ok := new(big.Int).SetString(string(receipt.LastTarget), 10)
+	if !ok || targetID.Sign() < 0 {
+		return
+	}
+	latest, err := lc.UserLogin.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(ctx, portal.PortalKey, receipt.Timestamp)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to find read receipt fallback")
+		return
+	} else if latest == nil {
+		return
+	}
+	latestID, ok := new(big.Int).SetString(string(latest.ID), 10)
+	if ok && latestID.Sign() >= 0 && latestID.Cmp(targetID) <= 0 {
+		receipt.Targets = []networkid.MessageID{latest.ID}
 	}
 }
 
