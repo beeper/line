@@ -60,7 +60,9 @@ func (fc *flexComponent) collectLines(lines []flexLine) []flexLine {
 		if text == "" {
 			var spans strings.Builder
 			for _, span := range fc.children() {
-				spans.WriteString(span.Text)
+				if span != nil {
+					spans.WriteString(span.Text)
+				}
 			}
 			text = spans.String()
 		}
