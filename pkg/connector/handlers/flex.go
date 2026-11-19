@@ -119,13 +119,13 @@ func (h *Handler) ConvertFlex(data line.Message, relatesTo *event.RelatesTo) (*b
 	hasLinks := false
 	for i, line := range lines {
 		plain[i] = line.text
-		formatted[i] = html.EscapeString(line.text)
+		formatted[i] = event.TextToHTML(line.text)
 		if isWebURL(line.uri) {
 			hasLinks = true
 			if line.uri != line.text {
 				plain[i] = fmt.Sprintf("%s: %s", line.text, line.uri)
 			}
-			formatted[i] = fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(line.uri), html.EscapeString(line.text))
+			formatted[i] = fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(line.uri), event.TextToHTML(line.text))
 		}
 	}
 	var formattedBody string
