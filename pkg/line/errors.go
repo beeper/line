@@ -192,7 +192,7 @@ func LogoutReason(err error) (int, string, bool) {
 
 func isLogoutTalkException(talk talkExceptionData) bool {
 	switch talk.Code {
-	case TalkExceptionAuthenticationFailed, TalkExceptionNotAvailableUser, TalkExceptionNotAuthorizedDevice:
+	case TalkExceptionNotAvailableUser, TalkExceptionNotAuthorizedDevice:
 		return true
 	}
 	return false
@@ -301,11 +301,12 @@ func IsNoUsableE2EEGroupKey(err error) bool {
 		return true
 	}
 	// Detect TalkException codes in raw API error strings (HTTP 400 with code 10051).
-	// Code 98 = member has LS off;
+	// Code 98 = member has LS off; Code 1 = auth failed;
 	// Code 100 "exceed max member" = the group is too large for key registration.
 	// NOTE: Code 5 "not found" is handled by IsGroupKeyNotFound (auto-register), NOT here.
 	if hasResponseErrorCode(msg) && strings.Contains(msg, "talkexception") {
 		if strings.Contains(msg, "\"code\":98,") || strings.Contains(msg, "\"code\":98}") ||
+			strings.Contains(msg, "\"code\":1,") || strings.Contains(msg, "\"code\":1}") ||
 			(hasJSONCode(msg, 100) && (strings.Contains(msg, `"reason":"exceed max member"`) ||
 				strings.Contains(msg, `"reason": "exceed max member"`))) {
 			return true
@@ -322,9 +323,8 @@ type talkExceptionData struct {
 }
 
 const (
-	TalkExceptionAuthenticationFailed = 1
-	TalkExceptionNotAvailableUser     = 7
-	TalkExceptionNotAuthorizedDevice  = 8
+	TalkExceptionNotAvailableUser    = 7
+	TalkExceptionNotAuthorizedDevice = 8
 )
 
 const (
