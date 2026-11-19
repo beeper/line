@@ -187,14 +187,22 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 }
 
 // isBridgeableContentType reports whether an inbound LINE message should be
-// bridged to Matrix. System messages (group created, member invited, etc.) are
-// skipped, but post notifications are let through regardless of content type
-// because LINE may wrap them in non-standard content types.
+// bridged to Matrix. System messages (group created, member invited, etc.),
+// group call events and presence are skipped, but post and call notifications
+// are let through regardless of content type because LINE may wrap them in
+// non-standard content types.
 func isBridgeableContentType(msg *line.Message) bool {
 	if msg == nil {
 		return false
 	}
-	return isPostNotification(msg) || ContentType(msg.ContentType) != ContentSystem
+	if isPostNotification(msg) || msg.ContentMetadata["ORGCONTP"] == "CALL" {
+		return true
+	}
+	switch ContentType(msg.ContentType) {
+	case ContentSystem, ContentCall, ContentPresence:
+		return false
+	}
+	return true
 }
 
 // isPostNotification reports whether a LINE message represents a note, album,
