@@ -209,15 +209,18 @@ func (c *Client) NegotiateE2EEPublicKey(mid string) (*E2EEPublicKey, error) {
 		return nil, err
 	}
 	var wrapper struct {
-		Code    int             `json:"code"`
+		Code    *int            `json:"code"`
 		Message string          `json:"message"`
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(resp, &wrapper); err != nil {
 		return nil, err
 	}
-	if wrapper.Code != 0 {
-		return nil, fmt.Errorf("negotiateE2EEPublicKey failed: %s", wrapper.Message)
+	if wrapper.Code == nil {
+		return nil, fmt.Errorf("negotiateE2EEPublicKey response missing code")
+	}
+	if *wrapper.Code != 0 {
+		return nil, fmt.Errorf("negotiateE2EEPublicKey failed: %s", resp)
 	}
 	return parseE2EEPublicKey(wrapper.Data)
 }
@@ -226,6 +229,15 @@ func parseE2EEPublicKey(rawData []byte) (*E2EEPublicKey, error) {
 	var data map[string]any
 	if err := json.Unmarshal(rawData, &data); err != nil {
 		return nil, err
+	}
+
+	var state struct {
+		AllowedTypes *[]int `json:"allowedTypes"`
+		SpecVersion  *int   `json:"specVersion"`
+	}
+	if json.Unmarshal(rawData, &state) == nil && state.AllowedTypes != nil && len(*state.AllowedTypes) == 0 &&
+		state.SpecVersion != nil && *state.SpecVersion == -1 {
+		return nil, fmt.Errorf("%w: %w", ErrNoUsableE2EEPublicKey, ErrE2EEPublicKeyDisabled)
 	}
 
 	var findString func(any) string

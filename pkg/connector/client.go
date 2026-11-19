@@ -257,6 +257,24 @@ func (lc *LineClient) newClientWithToken(token string) *line.Client {
 	return client
 }
 
+func (lc *LineClient) verifyNoE2EE(client *line.Client) error {
+	lc.recoverMu.Lock()
+	if lc.superseded.Load() || lc.isSessionInvalidated() {
+		lc.recoverMu.Unlock()
+		return errLineClientSuperseded
+	}
+	mid := lc.midOrFallback()
+	lc.recoverMu.Unlock()
+	_, err := client.NegotiateE2EEPublicKey(mid)
+	if errors.Is(err, line.ErrE2EEPublicKeyDisabled) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("verify own Letter Sealing status: %w", err)
+	}
+	return fmt.Errorf("%w: LINE Letter Sealing is enabled", e2ee.ErrMissingOwnPrivateKey)
+}
+
 func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
 	if picturePath == "" {
 		return &bridgev2.Avatar{Remove: true}
@@ -822,6 +840,10 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 		if ctx.Err() != nil {
 			return false
 		}
+		var noE2EEErr error
+		if lc.noE2EE.Load() {
+			_, noE2EEErr = lc.callLine(ctx, lc.verifyNoE2EE)
+		}
 		lc.recoverMu.Lock()
 		_, _, keyErr := mgr.MyKeyIDs()
 		if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || !lc.hasAccessToken() {
@@ -836,6 +858,19 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 			})
 			lc.recoverMu.Unlock()
 			return false
+		}
+		if lc.noE2EE.Load() && noE2EEErr != nil {
+			if errors.Is(noE2EEErr, e2ee.ErrMissingOwnPrivateKey) {
+				lc.markMissingE2EEKey(ctx, noE2EEErr)
+			} else {
+				lc.UserLogin.BridgeState.Send(status.BridgeState{
+					StateEvent: status.StateUnknownError,
+					Error:      "line-e2ee-init-failed",
+					Info:       map[string]any{"go_error": noE2EEErr.Error()},
+				})
+				lc.recoverMu.Unlock()
+				return false
+			}
 		}
 		if keyErr != nil && !lc.noE2EE.Load() {
 			lc.markMissingE2EEKey(ctx, fmt.Errorf("%w: %w", e2ee.ErrMissingOwnPrivateKey, keyErr))
