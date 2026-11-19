@@ -1909,10 +1909,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		// is never useful; without batch sending, restore the empty room instead.
 		lc.queueUnblockedDMRestore(ctx, mid, "op_unblock")
 
-	case OpContactUpdate:
-		lc.refreshContact(ctx, op.Param1)
-
-	case OpNotifiedUpdateProfile:
+	case OpContactUpdate, OpNotifiedUpdateProfile:
 		lc.wg.Add(1)
 		go func() {
 			defer lc.wg.Done()
