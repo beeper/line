@@ -1366,10 +1366,7 @@ func positionUserPills(body, rendered, marker string, pills []userPill) bool {
 		cursor += len(text)
 		rendered = rest
 	}
-	if strings.TrimRightFunc(body[cursor:], unicode.IsSpace) != rendered {
-		return false
-	}
-	return true
+	return strings.TrimRightFunc(body[cursor:], unicode.IsSpace) == rendered
 }
 
 func unpositionedPills(pills []userPill) []userPill {
