@@ -23,6 +23,7 @@ import (
 var _ bridgev2.IdentifierResolvingNetworkAPI = (*LineClient)(nil)
 
 func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev2.MatrixReadReceipt) error {
+	lc.noteOwnRead(string(read.Portal.ID))
 	if read.ReadUpTo.IsZero() && read.EventID == "" {
 		return nil
 	}
