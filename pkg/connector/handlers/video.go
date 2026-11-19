@@ -51,6 +51,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
 	width, height := lineMediaDimensions(data.ContentMetadata)
+	thumbWidth, thumbHeight := lineMediaInfoDimensions(data.ContentMetadata["MEDIA_THUMB_INFO"])
 	if h.GenerateDirectMediaURI != nil {
 		directMedia, err := newDirectMedia(
 			"video", oid, "", sid, downloadOptions, decryptedBody, data.ContentMetadata,
@@ -63,7 +64,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 			h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to generate LINE video preview URI")
 		} else {
 			info.ThumbnailURL = thumbnailURI
-			info.ThumbnailInfo = &event.FileInfo{MimeType: "image/jpeg", Width: width, Height: height}
+			info.ThumbnailInfo = &event.FileInfo{MimeType: "image/jpeg", Width: thumbWidth, Height: thumbHeight}
 		}
 		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
 			MsgType: event.MsgVideo, RelatesTo: relatesTo, Info: info,
@@ -162,7 +163,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 	} else {
 		videoInfo.ThumbnailURL = thumbnailURL
 		videoInfo.ThumbnailFile = thumbnailFile
-		videoInfo.ThumbnailInfo = &event.FileInfo{MimeType: "image/jpeg", Size: len(thumbnail), Width: width, Height: height}
+		videoInfo.ThumbnailInfo = &event.FileInfo{MimeType: "image/jpeg", Size: len(thumbnail), Width: thumbWidth, Height: thumbHeight}
 	}
 	if duration > 0 {
 		videoInfo.Duration = duration
