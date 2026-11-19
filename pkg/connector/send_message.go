@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"image"
 	"image/jpeg"
 	"maps"
@@ -151,7 +152,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// Matrix clients often send media as MsgFile (e.g. drag-and-drop), which would otherwise
 	// be sent as ContentFile (14) instead of the appropriate media type on LINE.
 	effectiveMsgType := msg.Content.MsgType
-	if effectiveMsgType == event.CapMsgSticker && sticker == nil {
+	if effectiveMsgType == event.MsgEmote && msg.OrigSender == nil {
+		msg.Content.Body = "/me " + msg.Content.Body
+		if msg.Content.FormattedBody != "" {
+			msg.Content.FormattedBody = "/me " + msg.Content.FormattedBody
+		}
+	}
+	if effectiveMsgType == event.MsgNotice || effectiveMsgType == event.MsgEmote {
+		effectiveMsgType = event.MsgText
+	} else if effectiveMsgType == event.CapMsgSticker && sticker == nil {
 		effectiveMsgType = event.MsgImage
 	} else if effectiveMsgType == event.MsgFile && msg.Content.Info != nil {
 		mime := msg.Content.Info.MimeType
@@ -938,7 +947,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			Int("media_size", len(plainMediaData)).
 			Msg("Uploaded plain media after sending")
 
-		if plainThumbData != nil {
+		if plainThumbData != nil && contentType != int(ContentImage) {
 			previewID := fmt.Sprintf("%s__ud-preview", sentMsg.ID)
 			if err := callLineErr(func(client *line.Client) error {
 				return client.UploadOBSPlain(plainThumbData, previewID, obsType)
@@ -1089,7 +1098,7 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 	if formattedBody != "" {
 		for _, m := range mentionLinkRegex.FindAllStringSubmatch(formattedBody, -1) {
 			if len(m) >= 3 {
-				nameByUserID[m[1]] = m[2]
+				nameByUserID[m[1]] = strings.TrimPrefix(html.UnescapeString(m[2]), "@")
 			}
 		}
 	}

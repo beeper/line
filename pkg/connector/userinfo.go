@@ -47,7 +47,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_11_11",
+		ID:               "dev.highest.matrix.line.capabilities.2026_11_19",
 		MaxTextLength:    5000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
@@ -167,6 +167,13 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 			event.MemberActionKick:         event.CapLevelFullySupported,
 			event.MemberActionLeave:        event.CapLevelFullySupported,
 			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
+		}
+		if portal != nil && isEditableGroupMID(string(portal.ID)) {
+			caps.ID += "+group"
+			caps.State = event.StateFeatureMap{
+				event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
+				event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
+			}
 		}
 	}
 	if lc.UserLogin == nil || lc.UserLogin.Bridge == nil || lc.UserLogin.Bridge.Config == nil || !lc.UserLogin.Bridge.Config.BridgeMatrixLeave {
