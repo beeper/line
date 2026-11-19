@@ -11,6 +11,7 @@ import (
 	"image"
 	"image/jpeg"
 	"maps"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1013,6 +1014,12 @@ func parseGeoURI(uri string) (lat, long float64, err error) {
 	}
 	if long, err = strconv.ParseFloat(longStr, 64); err != nil {
 		return 0, 0, fmt.Errorf("longitude is not a number: %w", err)
+	}
+	if math.IsNaN(lat) || math.IsInf(lat, 0) || lat < -90 || lat > 90 {
+		return 0, 0, fmt.Errorf("latitude is outside [-90,90]")
+	}
+	if math.IsNaN(long) || math.IsInf(long, 0) || long < -180 || long > 180 {
+		return 0, 0, fmt.Errorf("longitude is outside [-180,180]")
 	}
 	return lat, long, nil
 }
