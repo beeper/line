@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -701,6 +702,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	if canceled || ctx.Err() != nil || (processCtx != nil && processCtx.Err() != nil) {
 		return nil, context.Canceled
 	}
+	parentCtx := ctx
 	finishCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if processCtx != nil {
@@ -762,6 +764,9 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 		defer loginManager.Close()
 	}
 	if sameAccount && shouldPreserveExistingE2EEKeys(exportedKeys, ll.ExistingMetadata) {
+		if currentKeyID, stale := ll.storedE2EEKeysOutdated(client, mid); stale {
+			return ll.restartLoginForNewE2EEKey(parentCtx, currentKeyID)
+		}
 		copyLoginE2EEKeyMetadata(meta, ll.ExistingMetadata)
 		ll.User.Bridge.Log.Info().Int("keys", len(meta.ExportedKeyMap)).Msg("Preserved existing E2EE keys after re-login")
 	}
@@ -941,6 +946,50 @@ func copyLoginE2EEKeyMetadata(dst, src *UserLoginMetadata) {
 			dst.ExportedKeyMap[keyID] = exported
 		}
 	}
+}
+
+func (ll *LineEmailLogin) storedE2EEKeysOutdated(client *line.Client, mid string) (int, bool) {
+	pub, err := negotiateE2EEPublicKeyWithClient(client, mid)
+	if err != nil {
+		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to check current E2EE key, keeping existing keys")
+		return 0, false
+	}
+	currentKeyID, err := pub.KeyID.Int64()
+	if err != nil || currentKeyID <= 0 {
+		return 0, false
+	}
+	for id := range ll.ExistingMetadata.ExportedKeyMap {
+		if storedKeyID, err := strconv.ParseInt(id, 10, 64); err != nil || storedKeyID >= currentKeyID {
+			return 0, false
+		}
+	}
+	return int(currentKeyID), true
+}
+
+func (ll *LineEmailLogin) restartLoginForNewE2EEKey(ctx context.Context, currentKeyID int) (*bridgev2.LoginStep, error) {
+	ll.User.Bridge.Log.Warn().
+		Int("current_key_id", currentKeyID).
+		Int("stored_keys", len(ll.ExistingMetadata.ExportedKeyMap)).
+		Msg("Login: stored E2EE keys are older than the account's current key, requiring PIN verification")
+	usedCertificate := ll.Certificate != ""
+	ll.ExistingMetadata.ForceFullE2EELogin = true
+	ll.ExistingMetadata.Certificate = ""
+	ll.Certificate = ""
+	if err := ll.ExistingLogin.Save(ctx); err != nil {
+		ll.User.Bridge.Log.Warn().Err(err).Msg("Login: failed to save LINE E2EE reconnect requirement")
+	}
+	ll.mu.Lock()
+	usingQR := ll.qrLogin != nil
+	ll.mu.Unlock()
+	if !usedCertificate || usingQR || ll.Email == "" || ll.Password == "" {
+		return nil, ErrLoginE2EEKeysChanged
+	}
+	res, err := ll.loginCredentials(ctx, "")
+	if err != nil {
+		ll.logLoginFailure(err, "e2ee_key_refresh")
+		return nil, wrapLineLoginError(err)
+	}
+	return ll.handleLoginResponse(ctx, res)
 }
 
 func shouldPreserveExistingE2EEKeys(exportedKeys bool, existing *UserLoginMetadata) bool {
