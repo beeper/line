@@ -276,7 +276,7 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
 		MessageBoxCountLimit:           messageBoxPageLimit,
-		WithUnreadCount:                false,
+		WithUnreadCount:                lc.UserLogin.Bridge.Config.Backfill.Enabled,
 		LastMessagesPerMessageBoxCount: 0,
 	}
 
@@ -313,6 +313,9 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 		}
 		lc.queueDMChatResync(ctx, mid, checkNeedsBackfill != nil, true, checkNeedsBackfill)
 	}
+	if backfillEnabled {
+		lc.prefetchMessageBoxes(ctx, messageBoxes)
+	}
 }
 
 func (lc *LineClient) messageBoxNeedsBackfill(last line.MessageIDWrapper) func(context.Context, *database.Message) (bool, error) {
@@ -329,7 +332,7 @@ func (lc *LineClient) messageBoxNeedsBackfill(last line.MessageIDWrapper) func(c
 			return false, nil
 		}
 		deliveredTime, err := last.DeliveredTime.Int64()
-		return err != nil || time.UnixMilli(deliveredTime).After(latestMessage.Timestamp), nil
+		return err != nil || !time.UnixMilli(deliveredTime).Before(latestMessage.Timestamp), nil
 	}
 }
 
@@ -698,7 +701,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		}
 		intent, ok := params.Portal.GetIntentFor(ctx, sender, lc.UserLogin, bridgev2.RemoteEventMessage)
 		if !ok {
-			continue
+			return nil, fmt.Errorf("failed to get sender intent for backfill message %s", msg.ID)
 		}
 
 		opType := OpReceiveMessage
@@ -708,8 +711,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, chatMID, int(opType))
 		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText, decryptionFailed)
 		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
-			continue
+			return nil, fmt.Errorf("failed to convert backfill message %s: %w", msg.ID, err)
 		}
 		if converted == nil {
 			continue
@@ -776,7 +778,7 @@ func (lc *LineClient) fetchMessagesSince(ctx context.Context, chatMID string, an
 			return false
 		}
 		for _, msg := range page {
-			if msg.ID == string(anchor.ID) || !lc.parseMessageTimestamp(msg).After(anchor.Timestamp) {
+			if msg.ID == string(anchor.ID) || lc.parseMessageTimestamp(msg).Before(anchor.Timestamp) {
 				return true
 			}
 		}
@@ -786,12 +788,13 @@ func (lc *LineClient) fetchMessagesSince(ctx context.Context, chatMID string, an
 	for len(page) > 0 && len(msgs) < limit && !reachedAnchor(page) {
 		end := lineMessageIDWrapper(page[len(page)-1])
 		client, page, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) ([]*line.Message, error) {
-			return client.GetPreviousMessagesV2WithRequest(ctx, chatMID, end, min(limit-len(msgs), backfillPageSize))
+			return client.GetPreviousMessagesV2WithRequest(ctx, chatMID, end, min(limit-len(msgs)+1, backfillPageSize))
 		})
 		if err != nil {
 			return nil, err
 		}
 		page = slices.DeleteFunc(page, func(msg *line.Message) bool { return msg.ID == end.MessageID })
+		page = page[:min(len(page), limit-len(msgs))]
 		msgs = append(msgs, page...)
 	}
 	return msgs, nil
@@ -800,7 +803,7 @@ func (lc *LineClient) fetchMessagesSince(ctx context.Context, chatMID string, an
 func (lc *LineClient) fetchMessagesBefore(ctx context.Context, chatMID string, end line.MessageIDWrapper, limit int) (msgs []*line.Message, hasMore bool, err error) {
 	var client *line.Client
 	for len(msgs) < limit {
-		count := min(limit-len(msgs), backfillPageSize)
+		count := min(limit-len(msgs)+1, backfillPageSize)
 		var page []*line.Message
 		client, page, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) ([]*line.Message, error) {
 			return client.GetPreviousMessagesV2WithRequest(ctx, chatMID, end, count)
@@ -813,6 +816,7 @@ func (lc *LineClient) fetchMessagesBefore(ctx context.Context, chatMID string, e
 		if len(page) == 0 {
 			return msgs, false, nil
 		}
+		page = page[:min(len(page), limit-len(msgs))]
 		msgs = append(msgs, page...)
 		if !hasMore {
 			break
@@ -837,6 +841,10 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to prefetch message boxes")
 		return
 	}
+	lc.prefetchMessageBoxes(ctx, messageBoxes)
+}
+
+func (lc *LineClient) prefetchMessageBoxes(ctx context.Context, messageBoxes []line.MessageBox) {
 	latestMessageIDs := make(map[string]string, len(messageBoxes))
 	for _, box := range messageBoxes {
 		if box.LastDeliveredMessageID != nil {
@@ -925,9 +933,8 @@ func collectStartupBackfillChatMIDs(messageBoxes []line.MessageBox, memberChatMI
 	return chatMIDs
 }
 
-// backfillRecentMessages fetches up to limit recent messages for a single
-// chat and queues any not already in the local DB through the normal inbound
-// (live) message path. Used by prefetchMessages on startup.
+// backfillRecentMessages reconciles recent reactions and system events. When
+// backfill is disabled, it also queues unbridged messages through the live path.
 func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string, limit int) bool {
 	start := time.Now()
 	_, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
@@ -971,7 +978,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 		var didQueue bool
 		if ContentType(msg.ContentType) == ContentSystem {
 			didQueue = lc.queueHistoricalSystemMessage(msg, int(opType))
-		} else {
+		} else if !lc.UserLogin.Bridge.Config.Backfill.Enabled {
 			didQueue = lc.queueIncomingMessage(msg, int(opType))
 		}
 		if didQueue {
