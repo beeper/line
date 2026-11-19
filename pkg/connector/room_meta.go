@@ -12,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf16"
 
+	"github.com/disintegration/imaging"
 	"go.mau.fi/util/ffmpeg"
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
@@ -149,11 +150,7 @@ func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]b
 		}
 		data = converted
 	}
-	if cfg, format, err := image.DecodeConfig(bytes.NewReader(data)); err == nil && format == "jpeg" &&
-		cfg.Width <= maxLineGroupPictureDim && cfg.Height <= maxLineGroupPictureDim {
-		return data, nil
-	}
-	img, _, err := image.Decode(bytes.NewReader(data))
+	img, err := imaging.Decode(bytes.NewReader(data), imaging.AutoOrientation(true))
 	if err != nil {
 		if !ffmpeg.Supported() {
 			return nil, err
@@ -162,7 +159,7 @@ func convertGroupPicture(ctx context.Context, data []byte, mimeType string) ([]b
 		if convErr != nil {
 			return nil, fmt.Errorf("%w (ffmpeg: %w)", err, convErr)
 		}
-		if img, _, err = image.Decode(bytes.NewReader(png)); err != nil {
+		if img, err = imaging.Decode(bytes.NewReader(png), imaging.AutoOrientation(true)); err != nil {
 			return nil, err
 		}
 	}
