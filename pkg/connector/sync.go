@@ -655,7 +655,11 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 			return &bridgev2.FetchMessagesResponse{HasMore: false, MarkRead: true}, nil
 		}
 	}
-	lc.retryBackfillMessages(ctx, params.Portal)
+	recovered := lc.retryBackfillMessages(ctx, params.Portal)
+	recoveredIDs := make(map[string]bool, len(recovered))
+	for _, msgID := range recovered {
+		recoveredIDs[string(msgID)] = true
+	}
 	limit := params.Count
 	if limit <= 0 {
 		limit = startupBackfillMessageLimit
@@ -688,6 +692,9 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	backfillMsgs := make([]*bridgev2.BackfillMessage, 0, len(msgs))
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
+		if recoveredIDs[msg.ID] {
+			continue
+		}
 		if lc.shouldSkipDeletedChat(chatMID, msg.ID) {
 			hasMore = false
 			continue
@@ -710,9 +717,10 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 				}
 				return nil, saveErr
 			} else if stored {
-				continue
+				converted = lc.backfillRetryPlaceholder(msg)
+			} else {
+				converted = lc.backfillRetryOverflow(msg)
 			}
-			converted = lc.backfillRetryOverflow(msg)
 		}
 		if converted != nil {
 			backfillMsgs = append(backfillMsgs, converted)
