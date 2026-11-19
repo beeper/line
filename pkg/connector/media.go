@@ -183,6 +183,9 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 
 	info, err := exec.CommandContext(ctx, "heif-info", inputPath).Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("failed to inspect HEIF dimensions: %w", ctxErr)
+		}
 		return nil, fmt.Errorf("failed to inspect HEIF dimensions: %w", err)
 	}
 	pixels := 0
@@ -216,7 +219,7 @@ func convertHEICToJPEG(ctx context.Context, imageData []byte) ([]byte, error) {
 	// writer skips the block and writes the image.
 	pngData, pngErr := runHEIFDec(ctx, dir, inputPath, "png")
 	if pngErr != nil {
-		return nil, err
+		return nil, errors.Join(err, pngErr)
 	}
 	img, imgErr := png.Decode(bytes.NewReader(pngData))
 	if imgErr != nil {
@@ -252,7 +255,7 @@ func runHEIFDec(ctx context.Context, dir, inputPath, extension string) ([]byte, 
 	}
 	// heif-dec exits 0 even when its writer fails, leaving an empty file.
 	config, _, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil || config.Width <= 0 || config.Height <= 0 {
+	if err != nil || !lineImageSizeAllowed(config.Width, config.Height) {
 		return nil, fmt.Errorf("heif-dec produced invalid %s output: %s", extension, strings.TrimSpace(stderr.String()))
 	}
 	return data, nil
