@@ -117,7 +117,7 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 			return
 		}
 		data := strings.Join(dataLines, "\n")
-		if data != "" && data != "null" {
+		if (data != "" && data != "null") || currentEvent == "ping" || currentEvent == "reconnect" {
 			eventType := currentEvent
 			if eventType == "" {
 				eventType = "operation"
