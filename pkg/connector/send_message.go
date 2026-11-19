@@ -939,7 +939,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			Int("media_size", len(plainMediaData)).
 			Msg("Uploaded plain media after sending")
 
-		if plainThumbData != nil {
+		if plainThumbData != nil && contentType != int(ContentImage) {
 			previewID := fmt.Sprintf("%s__ud-preview", sentMsg.ID)
 			if err := callLineErr(func(client *line.Client) error {
 				return client.UploadOBSPlain(plainThumbData, previewID, obsType)
