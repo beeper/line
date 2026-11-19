@@ -31,6 +31,9 @@ Based on the [mautrix-twilio](https://github.com/mautrix/twilio) bridge
 > need to log out of the bridge first as the bridge will try to automatically
 > log back in and invalidate the LINE Chrome session again.
 
+For direct-chat identifiers, synchronization triggers, outbound-message diagnostics,
+and QR login troubleshooting, see [the debugging guide](readme/DEBUGGING.md).
+
 ## Features
 
 - [x] Messages

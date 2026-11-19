@@ -112,8 +112,15 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	}
 
 	// Upload to Matrix
+	imageMedia := lineImageMediaInfo(imgData)
+	if imageMedia.usedMimeFallback {
+		h.Log.Debug().Int("size_bytes", len(imgData)).Msg("Falling back to JPEG MIME type for LINE image")
+	}
+	if imageMedia.decodeErr != nil {
+		h.Log.Debug().Err(imageMedia.decodeErr).Str("mime_type", imageMedia.mimeType).Msg("Could not decode LINE image dimensions")
+	}
 	uploadStart := time.Now()
-	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, "image.jpg", "image/jpeg")
+	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, imageMedia.fileName, imageMedia.mimeType)
 	uploadDuration := time.Since(uploadStart)
 	if err != nil {
 		h.Log.Error().
@@ -145,7 +152,8 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 				Type: event.EventMessage,
 				Content: &event.MessageEventContent{
 					MsgType:   event.MsgImage,
-					Body:      "image.jpg",
+					Body:      imageMedia.fileName,
+					Info:      imageMedia.info,
 					URL:       mxc,
 					File:      file,
 					RelatesTo: relatesTo,

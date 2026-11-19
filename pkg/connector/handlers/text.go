@@ -41,7 +41,7 @@ func (h *Handler) ConvertText(ctx context.Context, portal *bridgev2.Portal, inte
 			}
 			if info.Image != "" && info.Obs.CDN != "" {
 				if err := h.uploadPreviewImage(ctx, client, portal, intent, info.Obs.CDN+info.Image, preview); err != nil {
-					h.Log.Warn().Err(err).Str("url", requestURL).Msg("Failed to bridge link preview image")
+					h.Log.Warn().Msg("Failed to bridge link preview image")
 				}
 			}
 			content.BeeperLinkPreviews = []*event.BeeperLinkPreview{preview}
@@ -59,7 +59,13 @@ func (h *Handler) ConvertText(ctx context.Context, portal *bridgev2.Portal, inte
 }
 
 func (h *Handler) uploadPreviewImage(ctx context.Context, client *line.Client, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, imageURL string, preview *event.BeeperLinkPreview) error {
-	data, err := client.DownloadOBSPublicResource(ctx, imageURL)
+	var data []byte
+	var err error
+	if h.DownloadPublicMedia != nil {
+		data, err = h.DownloadPublicMedia(ctx, client, imageURL)
+	} else {
+		data, err = client.DownloadOBSPublicResource(ctx, imageURL)
+	}
 	if err != nil {
 		return err
 	}

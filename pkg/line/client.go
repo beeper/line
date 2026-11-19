@@ -480,7 +480,7 @@ func (c *Client) callRPCWithBaseURLContext(ctx context.Context, baseURL, service
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 {
-		return nil, newHTTPError(resp.StatusCode, "API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, newHTTPResponseError(resp, "API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	return respBody, nil
@@ -565,7 +565,7 @@ func (c *Client) postWithHMAC(fullURL string, body []byte) ([]byte, error) {
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, newHTTPError(resp.StatusCode, "HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, newHTTPResponseError(resp, "HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	return io.ReadAll(resp.Body)

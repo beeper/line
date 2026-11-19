@@ -21,14 +21,29 @@ func testRPCContextCancellation(t *testing.T, method string, call func(*Client, 
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	result := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		result <- call(client, ctx)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Errorf("%s worker did not exit after cleanup cancellation", method)
+		}
+	})
 
 	select {
 	case <-requestStarted:
-	case <-time.After(time.Second):
+	case err := <-result:
+		t.Fatalf("%s failed before reaching transport: %v", method, err)
+	// Cold white-box signing happens before RoundTrip and is substantially
+	// slower under -race. This is a setup bound, not the cancellation bound.
+	case <-time.After(30 * time.Second):
 		t.Fatalf("%s request did not start", method)
 	}
 	cancel()
@@ -55,4 +70,24 @@ func TestGetProfileContextCancellation(t *testing.T) {
 		_, err := client.GetProfileContext(ctx)
 		return err
 	})
+}
+
+func TestIdentifierLookupContextCancellation(t *testing.T) {
+	for name, call := range map[string]func(*Client, context.Context) error{
+		"findContactByUserid": func(c *Client, ctx context.Context) error {
+			_, err := c.FindContactByUseridContext(ctx, "carol")
+			return err
+		},
+		"getContactsV2": func(c *Client, ctx context.Context) error {
+			_, err := c.GetContactsV2Context(ctx, []string{"u0123456789abcdef0123456789abcdef"})
+			return err
+		},
+		"getBuddyProfile": func(c *Client, ctx context.Context) error {
+			_, err := c.GetBuddyProfileContext(ctx, "u0123456789abcdef0123456789abcdef")
+			return err
+		},
+		"getAllContactIds": func(c *Client, ctx context.Context) error { _, err := c.GetAllContactIdsContext(ctx); return err },
+	} {
+		t.Run(name, func(t *testing.T) { testRPCContextCancellation(t, name, call) })
+	}
 }

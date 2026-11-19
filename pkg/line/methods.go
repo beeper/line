@@ -391,7 +391,11 @@ func (c *Client) GetE2EEPublicKey(mid string, keyVersion, keyID int) (*E2EEPubli
 }
 
 func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
-	resp, err := c.callRPC("TalkService", "sendMessage", reqSeq, msg)
+	return c.SendMessageContext(c.requestContext(), reqSeq, msg)
+}
+
+func (c *Client) SendMessageContext(ctx context.Context, reqSeq int64, msg *Message) (*Message, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "sendMessage", reqSeq, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -404,7 +408,12 @@ func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
 		return nil, err
 	}
 	if wrapper.Code != 0 {
-		return nil, fmt.Errorf("sendMessage failed: %s", wrapper.Message)
+		// Keep TalkException codes available to auth recovery and send retries,
+		// including when LINE wraps an error in an HTTP 200 response.
+		return nil, fmt.Errorf("sendMessage failed: %s", resp)
+	}
+	if wrapper.Data == nil || wrapper.Data.ID == "" {
+		return nil, fmt.Errorf("sendMessage returned no message acknowledgement")
 	}
 	return wrapper.Data, nil
 }
@@ -487,8 +496,12 @@ func (c *Client) SendChatChecked(chatMid, messageID string) error {
 
 // GetContactsV2 fetches contact details for a list of MIDs.
 func (c *Client) GetContactsV2(mids []string) (*ContactsResponse, error) {
+	return c.GetContactsV2Context(c.requestContext(), mids)
+}
+
+func (c *Client) GetContactsV2Context(ctx context.Context, mids []string) (*ContactsResponse, error) {
 	req := GetContactsV2Request{TargetUserMids: mids}
-	resp, err := c.callRPC("TalkService", "getContactsV2", req, 2)
+	resp, err := c.callRPCContext(ctx, "TalkService", "getContactsV2", req, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +521,11 @@ func (c *Client) GetContactsV2(mids []string) (*ContactsResponse, error) {
 
 // GetBuddyProfile fetches the profile of a LINE official/business account (buddy).
 func (c *Client) GetBuddyProfile(mid string) (*BuddyProfile, error) {
-	resp, err := c.callRPC("BuddyService", "getBuddyProfile", mid)
+	return c.GetBuddyProfileContext(c.requestContext(), mid)
+}
+
+func (c *Client) GetBuddyProfileContext(ctx context.Context, mid string) (*BuddyProfile, error) {
+	resp, err := c.callRPCContext(ctx, "BuddyService", "getBuddyProfile", mid)
 	if err != nil {
 		return nil, err
 	}
@@ -1039,7 +1056,11 @@ func (c *Client) RejectChatInvitationContext(ctx context.Context, reqSeq int64, 
 
 // FindContactByUserid looks up a LINE user by their user ID (not MID).
 func (c *Client) FindContactByUserid(userid string) (*Contact, error) {
-	resp, err := c.callRPC("TalkService", "findContactByUserid", userid)
+	return c.FindContactByUseridContext(c.requestContext(), userid)
+}
+
+func (c *Client) FindContactByUseridContext(ctx context.Context, userid string) (*Contact, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "findContactByUserid", userid)
 	if err != nil {
 		return nil, err
 	}
@@ -1059,7 +1080,11 @@ func (c *Client) FindContactByUserid(userid string) (*Contact, error) {
 
 // GetAllContactIds returns the MIDs of all contacts.
 func (c *Client) GetAllContactIds() ([]string, error) {
-	resp, err := c.callRPC("TalkService", "getAllContactIds")
+	return c.GetAllContactIdsContext(c.requestContext())
+}
+
+func (c *Client) GetAllContactIdsContext(ctx context.Context) ([]string, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "getAllContactIds")
 	if err != nil {
 		return nil, err
 	}
