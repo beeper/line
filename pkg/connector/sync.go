@@ -735,6 +735,8 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 		Int("concurrency", workerCount).
 		Msg("Prefetching recent messages")
 
+	catchUpMIDs := lc.chatsMissingLatestMessage(ctx, messageBoxes, chatMIDs)
+
 	jobs := make(chan string)
 	var workers sync.WaitGroup
 	var backfilledSystemEvents atomic.Bool
@@ -764,8 +766,8 @@ func (lc *LineClient) prefetchMessages(ctx context.Context) {
 	}
 	close(jobs)
 	workers.Wait()
-	if ctx.Err() == nil {
-		lc.queueStartupReadReceipts(messageBoxes, chatMIDs)
+	if ctx.Err() == nil && len(catchUpMIDs) > 0 {
+		lc.queueStartupReadReceipts(ctx, catchUpMIDs)
 	}
 
 	// Historical membership/name events are real state events. Replay them in
