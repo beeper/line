@@ -1642,6 +1642,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		case "fullSync":
 			lc.UserLogin.Bridge.Log.Info().Msg("Received fullSync request")
 
+			revUpdated := false
 			var fsPayload struct {
 				NextRevision string `json:"nextRevision"`
 			}
@@ -1650,7 +1651,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 					lc.UserLogin.Bridge.Log.Info().Int64("old", localRev).Int64("new", newRev).Msg("Updating local revision from fullSync")
 
 					localRev = newRev
-
+					revUpdated = true
 				}
 			}
 			newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
@@ -1664,7 +1665,9 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			go lc.syncChats(ctx)
 			go lc.syncDMChats(ctx)
 			go lc.prefetchMessages(ctx)
-			cancelListen(errSSEReconnect)
+			if revUpdated {
+				cancelListen(errSSEReconnect)
+			}
 		case "operation":
 			var op line.Operation
 			if err := json.Unmarshal([]byte(data), &op); err != nil {
