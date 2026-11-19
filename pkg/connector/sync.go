@@ -701,7 +701,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		}
 		intent, ok := params.Portal.GetIntentFor(ctx, sender, lc.UserLogin, bridgev2.RemoteEventMessage)
 		if !ok {
-			return nil, fmt.Errorf("failed to get sender intent for backfill message %s", msg.ID)
+			continue
 		}
 
 		opType := OpReceiveMessage
@@ -711,7 +711,8 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, chatMID, int(opType))
 		converted, err := lc.convertLineMessage(ctx, params.Portal, intent, *msg, bodyText, unwrappedText, decryptionFailed)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert backfill message %s: %w", msg.ID, err)
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
+			continue
 		}
 		if converted == nil {
 			continue
