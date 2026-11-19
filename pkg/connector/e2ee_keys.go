@@ -41,7 +41,7 @@ func (lc *LineClient) ensureGroupKey(ctx context.Context, chatMid string, groupK
 	if lc.E2EE.HasGroupKey(chatMid, groupKeyID) {
 		return nil
 	}
-	err, generation := lc.E2EE.GroupKeyError(chatMid, groupKeyID)
+	generation, err := lc.E2EE.GroupKeyError(chatMid, groupKeyID)
 	if err != nil {
 		return err
 	}

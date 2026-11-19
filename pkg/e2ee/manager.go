@@ -942,10 +942,10 @@ func (m *Manager) HasGroupKey(chatMid string, groupKeyID int) bool {
 	return m.errLocked() == nil && m.groupKeys[chatMid][groupKeyID] != 0
 }
 
-func (m *Manager) GroupKeyError(chatMid string, groupKeyID int) (error, uint64) {
+func (m *Manager) GroupKeyError(chatMid string, groupKeyID int) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.groupKeyErrors[groupKeyRef{chatMid, groupKeyID}], m.groupKeyGeneration
+	return m.groupKeyGeneration, m.groupKeyErrors[groupKeyRef{chatMid, groupKeyID}]
 }
 
 func (m *Manager) SetGroupKeyError(chatMid string, groupKeyID int, err error, generation uint64) {
