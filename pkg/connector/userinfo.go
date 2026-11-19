@@ -31,6 +31,9 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 	if read.EventID != "" {
 		msg, err := lc.UserLogin.Bridge.DB.Message.GetPartByMXID(ctx, read.EventID)
 		if err == nil && msg != nil && msg.ID != "" {
+			if msg.Room != read.Portal.PortalKey {
+				return nil
+			}
 			targetID = string(msg.ID)
 		}
 	}
@@ -39,6 +42,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 		return nil
 	}
 
+	lc.noteOwnRead(string(read.Portal.ID), targetID)
 	reqSeq := lc.nextUntrackedReqSeq()
 	_, err := lc.callLine(ctx, func(client *line.Client) error {
 		return client.SendChatChecked(int64(reqSeq), string(read.Portal.ID), targetID)

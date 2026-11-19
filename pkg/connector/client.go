@@ -107,10 +107,13 @@ type LineClient struct {
 	forcedLogoutMu         sync.Mutex
 	forcedLogoutSent       bool
 
+	prefetchMessagesMu sync.Mutex
+
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
-	// noE2EEGroups, groupMemberCache, generatedGroupNameCache, and knownMemberChatMIDs.
+	// noE2EEGroups, groupMemberCache, generatedGroupNameCache, knownMemberChatMIDs, and ownReadTargets.
 	// Hold it only around map accesses; never across network calls.
 	cacheMu                 sync.Mutex
+	ownReadTargets          map[string]string
 	blockedUsers            map[string]bool      // mid -> true if the user has blocked this contact in LINE
 	noE2EEGroups            map[string]time.Time // chatMid -> when group E2EE failure was cached
 	contactCache            map[string]cachedContact
