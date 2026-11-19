@@ -1134,6 +1134,9 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		},
 		ExcludeChangesFromTimeline: excludeFromTimeline,
 	}
+	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
+		info.Members.PowerLevels = lineGroupPowerLevels()
+	}
 	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
 	// out from under an accept that's already in flight.
 	if selfInvitePending {
@@ -1562,6 +1565,16 @@ func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
 				Type:      bridgev2.RemoteEventChatInfoChange,
 				PortalKey: portalKey,
 				Timestamp: time.Now(),
+				PreHandleWithResultFunc: func(ctx context.Context, portal *bridgev2.Portal) *bridgev2.EventHandlingResult {
+					lc.cacheMu.Lock()
+					generatedName := lc.generatedGroupNameCache[update.chatMid]
+					lc.cacheMu.Unlock()
+					if !generatedName {
+						result := bridgev2.EventHandlingResultIgnored
+						return &result
+					}
+					return nil
+				},
 			},
 			ChatInfoChange: &bridgev2.ChatInfoChange{
 				ChatInfo: &bridgev2.ChatInfo{
