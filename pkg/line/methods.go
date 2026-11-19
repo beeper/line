@@ -1098,8 +1098,6 @@ func (c *Client) RegisterE2EEGroupKey(keyVersion int, chatMid string, members []
 	return nil
 }
 
-// ChatMembersRequest is the struct argument of inviteIntoChat, deleteOtherFromChat and
-// cancelChatInvitation.
 type ChatMembersRequest struct {
 	ReqSeq         int64    `json:"reqSeq"`
 	ChatMid        string   `json:"chatMid"`
@@ -1122,7 +1120,6 @@ func (c *Client) DeleteSelfFromChat(ctx context.Context, reqSeq int64, chatMid s
 	return c.callChatMembershipRPC(ctx, "deleteSelfFromChat", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
 }
 
-// InviteIntoRoom and LeaveRoom are the legacy room (R…) calls, which take positional arguments.
 func (c *Client) InviteIntoRoom(ctx context.Context, reqSeq int64, roomMid string, mids []string) error {
 	return c.callChatMembershipRPC(ctx, "inviteIntoRoom", reqSeq, roomMid, mids)
 }
