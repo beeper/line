@@ -4,15 +4,18 @@
 Connects to Chrome's remote debugging port and captures:
 - SSE EventSource messages (the critical piece net-log misses)
 - Thrift RPC request/response bodies
-- All LINE-domain request headers
+- All LINE-domain request headers, including the ones Chrome adds itself
+  (Network.requestWillBeSentExtraInfo)
+- Request bodies of every LINE request, binary ones (image uploads) included
+  (stored as size + sha256, and the bytes in base64 in this raw capture)
 
 Usage:
     # First, launch Chrome with --remote-debugging-port=9222
     # Then:
-    python3 scripts/line-cdp-capture.py [output.json]
+    python3 .agents/skills/line-capture/scripts/line-cdp-capture.py [output.json]
 
     # Or use the wrapper:
-    bash scripts/line-chrome-capture.sh [output_dir]
+    bash .agents/skills/line-capture/scripts/line-chrome-capture.sh [output_dir]
 """
 
 import json
@@ -21,6 +24,7 @@ import os
 import signal
 import time
 import base64
+import hashlib
 import threading
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -69,7 +73,10 @@ class CDPCapture:
         self.thrift_responses = {}  # requestId -> response body
         self.request_bodies = {}  # requestId -> request body
         self.pending_body_requests = {}  # msg_id -> (requestId, session_id)
+        self.pending_post_requests = {}  # msg_id -> requestId
+        self.extra_headers = {}  # requestId -> headers from requestWillBeSentExtraInfo
         self.sessions = {}  # sessionId -> targetInfo
+        self.target_sessions = {}  # targetId -> sessionId
 
         self.running = True
 
@@ -143,6 +150,11 @@ class CDPCapture:
         self.ws.send(json.dumps(msg))
         return mid
 
+    def release_target(self, session_id: str, target_type: str):
+        """Let a page-like target run if it is held waiting for a debugger."""
+        if target_type in ("page", "iframe", "other"):
+            self.send_to_session(session_id, "Runtime.runIfWaitingForDebugger")
+
     def handle_event(self, msg: dict):
         method = msg.get("method", "")
         params = msg.get("params", {})
@@ -162,18 +174,39 @@ class CDPCapture:
                 "maxTotalBufferSize": 100 * 1024 * 1024,
                 "maxResourceBufferSize": 10 * 1024 * 1024,
             })
+            # Windows opened by the extension (the per-group popup.html, the
+            # Settings window) can arrive held at "waiting for debugger" even
+            # with waitForDebuggerOnStart off, and Chrome does not always set
+            # waitingForDebugger on the event. Left alone they stay blank and
+            # grey out the extension with "Debugger paused in another tab".
+            # runIfWaitingForDebugger is a no-op on a running target, so send
+            # it to every page-like target whatever the flag says.
+            self.release_target(sid, ttype)
             # Track session -> target mapping
             self.sessions[sid] = target_info
+            self.target_sessions[target_info.get("targetId", "")] = sid
+            return
+
+        # A window can start waiting after attach (it attaches with an empty
+        # URL and navigates), so release again whenever its info changes.
+        if method == "Target.targetInfoChanged":
+            info = params.get("targetInfo", {})
+            sid = self.target_sessions.get(info.get("targetId", ""))
+            if sid:
+                self.release_target(sid, info.get("type", ""))
             return
 
         if method == "Target.detachedFromTarget":
             sid = params.get("sessionId", "")
             target = self.sessions.pop(sid, {})
+            self.target_sessions.pop(target.get("targetId", ""), None)
             print(f"  Detached from [{target.get('type', '?')}] {target.get('title', '?')}", file=sys.stderr)
             return
 
         if method == "Network.requestWillBeSent":
             self._on_request(params, session_id)
+        elif method == "Network.requestWillBeSentExtraInfo":
+            self._on_request_extra_info(params)
         elif method == "Network.responseReceived":
             self._on_response(params, session_id)
         elif method == "Network.loadingFinished":
@@ -186,6 +219,27 @@ class CDPCapture:
 
     def handle_response(self, msg: dict):
         mid = msg.get("id")
+        if mid in self.pending_post_requests:
+            request_id = self.pending_post_requests.pop(mid)
+            result = msg.get("result", {})
+            post_data = result.get("postData")
+            if post_data is not None:
+                # Newer Chrome flags binary bodies with base64Encoded; older
+                # ones return text only, which is lossy for binary data.
+                if result.get("base64Encoded"):
+                    raw = base64.b64decode(post_data)
+                else:
+                    raw = post_data.encode("utf-8", errors="surrogateescape")
+                self.request_bodies[request_id] = {
+                    "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "base64": base64.b64encode(raw).decode("ascii"),
+                    "text": raw.decode("utf-8") if self._is_text(raw) else None,
+                }
+            else:
+                error = msg.get("error", {}).get("message", "unavailable")
+                self.request_bodies[request_id] = {"error": error}
+            return
         if mid in self.pending_body_requests:
             request_id, session_id = self.pending_body_requests.pop(mid)
             result = msg.get("result", {})
@@ -216,15 +270,32 @@ class CDPCapture:
             "session_id": session_id,
         }
 
-        # Capture POST body for Thrift calls
-        if request.get("hasPostData") and "/thrift/" in url:
-            post_data = request.get("postData", "")
-            if post_data:
-                self.request_bodies[request_id] = post_data
+        # Request bodies: the inline postData is missing for large or binary
+        # bodies (e.g. obs/uploadProfile), so always ask for it explicitly.
+        if request.get("hasPostData"):
+            target = session_id
+            if target:
+                mid = self.send_to_session(target, "Network.getRequestPostData", {"requestId": request_id})
+            else:
+                mid = self.send("Network.getRequestPostData", {"requestId": request_id})
+            self.pending_post_requests[mid] = request_id
 
         count = len(self.requests)
         if count % 10 == 1:
             print(f"  [{count} LINE requests captured]", file=sys.stderr)
+
+    @staticmethod
+    def _is_text(raw: bytes) -> bool:
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        return b"\x00" not in raw
+
+    def _on_request_extra_info(self, params: dict):
+        """Headers as sent on the wire (Cookie, Origin, Sec-*, X-Line-* ...)."""
+        request_id = params.get("requestId")
+        self.extra_headers.setdefault(request_id, {}).update(params.get("headers", {}))
 
     def _on_response(self, params: dict, session_id: str = ""):
         request_id = params.get("requestId")
@@ -295,6 +366,8 @@ class CDPCapture:
             entry.pop("session_id", None)  # internal, don't export
             if rid in self.thrift_responses:
                 entry["response_body"] = self.thrift_responses[rid]
+            if rid in self.extra_headers:
+                entry["request_extra_headers"] = self.extra_headers[rid]
             if rid in self.request_bodies:
                 entry["request_body"] = self.request_bodies[rid]
             requests_list.append(entry)
