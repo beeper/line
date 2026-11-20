@@ -232,14 +232,16 @@ func (ll *LineEmailLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
-					Type: bridgev2.LoginInputFieldTypeUsername,
-					ID:   "email",
-					Name: "Email",
+					Type:           bridgev2.LoginInputFieldTypeUsername,
+					ID:             "email",
+					Name:           "Email",
+					AutofillDomain: "line.me",
 				},
 				{
-					Type: bridgev2.LoginInputFieldTypePassword,
-					ID:   "password",
-					Name: "Password",
+					Type:           bridgev2.LoginInputFieldTypePassword,
+					ID:             "password",
+					Name:           "Password",
+					AutofillDomain: "line.me",
 				},
 			},
 		},
@@ -334,14 +336,16 @@ func (ll *LineEmailLogin) loginErrorStep(message string) *bridgev2.LoginStep {
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
-					Type: bridgev2.LoginInputFieldTypeUsername,
-					ID:   "email",
-					Name: "Email",
+					Type:           bridgev2.LoginInputFieldTypeUsername,
+					ID:             "email",
+					Name:           "Email",
+					AutofillDomain: "line.me",
 				},
 				{
-					Type: bridgev2.LoginInputFieldTypePassword,
-					ID:   "password",
-					Name: "Password",
+					Type:           bridgev2.LoginInputFieldTypePassword,
+					ID:             "password",
+					Name:           "Password",
+					AutofillDomain: "line.me",
 				},
 			},
 		},
