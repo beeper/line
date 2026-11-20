@@ -75,6 +75,8 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if err := lc.checkLineCall(ctx); err != nil {
 		return nil, err
 	}
+	noE2EE := lc.noE2EE.Load()
+	var sticker *lineSticker
 	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
 		var err error
@@ -87,10 +89,49 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		client, res, err = callLineResultUsing(lc, ctx, client, call)
 		return res, err
 	}
+	checkSend := func() error {
+		if err := lc.checkLineCall(ctx); err != nil {
+			return err
+		}
+		if lc.noE2EE.Load() != noE2EE {
+			message := "LINE encryption settings changed while sending. Try again"
+			return bridgev2.WrapErrorInStatus(errors.New(message)).
+				WithIsCertain(true).
+				WithSendNotice(true).
+				WithMessage(message)
+		}
+		return nil
+	}
 	sendLineMessage := func(reqSeq int, lineMsg *line.Message) (*line.Message, error) {
 		var err error
 		var sentMsg *line.Message
 		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
+			if err := checkSend(); err != nil {
+				return nil, err
+			}
+			if noE2EE && sticker == nil {
+				if verifyErr := lc.verifyNoE2EE(client); verifyErr != nil {
+					if line.IsAuthError(verifyErr) {
+						return nil, verifyErr
+					}
+					message := "Could not verify LINE Letter Sealing settings. Try again"
+					if errors.Is(verifyErr, e2ee.ErrMissingOwnPrivateKey) {
+						lc.recoverMu.Lock()
+						if ctx.Err() == nil && !lc.superseded.Load() && !lc.isSessionInvalidated() && lc.noE2EE.Load() {
+							lc.markMissingE2EEKey(ctx, verifyErr)
+						}
+						lc.recoverMu.Unlock()
+						message = "LINE Letter Sealing settings changed. Reconnect LINE in Beeper before sending"
+					}
+					return nil, bridgev2.WrapErrorInStatus(verifyErr).
+						WithIsCertain(true).
+						WithSendNotice(true).
+						WithMessage(message)
+				}
+			}
+			if err := checkSend(); err != nil {
+				return nil, err
+			}
 			return client.SendMessage(int64(reqSeq), lineMsg)
 		})
 		return sentMsg, err
@@ -105,7 +146,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if !isGroup && lc.isUserBlocked(portalMid) {
 		return nil, errBlockedContact
 	}
-	var sticker *lineSticker
 	if msg.Content.MsgType == event.CapMsgSticker {
 		var bridged *event.BridgedSticker
 		if msg.Content.Info != nil {
@@ -124,8 +164,12 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		// LINE sends native stickers as metadata without an encrypted payload.
 		plainText = true
 	} else if lc.E2EE == nil {
+		return nil, wrapConvertError(errors.New("LINE encryption is not initialized"))
+	} else if noE2EE {
+		if _, _, err := lc.E2EE.MyKeyIDs(); isTerminalCryptoError(err) {
+			return nil, wrapConvertError(err)
+		}
 		plainText = true
-		lc.UserLogin.Bridge.Log.Warn().Msg("E2EE not initialized, sending as plain text")
 	} else if isGroup {
 		if lc.isGroupNoE2EE(portalMid) {
 			plainText = true

@@ -37,7 +37,7 @@ func (lq *LineQRLogin) StartWithOverride(ctx context.Context, override *bridgev2
 	}
 	lq.login.ExistingLogin, lq.login.ExistingMetadata = override, meta
 	lq.login.Certificate = meta.Certificate
-	if meta.ForceFullE2EELogin || len(meta.ExportedKeyMap) == 0 {
+	if meta.ForceFullE2EELogin || (!meta.NoE2EE && len(meta.ExportedKeyMap) == 0) {
 		lq.login.Certificate = ""
 	}
 	return lq.Start(ctx)

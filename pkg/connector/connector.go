@@ -144,6 +144,7 @@ type UserLoginMetadata struct {
 	E2EEKeyID          string            `json:"e2ee_key_id,omitempty"`
 	ExportedKeyMap     map[string]string `json:"exported_key_map,omitempty"`
 	ForceFullE2EELogin bool              `json:"force_full_e2ee_login,omitempty"`
+	NoE2EE             bool              `json:"no_e2ee,omitempty"`
 	BlockedMIDs        []string          `json:"blocked_mids,omitempty"`
 
 	BlockedRecommendationMIDs []string `json:"blocked_recommendation_mids"`
@@ -163,6 +164,7 @@ func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.User
 		HTTPClient:         &http.Client{Timeout: 10 * time.Second},
 		sessionInvalidated: meta.SessionInvalidated,
 	}
+	client.noE2EE.Store(meta.NoE2EE)
 	if err := client.loadChatDeletions(ctx); err != nil {
 		return fmt.Errorf("failed to load chat deletions: %w", err)
 	}
@@ -268,7 +270,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 		}
 		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
 	}
-	if meta.ForceFullE2EELogin || len(meta.ExportedKeyMap) == 0 {
+	if meta.ForceFullE2EELogin || (!meta.NoE2EE && len(meta.ExportedKeyMap) == 0) {
 		ll.Certificate = ""
 		if override.Bridge != nil {
 			override.Bridge.Log.Info().
@@ -752,7 +754,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	if certificate == "" && (ll.ExistingMetadata == nil || sameAccount) {
 		certificate = ll.Certificate
 	}
-	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid}
+	meta := &UserLoginMetadata{AccessToken: token, RefreshToken: refreshToken, Email: ll.Email, Password: ll.Password, Certificate: certificate, Mid: mid, NoE2EE: res.NoE2EE}
 	if sameAccount && meta.Email == "" && meta.Password == "" {
 		meta.Email, meta.Password = ll.ExistingMetadata.Email, ll.ExistingMetadata.Password
 	}
@@ -819,6 +821,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 				Mid:          mid,
 				HTTPClient:   &http.Client{Timeout: 10 * time.Second},
 			}
+			newClient.noE2EE.Store(meta.NoE2EE)
 			login.Client = newClient
 			return nil
 		},
