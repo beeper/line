@@ -65,6 +65,12 @@ func (lc *LineClient) startupReadReceipt(mid, lastSeen string, caughtUp []networ
 	}
 	receipt.PreHandleWithResultFunc = func(ctx context.Context, portal *bridgev2.Portal) *bridgev2.EventHandlingResult {
 		ignore := bridgev2.EventHandlingResultIgnored
+		lc.runMu.Lock()
+		stopped := lc.stopped
+		lc.runMu.Unlock()
+		if stopped || lc.superseded.Load() || ctx.Err() != nil {
+			return &ignore
+		}
 		fail := func(err error) *bridgev2.EventHandlingResult {
 			result := bridgev2.EventHandlingResultFailed.WithError(err)
 			return &result
@@ -129,4 +135,30 @@ func (lc *LineClient) startupReadReceipt(mid, lastSeen string, caughtUp []networ
 		return nil
 	}
 	return receipt
+}
+
+func (lc *LineClient) queueCompletedBackfillReceipts(ctx context.Context, mid string, ids []networkid.MessageID) {
+	if len(ids) == 0 {
+		return
+	}
+	lc.runMu.Lock()
+	if lc.stopped || lc.superseded.Load() {
+		lc.runMu.Unlock()
+		return
+	}
+	if lc.activeRun != nil {
+		ctx = lc.activeRun.ctx
+	}
+	lc.wg.Add(1)
+	lc.runMu.Unlock()
+	ids = append([]networkid.MessageID(nil), ids...)
+	// Requeue asynchronously because completion runs inside the portal handler,
+	// which may hold the event lock or have a full bounded event queue.
+	go func() {
+		defer lc.wg.Done()
+		if ctx.Err() != nil || lc.superseded.Load() {
+			return
+		}
+		lc.queueStartupReadReceipts(ctx, map[string][]networkid.MessageID{mid: ids})
+	}()
 }

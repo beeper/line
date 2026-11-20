@@ -268,6 +268,18 @@ func (h *Handler) convertAlbumPreview(
 	}, nil
 }
 
+func AlbumPreviewPartIDs(metadata map[string]string) []networkid.PartID {
+	if strings.ToUpper(strings.TrimSpace(metadata["serviceType"])) != "AB" || parseAlbumPreviewContext(metadata).ChatID == "" {
+		return nil
+	}
+	previews, _ := parseAlbumPreviewMedias(metadata)
+	parts := make([]networkid.PartID, len(previews))
+	for i := range previews {
+		parts[i] = networkid.PartID(fmt.Sprintf("album-image-%d", i+1))
+	}
+	return parts
+}
+
 func parseAlbumPreviewContext(metadata map[string]string) albumPreviewContext {
 	previewContext := albumPreviewContext{
 		ChatID: strings.TrimSpace(metadata["chatId"]),
