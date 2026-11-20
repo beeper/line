@@ -135,6 +135,7 @@ type LineClient struct {
 }
 
 type lineClientRun struct {
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -209,7 +210,7 @@ func (lc *LineClient) isSessionInvalidated() bool {
 
 func (lc *LineClient) beginRun(parent context.Context) (context.Context, *lineClientRun, bool) {
 	ctx, cancel := context.WithCancel(parent)
-	run := &lineClientRun{cancel: cancel}
+	run := &lineClientRun{ctx: ctx, cancel: cancel}
 	lc.runMu.Lock()
 	if lc.stopped || lc.activeRun != nil {
 		lc.runMu.Unlock()

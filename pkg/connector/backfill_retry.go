@@ -17,6 +17,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
 
+	"github.com/beeper/line/pkg/connector/handlers"
 	"github.com/beeper/line/pkg/line"
 )
 
@@ -299,6 +300,17 @@ func (lc *LineClient) retryBackfillMessages(ctx context.Context, portal *bridgev
 				}
 			}
 			if converted != nil {
+				for _, pending := range lc.backfillRetryPlaceholder(msg).Parts {
+					found := false
+					for _, part := range converted.Parts {
+						found = found || part.ID == pending.ID
+					}
+					if !found {
+						pending.Content.Body = "[LINE message unavailable. Open LINE to view it.]"
+						pending.DBMetadata = &MessageMetadata{}
+						converted.Parts = append(converted.Parts, pending)
+					}
+				}
 				expected = nil
 				missing := make([]*bridgev2.ConvertedMessagePart, 0, len(converted.Parts))
 				for _, part := range converted.Parts {
@@ -513,6 +525,15 @@ func (lc *LineClient) backfillRetryPlaceholder(msg *line.Message) *bridgev2.Back
 	converted := lc.backfillRetryOverflow(msg)
 	converted.Parts[0].Content.Body = "[LINE message temporarily unavailable. Retrying.]"
 	converted.Parts[0].DBMetadata = &MessageMetadata{BackfillRetry: true}
+	if isPostNotification(msg) {
+		for _, partID := range handlers.AlbumPreviewPartIDs(msg.ContentMetadata) {
+			part := lc.backfillRetryOverflow(msg).Parts[0]
+			part.ID = partID
+			part.Content.Body = converted.Parts[0].Content.Body
+			part.DBMetadata = &MessageMetadata{BackfillRetry: true}
+			converted.Parts = append(converted.Parts, part)
+		}
+	}
 	return converted
 }
 

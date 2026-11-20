@@ -657,6 +657,9 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 		}
 	}
 	recovered := lc.retryBackfillMessages(ctx, params.Portal)
+	if unblockState == nil && !manualUnblockBackfill {
+		lc.queueCompletedBackfillReceipts(ctx, chatMID, recovered)
+	}
 	recoveredIDs := make(map[string]bool, len(recovered))
 	for _, msgID := range recovered {
 		recoveredIDs[string(msgID)] = true
@@ -731,6 +734,12 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	var completeCallback func()
 	if unblockState != nil {
 		completeCallback = unblockState.complete
+	} else if params.Forward && !manualUnblockBackfill && len(backfillMsgs) > 0 {
+		ids := make([]networkid.MessageID, 0, len(backfillMsgs))
+		for _, msg := range backfillMsgs {
+			ids = append(ids, msg.ID)
+		}
+		completeCallback = func() { lc.queueCompletedBackfillReceipts(ctx, chatMID, ids) }
 	}
 	return &bridgev2.FetchMessagesResponse{
 		Messages:         backfillMsgs,
@@ -999,8 +1008,6 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 			didQueue = lc.queueHistoricalSystemMessage(msg, int(opType))
 		} else if !lc.UserLogin.Bridge.Config.Backfill.Enabled {
 			didQueue = lc.queueIncomingMessage(msg, int(opType))
-		} else {
-			queuedMessages = append(queuedMessages, networkid.MessageID(msg.ID))
 		}
 		if didQueue {
 			queued++
