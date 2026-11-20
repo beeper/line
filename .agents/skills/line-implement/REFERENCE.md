@@ -5,8 +5,8 @@
 Start with:
 
 - `AGENTS.md` / `CLAUDE.md`
-- `.agents/commands/line-capture.md`
-- `.agents/commands/line-analyze.md`
+- `.agents/skills/line-capture/SKILL.md`
+- `.agents/skills/line-analyze/SKILL.md`
 - `.agents/commands/line-implement.md`
 - `docs/protocol/README.md`
 - `docs/protocol/endpoints/README.md`
@@ -61,7 +61,7 @@ IDs, MIDs, contacts, message bodies, media object IDs, QR/login artifacts, and
 E2EE metadata.
 
 - Use `/tmp/line-chrome-extension-capture/<timestamp>-<slug>` with `umask 077`.
-- Prefer the persistent dedicated Chrome profile created by `scripts/line-chrome-capture.sh`
+- Prefer the persistent dedicated Chrome profile created by `.agents/skills/line-capture/scripts/line-chrome-capture.sh`
   at `~/.cache/line-chrome-extension-capture/chrome-debug-profile`.
 - Ask before using the user's normal Chrome profile.
 - Ask before stopping a running bridge or invalidating an active LINE session.
@@ -88,7 +88,7 @@ Use CDP capture first because it includes SSE event bodies:
 ```bash
 umask 077
 CAPTURE_DIR="/tmp/line-chrome-extension-capture/$(date +%Y%m%d-%H%M%S)-feature-slug"
-bash scripts/line-chrome-capture.sh "$CAPTURE_DIR"
+bash .agents/skills/line-capture/scripts/line-chrome-capture.sh "$CAPTURE_DIR"
 ```
 
 The launcher stages clean unpacked copies of the LINE and Codex Chrome extension
@@ -112,15 +112,15 @@ sign-in screen, choose "Stay Signed Out" and continue to LINE login only.
 When Chrome closes:
 
 ```bash
-python3 scripts/parse-line-traffic.py "$CAPTURE_DIR/line-cdp-capture.json" "$CAPTURE_DIR/line-cdp-capture-parsed.json"
-python3 scripts/redact-line-capture.py "$CAPTURE_DIR/line-cdp-capture-parsed.json"
+python3 .agents/skills/line-analyze/scripts/parse-line-traffic.py "$CAPTURE_DIR/line-cdp-capture.json" "$CAPTURE_DIR/line-cdp-capture-parsed.json"
+python3 .agents/skills/line-analyze/scripts/redact-line-capture.py "$CAPTURE_DIR/line-cdp-capture-parsed.json"
 ```
 
 Use the net-log only as a backup:
 
 ```bash
-python3 scripts/parse-line-traffic.py "$CAPTURE_DIR/line-net-log.json" "$CAPTURE_DIR/line-net-log-parsed.json"
-python3 scripts/redact-line-capture.py "$CAPTURE_DIR/line-net-log-parsed.json"
+python3 .agents/skills/line-analyze/scripts/parse-line-traffic.py "$CAPTURE_DIR/line-net-log.json" "$CAPTURE_DIR/line-net-log-parsed.json"
+python3 .agents/skills/line-analyze/scripts/redact-line-capture.py "$CAPTURE_DIR/line-net-log-parsed.json"
 ```
 
 ## Analysis Checklist
