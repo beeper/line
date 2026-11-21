@@ -500,6 +500,11 @@ func IsInvalidPaidReactionType(err error) bool {
 		strings.Contains(msg, "invalid paidreactiontype in reactiontype")
 }
 
+func IsSticonNotOwned(err error) bool {
+	talk, ok := parseTalkException(err)
+	return ok && talk.Code == 121 && strings.Contains(strings.ToLower(talk.Reason), "not owned")
+}
+
 func hasResponseErrorCode(msg string) bool {
 	return strings.Contains(msg, "\"code\":10051") ||
 		strings.Contains(msg, "\"code\": 10051") ||
