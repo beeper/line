@@ -29,6 +29,7 @@ type DirectMedia struct {
 	Size        int      `json:"-"`
 	FileName    string   `json:"-"`
 	Duration    int      `json:"-"`
+	IsPreview   bool     `json:"-"`
 }
 
 type GenerateDirectMediaURI func(context.Context, string, *DirectMedia) (id.ContentURIString, any, error)
@@ -40,7 +41,7 @@ func newDirectMedia(
 	contentMetadata map[string]string,
 ) (*DirectMedia, error) {
 	kind = strings.ToLower(kind)
-	keys, encrypted, err := mediaDecryptionKeys(decryptedBody, contentMetadata, kind)
+	keys, _, err := mediaDecryptionKeys(decryptedBody, contentMetadata, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +59,7 @@ func newDirectMedia(
 		OBSPop:      opts.OBSPop,
 		ContentType: contentType,
 		Keys:        keys,
-		Size:        directMediaReportedSize(contentMetadata, encrypted),
+		Size:        directMediaReportedSize(contentMetadata),
 		FileName:    fileName,
 		Duration:    directMediaDuration(contentMetadata),
 	}
@@ -93,6 +94,18 @@ func (dm *DirectMedia) validate() error {
 	return nil
 }
 
+func (dm *DirectMedia) Preview() *DirectMedia {
+	preview := *dm
+	preview.IsPreview = true
+	preview.ContentType = "image/jpeg"
+	if preview.SID == "m" {
+		preview.TID = "preview"
+	} else {
+		preview.OID += "__ud-preview"
+	}
+	return &preview
+}
+
 func (h *Handler) generateDirectMedia(
 	ctx context.Context,
 	messageID string,
@@ -119,13 +132,10 @@ func (h *Handler) generateDirectMedia(
 	}}}, nil
 }
 
-func directMediaReportedSize(contentMetadata map[string]string, encrypted bool) int {
+func directMediaReportedSize(contentMetadata map[string]string) int {
 	size, err := strconv.ParseInt(strings.TrimSpace(contentMetadata["FILE_SIZE"]), 10, 64)
 	if err != nil || size <= 0 {
 		return 0
-	}
-	if encrypted && size >= encryptedMediaSizeOverhead {
-		size -= encryptedMediaSizeOverhead
 	}
 	if int64(int(size)) != size {
 		return 0
@@ -141,7 +151,8 @@ func directMediaDuration(contentMetadata map[string]string) int {
 func directMediaContent(kind, decryptedBody string, metadata map[string]string) (name, contentType string, err error) {
 	switch kind {
 	case "image":
-		return "image.jpg", "image/jpeg", nil
+		name, contentType = lineImageType(metadata)
+		return name, contentType, nil
 	case "audio":
 		return "audio.m4a", "audio/mp4", nil
 	case "video":
