@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"math/rand/v2"
 	"slices"
@@ -283,6 +284,7 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		return
 	}
 
+	dmMIDs := make([]string, 0, len(messageBoxes))
 	for _, box := range messageBoxes {
 		mid := box.ID
 		lowerMid := strings.ToLower(mid)
@@ -293,7 +295,12 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		if lc.isUserBlocked(mid) {
 			continue
 		}
-
+		dmMIDs = append(dmMIDs, mid)
+	}
+	if err := lc.fetchContacts(ctx, dmMIDs); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for DM sync")
+	}
+	for _, mid := range dmMIDs {
 		lc.queueDMChatResync(ctx, mid, false, false)
 	}
 }
@@ -342,6 +349,7 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 						EventSender: bridgev2.EventSender{
 							Sender: makeUserID(mid),
 						},
+						UserInfo:   lc.cachedUserInfo(mid),
 						Membership: event.MembershipJoin,
 						PowerLevel: ptr.Ptr(0),
 					},
@@ -932,6 +940,16 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch batch of chats")
 			continue
 		}
+		var memberMIDs []string
+		for _, chat := range chatsResp.Chats {
+			if chat.Extra.GroupExtra != nil {
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.MemberMids))
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.InviteeMids))
+			}
+		}
+		if err := lc.fetchContacts(ctx, memberMIDs); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for batch of chats")
+		}
 
 		for _, chat := range chatsResp.Chats {
 			portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
@@ -1077,6 +1095,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
+				UserInfo:         lc.cachedUserInfo(m),
 				Membership:       event.MembershipJoin,
 				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
@@ -1094,6 +1113,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
+				UserInfo:         lc.cachedUserInfo(m),
 				Membership:       membership,
 				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
@@ -1109,6 +1129,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 					EventSender: bridgev2.EventSender{
 						Sender: makeUserID(m),
 					},
+					UserInfo:         lc.cachedUserInfo(m),
 					Membership:       event.MembershipJoin,
 					MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 				})
