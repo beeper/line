@@ -107,6 +107,7 @@ type LineClient struct {
 	forcedLogoutMu         sync.Mutex
 	forcedLogoutSent       bool
 
+	contactRefreshMu   sync.Mutex
 	prefetchMessagesMu sync.Mutex
 
 	// cacheMu protects peerKeys, blockedUsers, contactCache, mediaFlowCache,
