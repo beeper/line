@@ -422,7 +422,7 @@ func (c *Client) SendMessage(reqSeq int64, msg *Message) (*Message, error) {
 		return nil, err
 	}
 	if wrapper.Code != 0 {
-		return nil, fmt.Errorf("sendMessage failed: %s", wrapper.Message)
+		return nil, fmt.Errorf("sendMessage failed: %s", resp)
 	}
 	return wrapper.Data, nil
 }
