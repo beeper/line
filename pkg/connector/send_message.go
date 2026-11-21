@@ -7,20 +7,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"image"
 	"image/jpeg"
 	"maps"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"go.mau.fi/util/ffmpeg"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
 
 	gen "github.com/beeper/line/pkg"
@@ -35,8 +36,6 @@ type mentionEntry struct {
 	M string `json:"M,omitempty"`
 	A string `json:"A,omitempty"`
 }
-
-var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
 var lineMediaSizeLimits = map[event.MessageType]int{
 	event.MsgImage: 20 * 1024 * 1024,
@@ -210,6 +209,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var payload []byte
 	var plainTextBody string // used when plainText == true for text messages
 	textBody := msg.Content.Body
+	sticonBodies := make(map[id.ContentURIString]string)
 
 	// For plain media: we send the message first, then upload media to r/talk/m/{msgId}.
 	var plainMediaData []byte // raw media data to upload after sending
@@ -248,6 +248,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			sticon, err := lc.resolveSticker(resolveCtx, mxc, nil, true)
 			if err != nil {
 				lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE emoji, sending alt text")
+			}
+			if sticon != nil {
+				sticonBodies[mxc] = sticon.Body
 			}
 			return sticon
 		})
@@ -655,17 +658,12 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	// Process mentions — set MENTION content metadata for LINE notification
-	if msg.Content.Mentions == nil {
-		msg.Content.Mentions = &event.Mentions{}
+	mentions := msg.Content.Mentions
+	if mentions == nil {
+		_, _, legacyRoomMention := findRoomMention(msg.Content.Body)
+		mentions = &event.Mentions{Room: legacyRoomMention}
 	}
-	// Detect implicit @room/@all/@everyone in body for LINE group-wide mentions
-	if !msg.Content.Mentions.Room {
-		lowerBody := strings.ToLower(msg.Content.Body)
-		if strings.Contains(lowerBody, "@room") || strings.Contains(lowerBody, "@all") || strings.Contains(lowerBody, "@everyone") {
-			msg.Content.Mentions.Room = true
-		}
-	}
-	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, msg.Content.Mentions)
+	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, mentions, sticonBodies)
 	for k, v := range mentionMeta {
 		contentMetadata[k] = v
 	}
@@ -1084,78 +1082,101 @@ func (lc *LineClient) HandleMatrixAcceptMessageRequest(ctx context.Context, msg 
 	return wrapSendError(err)
 }
 
-func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedBody string, mentions *event.Mentions) map[string]string {
+func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedBody string, mentions *event.Mentions, imageBodies ...map[id.ContentURIString]string) map[string]string {
 	if mentions == nil || (len(mentions.UserIDs) == 0 && !mentions.Room) {
 		return nil
 	}
 
 	var mentionees []mentionEntry
-
-	if mentions.Room {
-		lowerBody := strings.ToLower(body)
-		roomMentionTexts := []string{"@room", "@all", "@everyone"}
-		pos := -1
-		matchLen := 0
-		for _, text := range roomMentionTexts {
-			if p := strings.Index(lowerBody, text); p >= 0 {
-				pos = p
-				matchLen = len(text)
-				break
+	var occupied [][2]int
+	addMentionee := func(start, end int, entry mentionEntry) bool {
+		if start < 0 || start >= end || end > len(body) {
+			return false
+		}
+		for _, span := range occupied {
+			if start < span[1] && end > span[0] {
+				return false
 			}
 		}
-		if pos >= 0 {
-			start, startOK := byteIndexToUTF16Offset(body, pos)
-			end, endOK := byteIndexToUTF16Offset(body, pos+matchLen)
-			if startOK && endOK {
-				mentionees = append(mentionees, mentionEntry{
-					S: strconv.Itoa(start),
-					E: strconv.Itoa(end),
-					A: "1",
-				})
-			}
+		startUTF16, startOK := byteIndexToUTF16Offset(body, start)
+		endUTF16, endOK := byteIndexToUTF16Offset(body, end)
+		if !startOK || !endOK {
+			return false
+		}
+		entry.S = strconv.Itoa(startUTF16)
+		entry.E = strconv.Itoa(endUTF16)
+		mentionees = append(mentionees, entry)
+		occupied = append(occupied, [2]int{start, end})
+		return true
+	}
+
+	if mentions.Room {
+		if start, end, ok := findRoomMention(body); ok {
+			addMentionee(start, end, mentionEntry{A: "1"})
 		}
 	}
 
-	nameByUserID := map[string]string{}
-	if formattedBody != "" {
-		for _, m := range mentionLinkRegex.FindAllStringSubmatch(formattedBody, -1) {
-			if len(m) >= 3 {
-				nameByUserID[m[1]] = strings.TrimPrefix(html.UnescapeString(m[2]), "@")
+	mentioned := make(map[id.UserID]bool, len(mentions.UserIDs))
+	for _, userID := range mentions.UserIDs {
+		mentioned[userID] = true
+	}
+	pillUsers := make(map[id.UserID]bool, len(mentions.UserIDs))
+	pills := parseUserPills(ctx, body, formattedBody, imageBodies...)
+	labelOwners := make(map[string]id.UserID)
+	ambiguousLabels := make(map[string]bool)
+	for _, pill := range pills {
+		if pill.start >= 0 || !mentioned[pill.userID] {
+			continue
+		}
+		if _, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(pill.userID); !ok {
+			continue
+		}
+		label := strings.TrimPrefix(strings.TrimSpace(pill.text), "@")
+		if owner, ok := labelOwners[label]; ok && owner != pill.userID {
+			ambiguousLabels[label] = true
+		}
+		labelOwners[label] = pill.userID
+	}
+	for _, pill := range pills {
+		pillUsers[pill.userID] = true
+		if !mentioned[pill.userID] {
+			continue
+		}
+		mid, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(pill.userID)
+		if !ok {
+			continue
+		}
+		if pill.start < 0 {
+			if ambiguousLabels[strings.TrimPrefix(strings.TrimSpace(pill.text), "@")] {
+				continue
 			}
+			if start, end, ok := findUniquePillText(body, pill.text); ok {
+				addMentionee(start, end, mentionEntry{M: string(mid)})
+			}
+		} else {
+			addMentionee(pill.start, pill.end, mentionEntry{M: string(mid)})
 		}
 	}
 
 	for _, userID := range mentions.UserIDs {
+		if pillUsers[userID] {
+			continue
+		}
 		mid, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(userID)
 		if !ok {
 			continue
 		}
-
-		displayName := nameByUserID[string(userID)]
-
-		if displayName == "" {
-			existingGhost, err := lc.UserLogin.Bridge.GetExistingGhostByID(ctx, mid)
-			if err == nil && existingGhost != nil && existingGhost.Name != "" {
-				displayName = existingGhost.Name
-			}
-		}
-
-		if displayName == "" {
+		existingGhost, err := lc.UserLogin.Bridge.GetExistingGhostByID(ctx, mid)
+		if err != nil || existingGhost == nil || existingGhost.Name == "" {
 			continue
 		}
-
-		searchStr := "@" + displayName
-		pos := strings.Index(body, searchStr)
-		if pos >= 0 {
-			start, startOK := byteIndexToUTF16Offset(body, pos)
-			end, endOK := byteIndexToUTF16Offset(body, pos+len(searchStr))
-			if startOK && endOK {
-				mentionees = append(mentionees, mentionEntry{
-					S: strconv.Itoa(start),
-					E: strconv.Itoa(end),
-					M: string(mid),
-				})
+		searchStr := "@" + existingGhost.Name
+		for cursor := 0; cursor < len(body); {
+			start, end, ok := findWholeWord(body, cursor, searchStr)
+			if !ok || addMentionee(start, end, mentionEntry{M: string(mid)}) {
+				break
 			}
+			cursor = end
 		}
 	}
 
@@ -1174,4 +1195,174 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 	return map[string]string{
 		"MENTION": string(mentionJSON),
 	}
+}
+
+type userPill struct {
+	userID id.UserID
+	text   string
+	start  int
+	end    int
+}
+
+func parseUserPills(ctx context.Context, body, formattedBody string, imageBodies ...map[id.ContentURIString]string) []userPill {
+	if formattedBody == "" {
+		return nil
+	}
+	marker := "\x00"
+	for strings.Contains(body, marker) || strings.Contains(formattedBody, marker) {
+		marker += "\x00"
+	}
+	var pills []userPill
+	parser := *format.TextHTMLParser
+	if len(imageBodies) > 0 && len(imageBodies[0]) > 0 {
+		parser.ImageConverter = func(src, alt, _, _, _ string, isEmoji bool) string {
+			if text, ok := imageBodies[0][id.ContentURIString(src)]; ok && isEmoji {
+				return text
+			}
+			return alt
+		}
+	} else {
+		parser.LinkConverter = func(text, _ string, _ format.Context) string { return text }
+	}
+	parser.PillConverter = func(displayname, mxid, eventID string, _ format.Context) string {
+		if strings.HasPrefix(mxid, "@") && eventID == "" {
+			token := marker + strconv.Itoa(len(pills)) + marker
+			pills = append(pills, userPill{userID: id.UserID(mxid), text: displayname, start: -1})
+			return token
+		}
+		return displayname
+	}
+	plain := func(text string, _ format.Context) string { return text }
+	for candidate := range 3 {
+		if candidate == 1 {
+			parser.LinkConverter = format.MarkdownHTMLParser.LinkConverter
+		} else if candidate == 2 {
+			parser.LinkConverter = func(text, _ string, _ format.Context) string { return text }
+			parser.BoldConverter = plain
+			parser.ItalicConverter = plain
+			parser.StrikethroughConverter = plain
+			parser.UnderlineConverter = plain
+			parser.MonospaceConverter = plain
+			parser.MonospaceBlockConverter = func(text, _ string, _ format.Context) string { return text }
+		}
+		pills = nil
+		rendered := parser.Parse(formattedBody, format.NewContext(ctx))
+		if positionUserPills(body, rendered, marker, pills) {
+			return pills
+		}
+	}
+	return unpositionedPills(pills)
+}
+
+func positionUserPills(body, rendered, marker string, pills []userPill) bool {
+	cursor := len(body) - len(strings.TrimLeftFunc(body, unicode.IsSpace))
+	for i := range pills {
+		prefix, rest, ok := strings.Cut(rendered, marker+strconv.Itoa(i)+marker)
+		if !ok || !strings.HasPrefix(body[cursor:], prefix) {
+			return false
+		}
+		cursor += len(prefix)
+		text := pills[i].text
+		if !strings.HasPrefix(text, "@") && strings.HasPrefix(body[cursor:], "@"+text) {
+			text = "@" + text
+		}
+		if text == "" || !strings.HasPrefix(body[cursor:], text) {
+			return false
+		}
+		pills[i].start, pills[i].end = cursor, cursor+len(text)
+		cursor += len(text)
+		rendered = rest
+	}
+	return strings.TrimRightFunc(body[cursor:], unicode.IsSpace) == rendered
+}
+
+func unpositionedPills(pills []userPill) []userPill {
+	for i := range pills {
+		pills[i].start = -1
+	}
+	return pills
+}
+
+func findUniquePillText(body, text string) (start, end int, ok bool) {
+	text = strings.TrimPrefix(strings.TrimSpace(text), "@")
+	if text == "" {
+		return 0, 0, false
+	}
+	for offset := 0; offset < len(body); {
+		pos := strings.Index(body[offset:], text)
+		if pos < 0 {
+			break
+		}
+		candidateStart := offset + pos
+		candidateEnd := candidateStart + len(text)
+		hasAt := candidateStart > 0 && body[candidateStart-1] == '@'
+		if hasAt {
+			candidateStart--
+		}
+		before, _ := utf8.DecodeLastRuneInString(body[:candidateStart])
+		after, _ := utf8.DecodeRuneInString(body[candidateEnd:])
+		bounded := !isMentionWordRune(before) && !isMentionWordRune(after)
+		if hasAt {
+			isLatinWord := func(r rune) bool { return unicode.In(r, unicode.Latin) || unicode.IsDigit(r) || r == '_' }
+			bounded = !isLatinWord(before) && !strings.ContainsRune("._-+@", before) && !isLatinWord(after)
+		}
+		if bounded {
+			if ok {
+				return 0, 0, false
+			}
+			start, end, ok = candidateStart, candidateEnd, true
+		}
+		offset = candidateEnd
+	}
+	return
+}
+
+func findWholeWord(body string, from int, text string) (int, int, bool) {
+	for offset := from; offset < len(body); {
+		pos := strings.Index(body[offset:], text)
+		if pos < 0 {
+			break
+		}
+		start := offset + pos
+		end := start + len(text)
+		before, _ := utf8.DecodeLastRuneInString(body[:start])
+		after, _ := utf8.DecodeRuneInString(body[end:])
+		if !isMentionWordRune(before) && !isMentionWordRune(after) {
+			return start, end, true
+		}
+		offset = start + 1
+	}
+	return 0, 0, false
+}
+
+var roomMentionTexts = []string{"@room", "@all", "@everyone"}
+
+func findRoomMention(body string) (int, int, bool) {
+	lowerBody := strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, body)
+	for _, text := range roomMentionTexts {
+		for offset := 0; offset < len(lowerBody); {
+			pos := strings.Index(lowerBody[offset:], text)
+			if pos < 0 {
+				break
+			}
+			start := offset + pos
+			end := start + len(text)
+			before, _ := utf8.DecodeLastRuneInString(lowerBody[:start])
+			after, _ := utf8.DecodeRuneInString(lowerBody[end:])
+			if !isMentionWordRune(before) && !strings.ContainsRune("._-+@", before) && !isMentionWordRune(after) {
+				return start, end, true
+			}
+			offset = start + 1
+		}
+	}
+	return 0, 0, false
+}
+
+func isMentionWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
