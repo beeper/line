@@ -64,7 +64,8 @@ type Manager struct {
 
 	latestGroupKey map[string]int // chatMid -> latest groupKeyId
 	// groupSpecVersion maps chatMid -> specVersion of the latest group key
-	groupSpecVersion map[string]int
+	groupSpecVersion      map[string]int
+	decryptedGroupSenders map[int]struct{}
 
 	groupKeyLRU        []groupKeyRef
 	groupNativeObjects int
@@ -98,6 +99,8 @@ func NewManagerWithRunner(r *gen.Runner) *Manager {
 		groupSessionChannels: make(map[string]map[int]map[int]int),
 		latestGroupKey:       make(map[string]int),
 		groupSpecVersion:     make(map[string]int),
+
+		decryptedGroupSenders: make(map[int]struct{}),
 	}
 }
 
@@ -118,6 +121,7 @@ func (m *Manager) Close() {
 	m.sequence = nil
 	m.groupKeys = nil
 	m.groupSessionChannels = nil
+	m.decryptedGroupSenders = nil
 	m.latestGroupKey = nil
 	m.groupSpecVersion = nil
 	m.groupKeyLRU = nil
@@ -752,6 +756,34 @@ func (m *Manager) WrapGroupKeyForMember(memberPubKeyB64 string, keyID int) (stri
 }
 
 func (m *Manager) DecryptGroupMessage(msg *line.Message, chatMid string) (string, int, error) {
+	pt, groupKeyID, err := m.decryptGroupMessage(msg, chatMid)
+	if err == nil {
+		if senderKeyID, errDecode := DecodeKeyID(msg.Chunks[len(msg.Chunks)-2]); errDecode == nil {
+			m.mu.Lock()
+			if m.decryptedGroupSenders != nil {
+				m.decryptedGroupSenders[senderKeyID] = struct{}{}
+			}
+			m.mu.Unlock()
+		}
+	}
+	return pt, groupKeyID, err
+}
+
+func (m *Manager) HasDecryptedGroupSender(msg *line.Message) bool {
+	if len(msg.Chunks) < 5 {
+		return false
+	}
+	senderKeyID, err := DecodeKeyID(msg.Chunks[len(msg.Chunks)-2])
+	if err != nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.decryptedGroupSenders[senderKeyID]
+	return ok
+}
+
+func (m *Manager) decryptGroupMessage(msg *line.Message, chatMid string) (string, int, error) {
 	// Group chunks: [..., groupKeyID(4), ???]
 	// JS: vF365(t, n, r); n=myKeyID, r=groupKeyID.
 	// chunks = [first, body, tag, senderKeyID, groupKeyID]
