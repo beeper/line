@@ -30,6 +30,8 @@ const (
 
 const OpNotifiedDeleteOtherFromChat OperationType = 133
 
+const OpNotifiedUpdateProfile OperationType = 2
+
 const (
 	OpAcceptChatInvitation OperationType = 129
 	OpRejectChatInvitation OperationType = 131

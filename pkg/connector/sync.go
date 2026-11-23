@@ -1941,37 +1941,12 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		// is never useful; without batch sending, restore the empty room instead.
 		lc.queueUnblockedDMRestore(ctx, mid, "op_unblock")
 
-	case OpContactUpdate:
-		mid := op.Param1
-		lc.cacheMu.Lock()
-		delete(lc.contactCache, mid)
-		lc.cacheMu.Unlock()
-		contact := lc.getContact(ctx, mid)
-		name := contact.EffectiveDisplayName()
-		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Str("name", name).Msg("Contact updated")
-		ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, makeUserID(mid))
-		if err == nil && ghost != nil {
-			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{
-				Identifiers: []string{mid},
-				Name:        &name,
-				Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
-			})
-		}
-		dmType := database.RoomTypeDM
-		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-			ChatInfo: &bridgev2.ChatInfo{
-				Type:   &dmType,
-				Name:   &name,
-				Avatar: lc.avatarFromPicturePath(contact.PicturePath),
-			},
-		})
-		lc.refreshGroupsForContact(ctx, mid)
+	case OpContactUpdate, OpNotifiedUpdateProfile:
+		lc.wg.Add(1)
+		go func() {
+			defer lc.wg.Done()
+			lc.refreshContact(context.Background(), op.Param1)
+		}()
 
 	case OpDeleteSelfFromChat:
 		lc.handleSelfLeave(op.Param1)
@@ -2209,6 +2184,44 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}
 		logEvt.Msg("Unhandled SSE operation")
 	}
+}
+
+func (lc *LineClient) refreshContact(ctx context.Context, mid string) {
+	lc.contactRefreshMu.Lock()
+	defer lc.contactRefreshMu.Unlock()
+	lc.cacheMu.Lock()
+	delete(lc.contactCache, mid)
+	lc.cacheMu.Unlock()
+	contact := lc.getContact(ctx, mid)
+	name := contact.EffectiveDisplayName()
+	if name == mid {
+		lc.UserLogin.Bridge.Log.Warn().Str("mid", mid).Msg("Failed to fetch updated contact")
+		return
+	}
+	lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Str("name", name).Msg("Contact updated")
+	ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, makeUserID(mid))
+	if err == nil && ghost != nil {
+		ghost.UpdateInfo(ctx, &bridgev2.UserInfo{
+			Identifiers: []string{mid},
+			Name:        &name,
+			Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
+		})
+	}
+	dmType := database.RoomTypeDM
+	portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventChatResync,
+			PortalKey: portalKey,
+			Timestamp: time.Now(),
+		},
+		ChatInfo: &bridgev2.ChatInfo{
+			Type:   &dmType,
+			Name:   &name,
+			Avatar: lc.avatarFromPicturePath(contact.PicturePath),
+		},
+	})
+	lc.refreshGroupsForContact(ctx, mid)
 }
 
 func (lc *LineClient) prepareReadReceiptFallback(ctx context.Context, portal *bridgev2.Portal, receipt *simplevent.Receipt) {
