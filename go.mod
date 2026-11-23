@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/disintegration/imaging v1.6.2
 	github.com/mattn/go-sqlite3 v1.14.53
+	github.com/nyaruka/phonenumbers v1.7.4
 	github.com/rs/zerolog v1.35.1
 	github.com/u2takey/ffmpeg-go v0.5.0
 	go.mau.fi/util v0.11.1
@@ -42,6 +43,7 @@ require (
 	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	maunium.net/go/mauflag v1.0.0 // indirect

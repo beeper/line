@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nyaruka/phonenumbers"
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 
@@ -411,39 +412,20 @@ func (lc *LineClient) setCachedContact(mid string, contact line.Contact) {
 
 var lineUserMIDRegex = regexp.MustCompile(`^[Uu][A-Za-z0-9_-]{32,}$`)
 
-var twoDigitCountryCodes = map[string]bool{
-	"20": true, "27": true, "30": true, "31": true, "32": true, "33": true, "34": true, "36": true, "39": true,
-	"40": true, "41": true, "43": true, "44": true, "45": true, "46": true, "47": true, "48": true, "49": true,
-	"51": true, "52": true, "53": true, "54": true, "55": true, "56": true, "57": true, "58": true,
-	"60": true, "61": true, "62": true, "63": true, "64": true, "65": true, "66": true,
-	"81": true, "82": true, "84": true, "86": true, "90": true, "91": true, "92": true, "93": true, "94": true, "95": true, "98": true,
-}
-
 func linePhoneQuery(identifier string) (string, bool) {
-	rest, ok := strings.CutPrefix(identifier, "+")
-	if !ok {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(identifier), "tel:")
+	if !strings.HasPrefix(trimmed, "+") {
 		return "", false
 	}
-	digits := strings.Map(func(r rune) rune {
-		switch {
-		case r >= '0' && r <= '9':
-			return r
-		case r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
-			return -1
-		default:
-			return 'x'
-		}
-	}, rest)
-	if strings.Contains(digits, "x") || len(digits) < 6 || len(digits) > 15 {
+	cleaned, err := bridgev2.CleanPhoneNumber(trimmed)
+	if err != nil {
 		return "", false
 	}
-	ccLength := 3
-	if digits[0] == '1' || digits[0] == '7' {
-		ccLength = 1
-	} else if twoDigitCountryCodes[digits[:2]] {
-		ccLength = 2
+	num, err := phonenumbers.Parse(cleaned, "")
+	if err != nil || !phonenumbers.IsPossibleNumber(num) {
+		return "", false
 	}
-	return "+" + digits[:ccLength] + " " + digits[ccLength:], true
+	return fmt.Sprintf("+%d %s", num.GetCountryCode(), phonenumbers.GetNationalSignificantNumber(num)), true
 }
 
 func isInvalidUseridError(err error) bool {
