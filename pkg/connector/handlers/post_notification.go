@@ -29,6 +29,10 @@ type postPreviewMedia struct {
 type albumPreviewContext struct {
 	ChatID  string
 	AlbumID string
+
+	CreatedTime       string
+	PreviewCount      int
+	FromPreviewMedias bool
 }
 
 // ConvertPostNotification converts a LINE note, album, or unknown post
@@ -85,7 +89,7 @@ func (h *Handler) ConvertPostNotification(
 		return converted, nil
 	}
 
-	previewMedias, parseErr := parseAlbumPreviewMedias(data.ContentMetadata)
+	previewMedias, fromPreviewMedias, parseErr := parseAlbumPreviewMedias(data.ContentMetadata)
 	if parseErr != nil {
 		h.Log.Warn().
 			Err(parseErr).
@@ -96,6 +100,9 @@ func (h *Handler) ConvertPostNotification(
 		return converted, nil
 	}
 	previewContext := parseAlbumPreviewContext(data.ContentMetadata)
+	previewContext.CreatedTime = data.CreatedTime.String()
+	previewContext.PreviewCount = len(previewMedias)
+	previewContext.FromPreviewMedias = fromPreviewMedias
 	if previewContext.ChatID == "" {
 		h.Log.Warn().
 			Str("msg_id", data.ID).
@@ -226,6 +233,11 @@ func (h *Handler) convertAlbumPreview(
 		h.Log.Warn().
 			Str("msg_id", messageID).
 			Str("media_oid", media.OID).
+			Str("created_time", previewContext.CreatedTime).
+			Int("preview_index", index).
+			Int("preview_count", previewContext.PreviewCount).
+			Bool("from_preview_medias", previewContext.FromPreviewMedias).
+			Bool("has_album_id", previewContext.AlbumID != "").
 			Msg("LINE album preview image expired before it could be bridged")
 		return nil, nil
 	} else if err != nil {
@@ -287,9 +299,9 @@ func parseAlbumPreviewContext(metadata map[string]string) albumPreviewContext {
 	return previewContext
 }
 
-func parseAlbumPreviewMedias(metadata map[string]string) ([]postPreviewMedia, error) {
+func parseAlbumPreviewMedias(metadata map[string]string) ([]postPreviewMedia, bool, error) {
 	if metadata == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	var parsed []postPreviewMedia
@@ -318,6 +330,7 @@ func parseAlbumPreviewMedias(metadata map[string]string) ([]postPreviewMedia, er
 		medias = append(medias, media)
 	}
 
+	fromPreviewMedias := len(medias) > 0
 	// LINE duplicates the first preview in the top-level metadata. Only use it
 	// when previewMedias was absent, malformed, or had no supported images.
 	if len(medias) == 0 {
@@ -332,7 +345,7 @@ func parseAlbumPreviewMedias(metadata map[string]string) ([]postPreviewMedia, er
 			})
 		}
 	}
-	return medias, parseErr
+	return medias, fromPreviewMedias, parseErr
 }
 
 func albumPreviewImageType(data []byte) (mimeType, extension string) {

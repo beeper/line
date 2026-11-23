@@ -8,6 +8,7 @@ const (
 	OpReceiveMessage         OperationType = 26
 	OpSendChatChecked        OperationType = 40
 	OpSendChatRemoved        OperationType = 41
+	OpSendContent            OperationType = 43
 	OpContactUpdate          OperationType = 49
 	OpReadReceipt            OperationType = 55
 	OpNotifiedJoinChat       OperationType = 60
@@ -30,6 +31,11 @@ const (
 const OpNotifiedDeleteOtherFromChat OperationType = 133
 
 const OpNotifiedUpdateProfile OperationType = 2
+
+const (
+	OpAcceptChatInvitation OperationType = 129
+	OpRejectChatInvitation OperationType = 131
+)
 
 // ContentType values for LINE messages.
 type ContentType int

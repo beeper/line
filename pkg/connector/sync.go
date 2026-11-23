@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"math/rand/v2"
 	"slices"
@@ -39,12 +40,13 @@ const (
 	unblockBackfillFrameworkCompletionTimeout = 2 * time.Minute
 	groupPortalCreateWait                     = 30 * time.Second
 	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
-	defaultReceiveAuthProbeInterval           = 150 * time.Second
 	maxReconnectDelay                         = 5 * time.Minute
 )
 
 var (
-	errReceiveAuthProbeDue               = errors.New("receive auth probe due")
+	errSSEReconnect                      = errors.New("SSE reconnect requested")
+	errSSEResync                         = errors.New("SSE resync with new revision")
+	errSSEStop                           = errors.New("SSE session ended")
 	errUnblockBackfillHandledByFramework = errors.New("unblock backfill handled by framework")
 )
 
@@ -109,12 +111,7 @@ var (
 	listenSSEWithClient = func(client *line.Client, ctx context.Context, localRev int64, handler func(eventType, data string)) error {
 		return client.ListenSSE(ctx, localRev, handler)
 	}
-	sseReconnectDelay          = 3 * time.Second
-	receiveAuthProbeInterval   = defaultReceiveAuthProbeInterval
-	receiveAuthProbeNow        = time.Now
-	newReceiveAuthProbeContext = func(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
-		return context.WithDeadlineCause(parent, deadline, errReceiveAuthProbeDue)
-	}
+	sseReconnectDelay        = 3 * time.Second
 	runSilentUnblockBackfill = func(ctx context.Context, lc *LineClient, mid string) {
 		lc.silentBackfillRecentMessages(ctx, mid, startupBackfillMessageLimit)
 	}
@@ -283,6 +280,7 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		return
 	}
 
+	dmMIDs := make([]string, 0, len(messageBoxes))
 	for _, box := range messageBoxes {
 		mid := box.ID
 		lowerMid := strings.ToLower(mid)
@@ -293,7 +291,12 @@ func (lc *LineClient) syncDMChats(ctx context.Context) {
 		if lc.isUserBlocked(mid) {
 			continue
 		}
-
+		dmMIDs = append(dmMIDs, mid)
+	}
+	if err := lc.fetchContacts(ctx, dmMIDs); err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for DM sync")
+	}
+	for _, mid := range dmMIDs {
 		lc.queueDMChatResync(ctx, mid, false, false)
 	}
 }
@@ -342,6 +345,7 @@ func (lc *LineClient) queueDMChatResync(ctx context.Context, mid string, createP
 						EventSender: bridgev2.EventSender{
 							Sender: makeUserID(mid),
 						},
+						UserInfo:   lc.cachedUserInfo(mid),
 						Membership: event.MembershipJoin,
 						PowerLevel: ptr.Ptr(0),
 					},
@@ -932,6 +936,16 @@ func (lc *LineClient) syncChatsNow(ctx context.Context) {
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch batch of chats")
 			continue
 		}
+		var memberMIDs []string
+		for _, chat := range chatsResp.Chats {
+			if chat.Extra.GroupExtra != nil {
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.MemberMids))
+				memberMIDs = slices.AppendSeq(memberMIDs, maps.Keys(chat.Extra.GroupExtra.InviteeMids))
+			}
+		}
+		if err := lc.fetchContacts(ctx, memberMIDs); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for batch of chats")
+		}
 
 		for _, chat := range chatsResp.Chats {
 			portalKey := networkid.PortalKey{ID: makePortalID(chat.ChatMid), Receiver: lc.UserLogin.ID}
@@ -1048,6 +1062,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 
 	var groupMemberMids []string
 	selfInvitePending := false
+	selfIsGroupMember := false
 	if chat.Extra.GroupExtra != nil {
 		if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
 			members[0].PowerLevel = ptr.Ptr(100)
@@ -1059,11 +1074,13 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 		// created as a normal joined room rather than a request. Don't mark self as
 		// MembershipInvite: on Beeper an invite-membership self user is excluded from the room
 		// entirely (getInitialMemberList skips non-join members), so the room would never appear.
-		if _, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]; !isMember && chat.Type == 0 {
+		_, isMember := chat.Extra.GroupExtra.MemberMids[lc.Mid]
+		if !isMember && chat.Type == 0 {
 			if _, isInvitee := chat.Extra.GroupExtra.InviteeMids[lc.Mid]; isInvitee {
 				selfInvitePending = true
 			}
 		}
+		selfIsGroupMember = isMember && chat.Type == 0
 
 		// Populate group member cache for fallback use when GetChats
 		// returns empty MemberMids (known LINE API issue).
@@ -1077,6 +1094,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
+				UserInfo:         lc.cachedUserInfo(m),
 				Membership:       event.MembershipJoin,
 				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
@@ -1094,6 +1112,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 				EventSender: bridgev2.EventSender{
 					Sender: makeUserID(m),
 				},
+				UserInfo:         lc.cachedUserInfo(m),
 				Membership:       membership,
 				MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 			})
@@ -1109,6 +1128,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 					EventSender: bridgev2.EventSender{
 						Sender: makeUserID(m),
 					},
+					UserInfo:         lc.cachedUserInfo(m),
 					Membership:       event.MembershipJoin,
 					MemberEventExtra: hiddenMemberEventExtra(excludeFromTimeline),
 				})
@@ -1158,10 +1178,11 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
 		info.Members.PowerLevels = lineGroupPowerLevels()
 	}
-	// Leave MessageRequest nil for non-invite chats so a racing resync can't clear the flag
-	// out from under an accept that's already in flight.
+	// GetChats can omit self from both lists, so only confirmed membership clears a request.
 	if selfInvitePending {
 		info.MessageRequest = ptr.Ptr(true)
+	} else if selfIsGroupMember {
+		info.MessageRequest = ptr.Ptr(false)
 	}
 	return info
 }
@@ -1606,26 +1627,6 @@ func (lc *LineClient) refreshGroupsForContact(ctx context.Context, mid string) {
 	}
 }
 
-func startReceiveAuthProbeContext(parent context.Context, startedAt time.Time) (context.Context, context.CancelFunc, time.Time) {
-	if receiveAuthProbeInterval <= 0 {
-		return parent, func() {}, time.Time{}
-	}
-
-	nextProbeAt := startedAt.Add(receiveAuthProbeInterval)
-	if now := receiveAuthProbeNow(); !nextProbeAt.After(now) {
-		nextProbeAt = now.Add(receiveAuthProbeInterval)
-	}
-	receiveCtx, cancel := newReceiveAuthProbeContext(parent, nextProbeAt)
-	return receiveCtx, cancel, nextProbeAt
-}
-
-func isReceiveAuthProbeDue(receiveCtx context.Context, nextProbeAt time.Time) bool {
-	if receiveAuthProbeInterval <= 0 {
-		return false
-	}
-	return errors.Is(context.Cause(receiveCtx), errReceiveAuthProbeDue) || !receiveAuthProbeNow().Before(nextProbeAt)
-}
-
 type reconnectBackoff struct {
 	delay time.Duration
 }
@@ -1674,46 +1675,47 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		lc.UserLogin.Bridge.Log.Info().Int64("local_rev", localRev).Msg("Seeded local revision from getLastOpRevision")
 	}
 
-	receiveCtx, cancelReceive, nextProbeAt := startReceiveAuthProbeContext(ctx, receiveAuthProbeNow())
-	defer func() {
-		cancelReceive()
-	}()
-	probeAndReschedule := func() bool {
-		probeStartedAt := receiveAuthProbeNow()
-		if lc.handleReceiveAuthProbe(ctx) || ctx.Err() != nil {
-			return true
-		}
-		cancelReceive()
-		receiveCtx, cancelReceive, nextProbeAt = startReceiveAuthProbeContext(ctx, probeStartedAt)
-		return false
-	}
-
+	var listenCtx context.Context
+	var cancelListen context.CancelCauseFunc
 	sseDisconnected := false
-	var backoff reconnectBackoff
+	var backoff, requestedBackoff reconnectBackoff
 	handler := func(eventType, data string) {
 		backoff.reset()
+		if eventType != line.SSEEventOpen && eventType != "reconnect" && eventType != "talkException" {
+			requestedBackoff.reset()
+		}
 		if sseDisconnected && lc.sendSSEConnectedIfCurrent(ctx) {
 			sseDisconnected = false
 		}
 
-		// handle keep alives
-		if eventType == line.SSEEventOpen || eventType == "ping" || eventType == "connInfoRevision" {
-			return
-		}
-
-		// handle fullsync requests
-		if eventType == "fullSync" {
+		switch eventType {
+		case line.SSEEventOpen, "ping", "connInfoRevision":
+		case "reconnect":
+			lc.UserLogin.Bridge.Log.Debug().Msg("LINE asked to reconnect the operation stream")
+			cancelListen(errSSEReconnect)
+		case "talkException":
+			err := line.NewSSETalkException(data)
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Received talkException on the operation stream")
+			if !line.IsAuthError(err) {
+				return
+			} else if lc.handleReceiveAuthError(ctx, client, err) {
+				cancelListen(errSSEStop)
+			} else {
+				cancelListen(errSSEReconnect)
+			}
+		case "fullSync":
 			lc.UserLogin.Bridge.Log.Info().Msg("Received fullSync request")
 
+			revUpdated := false
 			var fsPayload struct {
 				NextRevision string `json:"nextRevision"`
 			}
 			if err := json.Unmarshal([]byte(data), &fsPayload); err == nil && fsPayload.NextRevision != "" {
-				if newRev, err := strconv.ParseInt(fsPayload.NextRevision, 10, 64); err == nil {
+				if newRev, err := strconv.ParseInt(fsPayload.NextRevision, 10, 64); err == nil && newRev != localRev {
 					lc.UserLogin.Bridge.Log.Info().Int64("old", localRev).Int64("new", newRev).Msg("Updating local revision from fullSync")
 
 					localRev = newRev
-
+					revUpdated = true
 				}
 			}
 			newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
@@ -1727,11 +1729,10 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			go lc.syncChats(ctx)
 			go lc.syncDMChats(ctx)
 			go lc.prefetchMessages(ctx)
-			return
-		}
-
-		// handle operations
-		if eventType == "operation" {
+			if revUpdated {
+				cancelListen(errSSEResync)
+			}
+		case "operation":
 			var op line.Operation
 			if err := json.Unmarshal([]byte(data), &op); err != nil {
 				lc.UserLogin.Bridge.Log.Error().Err(err).Msg("Failed to unmarshal op")
@@ -1744,6 +1745,8 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 			}
 
 			lc.handleOperation(ctx, op)
+		default:
+			lc.UserLogin.Bridge.Log.Debug().Str("event_type", eventType).Str("data", data).Msg("Unhandled SSE event")
 		}
 	}
 
@@ -1751,25 +1754,21 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
-			if probeAndReschedule() {
-				return
-			}
-			continue
-		}
 
 		client = lc.newClient()
-		err := listenSSEWithClient(client, receiveCtx, localRev, handler)
+		listenCtx, cancelListen = context.WithCancelCause(ctx)
+		err := listenSSEWithClient(client, listenCtx, localRev, handler)
+		cause := context.Cause(listenCtx)
+		cancelListen(nil)
+		if ctx.Err() != nil || errors.Is(cause, errSSEStop) {
+			return
+		} else if errors.Is(cause, errSSEResync) {
+			continue
+		} else if errors.Is(cause, errSSEReconnect) {
+			waitForSSEReconnect(ctx, requestedBackoff.next())
+			continue
+		}
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isReceiveAuthProbeDue(receiveCtx, nextProbeAt) {
-				if probeAndReschedule() {
-					return
-				}
-				continue
-			}
 			if errors.Is(err, context.Canceled) {
 				return
 			}
@@ -1777,7 +1776,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("SSE Disconnected")
 
 				if line.IsSSEIdleTimeout(err) {
-					if probeAndReschedule() {
+					if lc.handleReceiveAuthProbe(ctx) || ctx.Err() != nil {
 						return
 					}
 				} else if line.IsAuthError(err) && lc.handleReceiveAuthError(ctx, client, err) {
@@ -1787,9 +1786,7 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 					sseDisconnected = true
 				}
 			}
-			if !waitForSSEReconnect(receiveCtx, backoff.next()) {
-				continue
-			}
+			waitForSSEReconnect(ctx, backoff.next())
 		}
 	}
 }
@@ -1963,7 +1960,7 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			return
 		}
 		lc.reqSeqMu.Unlock()
-		lc.handleSelfLeave(op.Param1)
+		lc.handleChatRemovedElsewhere(ctx, op)
 
 	case OpDeleteOtherFromChat:
 		lc.handleMemberLeave(op.Param1, op.Param2)
@@ -1992,12 +1989,29 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpCancelInvitation:
 		lc.handleMemberLeave(op.Param1, op.Param3)
 
+	case OpAcceptChatInvitation:
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatResync,
+				PortalKey: networkid.PortalKey{ID: makePortalID(op.Param1), Receiver: lc.UserLogin.ID},
+			},
+			ChatInfo: &bridgev2.ChatInfo{MessageRequest: ptr.Ptr(false)},
+		})
+
+	case OpRejectChatInvitation:
+		if lc.consumeSentReqSeq(op.ReqSeq) {
+			return
+		}
+		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatDelete{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatDelete,
+				PortalKey: networkid.PortalKey{ID: makePortalID(op.Param1), Receiver: lc.UserLogin.ID},
+			},
+			OnlyForMe: true,
+		})
+
 	case OpInviteIntoChat, OpNotifiedInviteIntoChat:
-		lc.wg.Add(1)
-		go func() {
-			defer lc.wg.Done()
-			lc.handleInvite(context.Background(), op.Param1, OperationType(op.Type))
-		}()
+		lc.handleInvite(ctx, op.Param1, OperationType(op.Type))
 
 	case OpChatUpdate, OpChatUpdate2:
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", op.Param1).Int("op_type", op.Type).Msg("Received chat update operation")
@@ -2141,8 +2155,12 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 			lc.handlePaidReaction(ctx, op, param2)
 		}()
 
-	case OpSendMessage, OpReceiveMessage:
+	case OpSendMessage, OpReceiveMessage, OpSendContent:
 		if op.Message != nil {
+			isOBSMedia := isOBSMediaContentType(ContentType(op.Message.ContentType))
+			if (opType == OpSendMessage && isOBSMedia) || (opType == OpSendContent && !isOBSMedia) {
+				return
+			}
 			if lc.shouldSkipDeletedChat(portalMIDForMessage(op.Message, op.Type), op.Message.ID) {
 				return
 			}

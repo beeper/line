@@ -3,6 +3,7 @@ package line
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,23 @@ var sseIdleTimeout = defaultSSEIdleTimeout
 
 func IsSSEIdleTimeout(err error) bool {
 	return errors.Is(err, ErrSSEIdleTimeout)
+}
+
+// NewSSETalkException wraps a talkException event from the operation stream in
+// the envelope Talk API errors use, so the same error classifiers apply to it.
+func NewSSETalkException(data string) error {
+	var exception map[string]any
+	if err := json.Unmarshal([]byte(data), &exception); err != nil || exception == nil {
+		return fmt.Errorf("SSE talkException: %s", data)
+	}
+	if _, ok := exception["name"]; !ok {
+		exception["name"] = "TalkException"
+	}
+	body, err := json.Marshal(map[string]any{"code": 10051, "message": "RESPONSE_ERROR", "data": exception})
+	if err != nil {
+		return fmt.Errorf("SSE talkException: %s", data)
+	}
+	return fmt.Errorf("SSE talkException: %s", body)
 }
 
 // ListenSSE connects to the Event Stream and blocks
@@ -99,7 +117,7 @@ func (c *Client) ListenSSE(ctx context.Context, localRev int64, callback func(ev
 			return
 		}
 		data := strings.Join(dataLines, "\n")
-		if data != "" && data != "null" {
+		if (data != "" && data != "null") || currentEvent == "ping" || currentEvent == "reconnect" {
 			eventType := currentEvent
 			if eventType == "" {
 				eventType = "operation"

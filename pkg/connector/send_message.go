@@ -11,6 +11,7 @@ import (
 	"image"
 	"image/jpeg"
 	"maps"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -75,6 +76,8 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if err := lc.checkLineCall(ctx); err != nil {
 		return nil, err
 	}
+	noE2EE := lc.noE2EE.Load()
+	var sticker *lineSticker
 	client := lc.newClient()
 	callLineErr := func(call func(*line.Client) error) error {
 		var err error
@@ -87,10 +90,49 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		client, res, err = callLineResultUsing(lc, ctx, client, call)
 		return res, err
 	}
+	checkSend := func() error {
+		if err := lc.checkLineCall(ctx); err != nil {
+			return err
+		}
+		if lc.noE2EE.Load() != noE2EE {
+			message := "LINE encryption settings changed while sending. Try again"
+			return bridgev2.WrapErrorInStatus(errors.New(message)).
+				WithIsCertain(true).
+				WithSendNotice(true).
+				WithMessage(message)
+		}
+		return nil
+	}
 	sendLineMessage := func(reqSeq int, lineMsg *line.Message) (*line.Message, error) {
 		var err error
 		var sentMsg *line.Message
 		client, sentMsg, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) (*line.Message, error) {
+			if err := checkSend(); err != nil {
+				return nil, err
+			}
+			if noE2EE && sticker == nil {
+				if verifyErr := lc.verifyNoE2EE(client); verifyErr != nil {
+					if line.IsAuthError(verifyErr) {
+						return nil, verifyErr
+					}
+					message := "Could not verify LINE Letter Sealing settings. Try again"
+					if errors.Is(verifyErr, e2ee.ErrMissingOwnPrivateKey) {
+						lc.recoverMu.Lock()
+						if ctx.Err() == nil && !lc.superseded.Load() && !lc.isSessionInvalidated() && lc.noE2EE.Load() {
+							lc.markMissingE2EEKey(ctx, verifyErr)
+						}
+						lc.recoverMu.Unlock()
+						message = "LINE Letter Sealing settings changed. Reconnect LINE in Beeper before sending"
+					}
+					return nil, bridgev2.WrapErrorInStatus(verifyErr).
+						WithIsCertain(true).
+						WithSendNotice(true).
+						WithMessage(message)
+				}
+			}
+			if err := checkSend(); err != nil {
+				return nil, err
+			}
 			return client.SendMessage(int64(reqSeq), lineMsg)
 		})
 		return sentMsg, err
@@ -105,7 +147,6 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if !isGroup && lc.isUserBlocked(portalMid) {
 		return nil, errBlockedContact
 	}
-	var sticker *lineSticker
 	if msg.Content.MsgType == event.CapMsgSticker {
 		var bridged *event.BridgedSticker
 		if msg.Content.Info != nil {
@@ -124,8 +165,12 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		// LINE sends native stickers as metadata without an encrypted payload.
 		plainText = true
 	} else if lc.E2EE == nil {
+		return nil, wrapConvertError(errors.New("LINE encryption is not initialized"))
+	} else if noE2EE {
+		if _, _, err := lc.E2EE.MyKeyIDs(); isTerminalCryptoError(err) {
+			return nil, wrapConvertError(err)
+		}
 		plainText = true
-		lc.UserLogin.Bridge.Log.Warn().Msg("E2EE not initialized, sending as plain text")
 	} else if isGroup {
 		if lc.isGroupNoE2EE(portalMid) {
 			plainText = true
@@ -193,7 +238,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// For non-text messages, check with the server whether to use E2EE or plain media upload.
 	// This must happen before media processing since it affects the upload path.
 	useE2EEMedia := !plainText
-	if useE2EEMedia && effectiveMsgType != event.MsgText {
+	if useE2EEMedia && effectiveMsgType != event.MsgText && effectiveMsgType != event.MsgLocation {
 		mediaContentType := contentTypeForMsgType(effectiveMsgType)
 		if !lc.shouldUseE2EEMediaFlow(portalMid, mediaContentType) {
 			lc.UserLogin.Bridge.Log.Info().
@@ -223,6 +268,8 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	// the raw file (some file types require ZIP, others like PDF work directly).
 	var rawFileData []byte
 	var rawFileName string
+
+	var location *line.MessageLocation
 
 	switch effectiveMsgType {
 	case event.CapMsgSticker:
@@ -650,6 +697,24 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Msg("Prepared audio message")
 		}
 
+	case event.MsgLocation:
+		lat, long, err := parseGeoURI(msg.Content.GeoURI)
+		if err != nil {
+			return nil, wrapConvertError(fmt.Errorf("invalid location: %w", err))
+		}
+		contentType = int(ContentLocation)
+		title := strings.TrimSpace(msg.Content.Body)
+		if title == "" {
+			title = "Location"
+		}
+		location = &line.MessageLocation{Title: title, Latitude: lat, Longitude: long}
+		if !plainText {
+			payload, err = json.Marshal(map[string]any{"location": location})
+			if err != nil {
+				return nil, wrapConvertError(fmt.Errorf("failed to marshal location payload: %w", err))
+			}
+		}
+
 	default:
 		return nil, fmt.Errorf("%w %s", bridgev2.ErrUnsupportedMessageType, effectiveMsgType)
 	}
@@ -764,12 +829,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		SessionID:       0,
 		CreatedTime:     json.Number(strconv.FormatInt(now, 10)),
 		ContentType:     contentType,
-		HasContent:      contentType != int(ContentText),
+		HasContent:      contentType != int(ContentText) && contentType != int(ContentLocation),
 		ContentMetadata: contentMetadata,
 	}
 
 	if plainText {
 		lineMsg.Text = plainTextBody
+		lineMsg.Location = location
 	} else {
 		lineMsg.Chunks = chunks
 		contentMetadata["e2eeVersion"] = strconv.Itoa(e2ee.ChunksVersion(chunks))
@@ -982,6 +1048,32 @@ func wrapInZip(fileName string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func parseGeoURI(uri string) (lat, long float64, err error) {
+	coordinates, ok := strings.CutPrefix(uri, "geo:")
+	if !ok {
+		return 0, 0, fmt.Errorf("uri doesn't have geo: prefix")
+	}
+	coordinates, _, _ = strings.Cut(coordinates, ";")
+	latStr, longStr, ok := strings.Cut(coordinates, ",")
+	if !ok {
+		return 0, 0, fmt.Errorf("didn't find two numbers separated by a comma")
+	}
+	longStr, _, _ = strings.Cut(longStr, ",")
+	if lat, err = strconv.ParseFloat(latStr, 64); err != nil {
+		return 0, 0, fmt.Errorf("latitude is not a number: %w", err)
+	}
+	if long, err = strconv.ParseFloat(longStr, 64); err != nil {
+		return 0, 0, fmt.Errorf("longitude is not a number: %w", err)
+	}
+	if math.IsNaN(lat) || math.IsInf(lat, 0) || lat < -90 || lat > 90 {
+		return 0, 0, fmt.Errorf("latitude is outside [-90,90]")
+	}
+	if math.IsNaN(long) || math.IsInf(long, 0) || long < -180 || long > 180 {
+		return 0, 0, fmt.Errorf("longitude is outside [-180,180]")
+	}
+	return lat, long, nil
 }
 
 func isLineAudioFormat(mimeType string) bool {

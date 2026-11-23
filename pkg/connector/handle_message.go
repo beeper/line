@@ -155,7 +155,7 @@ func (lc *LineClient) queueIncomingMessage(msg *line.Message, opType int) bool {
 			LogContext:   func(c zerolog.Context) zerolog.Context { return c.Str("msg_id", msg.ID) },
 			PortalKey:    portalKey,
 			CreatePortal: true,
-			Sender:       bridgev2.EventSender{Sender: senderID, IsFromMe: OperationType(opType) == OpSendMessage},
+			Sender:       bridgev2.EventSender{Sender: senderID, IsFromMe: isOwnMessageOp(opType)},
 			Timestamp:    ts,
 			PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
 				lc.hiddenJoinGroupMessageSender(ctx, portal, portalIDStr, msg.From, ts)
@@ -219,8 +219,8 @@ func isPostNotification(msg *line.Message) bool {
 // portalMIDForMessage returns the chat MID that owns a message (the portal key).
 func portalMIDForMessage(msg *line.Message, opType int) string {
 	portalIDStr := msg.From
-	// If I sent it (Type 25), the portal is the recipient (msg.To)
-	if OperationType(opType) == OpSendMessage {
+	// If I sent it (Type 25 or 43), the portal is the recipient (msg.To)
+	if isOwnMessageOp(opType) {
 		portalIDStr = msg.To
 	}
 	// If it's a group (ToType 1 or 2), the portal is msg.To
@@ -228,6 +228,18 @@ func portalMIDForMessage(msg *line.Message, opType int) string {
 		portalIDStr = msg.To
 	}
 	return portalIDStr
+}
+
+func isOwnMessageOp(opType int) bool {
+	return OperationType(opType) == OpSendMessage || OperationType(opType) == OpSendContent
+}
+
+func isOBSMediaContentType(contentType ContentType) bool {
+	switch contentType {
+	case ContentImage, ContentVideo, ContentAudio, ContentFile:
+		return true
+	}
+	return false
 }
 
 // parseMessageTimestamp converts a LINE message's CreatedTime to a time.Time,
@@ -273,7 +285,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 				// Group Decryption
 				if len(msg.Chunks) >= 5 {
 					if gkID, err := e2ee.DecodeKeyID(msg.Chunks[len(msg.Chunks)-1]); err == nil && gkID != 0 {
-						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, gkID); errFetch != nil {
+						if errFetch := lc.ensureGroupKey(context.Background(), portalIDStr, gkID); errFetch != nil {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Prefetch group key before decrypt failed")
 						}
@@ -288,7 +300,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 					groupDecryptLogContext(lc.UserLogin.Bridge.Log.Debug().Err(err), msg, portalIDStr, opType).
 						Msg("DecryptGroupMessage failed")
 					if !isTerminalCryptoError(err) && keyID != 0 {
-						if errFetch := lc.fetchAndUnwrapGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
+						if errFetch := lc.ensureGroupKey(context.Background(), portalIDStr, keyID); errFetch != nil {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errFetch), msg, portalIDStr, opType).
 								Msg("Failed to fetch/unwrap group key")
 							lc.markMissingE2EEKey(context.Background(), errFetch)
@@ -297,6 +309,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 							decryptionFailed = false
 						} else {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
+								Bool("sender_key_decrypted_before", lc.E2EE.HasDecryptedGroupSender(msg)).
 								Msg("DecryptGroupMessage failed after group key refresh")
 						}
 					}
@@ -423,7 +436,7 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 
 	// Handle call events (ORGCONTP == "CALL")
 	if data.ContentMetadata["ORGCONTP"] == "CALL" {
-		return h.ConvertCall(data, replyRelatesTo)
+		return h.ConvertCall(data, replyRelatesTo, lc.isOwnMID(data.From))
 	}
 
 	// Dispatch to content-type-specific handlers
@@ -441,7 +454,7 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 	case ContentLocation:
 		return h.ConvertLocation(data, decryptedBody, replyRelatesTo)
 	case ContentContact:
-		return h.ConvertContact(data, replyRelatesTo)
+		return h.ConvertContact(data, lc.contactCardMXID(data.ContentMetadata["mid"]), replyRelatesTo)
 	case ContentFlex:
 		return h.ConvertFlex(data, replyRelatesTo)
 	case ContentHTML:
@@ -596,6 +609,15 @@ func (lc *LineClient) convertLineMessage(ctx context.Context, portal *bridgev2.P
 	}
 
 	return converted, nil
+}
+
+func (lc *LineClient) contactCardMXID(mid string) id.UserID {
+	if !isUserMID(mid) {
+		return ""
+	} else if lc.isOwnMID(mid) {
+		return lc.UserLogin.UserMXID
+	}
+	return lc.UserLogin.Bridge.Matrix.FormatGhostMXID(makeUserID(mid))
 }
 
 // resolveReplyRelatesTo looks up the Matrix event ID for a replied-to LINE message.

@@ -11,7 +11,7 @@ require (
 	golang.org/x/crypto v0.59.0
 	golang.org/x/image v0.23.0
 	golang.org/x/net v0.62.0
-	maunium.net/go/mautrix v0.33.1-0.20261117110342-a9dff577746a
+	maunium.net/go/mautrix v0.33.1-0.20261120111454-33abe66d85a0
 )
 
 require (

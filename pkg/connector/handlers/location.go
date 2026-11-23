@@ -17,19 +17,22 @@ func (h *Handler) ConvertLocation(data line.Message, decryptedBody string, relat
 	if location == nil && strings.HasPrefix(strings.TrimSpace(decryptedBody), "{") {
 		var payload struct {
 			Location *struct {
-				Title     string   `json:"title"`
-				Address   string   `json:"address"`
-				Latitude  *float64 `json:"latitude"`
-				Longitude *float64 `json:"longitude"`
+				Title     string       `json:"title"`
+				Address   string       `json:"address"`
+				Latitude  *json.Number `json:"latitude"`
+				Longitude *json.Number `json:"longitude"`
 			} `json:"location"`
 		}
 		if err := json.Unmarshal([]byte(decryptedBody), &payload); err != nil {
 			h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to parse encrypted location payload")
-		} else if loc := payload.Location; loc != nil && loc.Latitude != nil && loc.Longitude != nil &&
-			*loc.Latitude >= -90 && *loc.Latitude <= 90 && *loc.Longitude >= -180 && *loc.Longitude <= 180 {
-			location = &line.MessageLocation{
-				Title: loc.Title, Address: loc.Address,
-				Latitude: *loc.Latitude, Longitude: *loc.Longitude,
+		} else if loc := payload.Location; loc != nil && loc.Latitude != nil && loc.Longitude != nil {
+			lat, latErr := loc.Latitude.Float64()
+			long, longErr := loc.Longitude.Float64()
+			if latErr == nil && longErr == nil && lat >= -90 && lat <= 90 && long >= -180 && long <= 180 {
+				location = &line.MessageLocation{
+					Title: loc.Title, Address: loc.Address,
+					Latitude: lat, Longitude: long,
+				}
 			}
 		}
 	}

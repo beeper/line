@@ -14,6 +14,7 @@ import (
 var (
 	ErrLoginVerificationExpired = errors.New("LINE login verification expired")
 	ErrNoUsableE2EEPublicKey    = errors.New("no usable E2EE public key")
+	ErrE2EEPublicKeyDisabled    = errors.New("letter sealing is disabled")
 	ErrNoUsableE2EEGroupKey     = errors.New("no usable E2EE group key")
 	ErrGroupKeyNotFound         = errors.New("group key not found")
 	ErrMemberSettingsOff        = errors.New("member settings off")
@@ -498,6 +499,11 @@ func IsInvalidPaidReactionType(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return hasResponseErrorCode(msg) &&
 		strings.Contains(msg, "invalid paidreactiontype in reactiontype")
+}
+
+func IsSticonNotOwned(err error) bool {
+	talk, ok := parseTalkException(err)
+	return ok && talk.Code == 121 && strings.Contains(strings.ToLower(talk.Reason), "not owned")
 }
 
 func hasResponseErrorCode(msg string) bool {
