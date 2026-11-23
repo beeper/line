@@ -32,6 +32,7 @@ func init() {
 		"line-login-failed":     "LINE could not sign you in. Sign in again.",
 		"line-token-expired":    "Your LINE session expired and could not be restored. Sign in again.",
 		"line-sse-disconnected": "Disconnected from LINE, reconnecting",
+		"line-e2ee-init-failed": "LINE encryption failed to start",
 	})
 }
 
@@ -75,6 +76,7 @@ type LineClient struct {
 	Mid          string
 	HTTPClient   *http.Client
 	E2EE         *e2ee.Manager
+	noE2EE       atomic.Bool
 	peerKeys     map[string]peerKeyInfo
 
 	reqSeqMu    sync.Mutex
@@ -256,6 +258,24 @@ func (lc *LineClient) newClientWithToken(token string) *line.Client {
 	client := newLineAPIClient(token)
 	client.OBSTokenCache = &lc.obsTokenCache
 	return client
+}
+
+func (lc *LineClient) verifyNoE2EE(client *line.Client) error {
+	lc.recoverMu.Lock()
+	if lc.superseded.Load() || lc.isSessionInvalidated() {
+		lc.recoverMu.Unlock()
+		return errLineClientSuperseded
+	}
+	mid := lc.midOrFallback()
+	lc.recoverMu.Unlock()
+	_, err := client.NegotiateE2EEPublicKey(mid)
+	if errors.Is(err, line.ErrE2EEPublicKeyDisabled) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("verify own Letter Sealing status: %w", err)
+	}
+	return fmt.Errorf("%w: LINE Letter Sealing is enabled", e2ee.ErrMissingOwnPrivateKey)
 }
 
 func (lc *LineClient) avatarFromPicturePath(picturePath string) *bridgev2.Avatar {
@@ -802,14 +822,19 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 	// default. Explicitly clear that setting once per bridge connection so the
 	// user's phone continues receiving notifications.
 	lc.configurePhoneNotifications(ctx)
-	if ctx.Err() != nil || !lc.sendConnectedStateIfCurrent(ctx) {
+	if ctx.Err() != nil {
 		return false
 	}
 
-	// Initialize E2EE manager and load keys
 	mgr, err := e2ee.NewManager()
 	if err != nil {
-		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to init E2EE manager")
+		lc.UserLogin.Bridge.Log.Err(err).Msg("Failed to init E2EE manager")
+		lc.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateUnknownError,
+			Error:      "line-e2ee-init-failed",
+			Info:       map[string]any{"go_error": err.Error()},
+		})
+		return false
 	} else {
 		lc.E2EE = mgr
 		// Storage key is optional for runtime decrypt/encrypt; try it for file support
@@ -835,6 +860,48 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 				lc.UserLogin.Bridge.Log.Info().Int("exported_keys", len(meta.ExportedKeyMap)).Msg("Loaded E2EE key from DB metadata")
 			}
 		}
+		if ctx.Err() != nil {
+			return false
+		}
+		var noE2EEErr error
+		if lc.noE2EE.Load() {
+			_, noE2EEErr = lc.callLine(ctx, lc.verifyNoE2EE)
+		}
+		lc.recoverMu.Lock()
+		_, _, keyErr := mgr.MyKeyIDs()
+		if ctx.Err() != nil || lc.superseded.Load() || lc.isSessionInvalidated() || !lc.hasAccessToken() {
+			lc.recoverMu.Unlock()
+			return false
+		}
+		if isTerminalCryptoError(keyErr) {
+			lc.UserLogin.BridgeState.Send(status.BridgeState{
+				StateEvent: status.StateUnknownError,
+				Error:      "line-e2ee-init-failed",
+				Info:       map[string]any{"go_error": keyErr.Error()},
+			})
+			lc.recoverMu.Unlock()
+			return false
+		}
+		if lc.noE2EE.Load() && noE2EEErr != nil {
+			if errors.Is(noE2EEErr, e2ee.ErrMissingOwnPrivateKey) {
+				lc.markMissingE2EEKey(ctx, noE2EEErr)
+			} else {
+				lc.UserLogin.BridgeState.Send(status.BridgeState{
+					StateEvent: status.StateUnknownError,
+					Error:      "line-e2ee-init-failed",
+					Info:       map[string]any{"go_error": noE2EEErr.Error()},
+				})
+				lc.recoverMu.Unlock()
+				return false
+			}
+		}
+		if keyErr != nil && !lc.noE2EE.Load() {
+			lc.markMissingE2EEKey(ctx, fmt.Errorf("%w: %w", e2ee.ErrMissingOwnPrivateKey, keyErr))
+		}
+		lc.recoverMu.Unlock()
+	}
+	if ctx.Err() != nil || !lc.sendConnectedStateIfCurrent(ctx) {
+		return false
 	}
 
 	// Seed the last-known block list before fetching a fresh copy, so a
@@ -991,6 +1058,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		staged.RefreshToken = refreshToken
 	}
 	staged.SessionInvalidated = false
+	staged.NoE2EE = res.NoE2EE
 	staged.LogoutCode, staged.LogoutReason = 0, ""
 	if res.Mid != "" {
 		staged.Mid = res.Mid
@@ -1043,6 +1111,7 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 		*meta = previous
 		return fmt.Errorf("save recovered LINE login: %w", err)
 	}
+	lc.noE2EE.Store(staged.NoE2EE)
 	lc.setTokens(accessToken, refreshToken)
 	lc.Mid = staged.Mid
 	lc.obsTokenCache.Invalidate()

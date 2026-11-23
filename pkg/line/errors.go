@@ -14,6 +14,7 @@ import (
 var (
 	ErrLoginVerificationExpired = errors.New("LINE login verification expired")
 	ErrNoUsableE2EEPublicKey    = errors.New("no usable E2EE public key")
+	ErrE2EEPublicKeyDisabled    = errors.New("letter sealing is disabled")
 	ErrNoUsableE2EEGroupKey     = errors.New("no usable E2EE group key")
 	ErrGroupKeyNotFound         = errors.New("group key not found")
 	ErrMemberSettingsOff        = errors.New("member settings off")
