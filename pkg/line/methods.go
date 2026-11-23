@@ -1166,20 +1166,7 @@ func (c *Client) RejectChatInvitation(reqSeq int64, chatMid string) error {
 }
 
 func (c *Client) RejectChatInvitationContext(ctx context.Context, reqSeq int64, chatMid string) error {
-	resp, err := c.callRPCContext(ctx, "TalkService", "rejectChatInvitation", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
-	if err != nil {
-		return err
-	}
-	var wrapper struct {
-		Code int `json:"code"`
-	}
-	if err := json.Unmarshal(resp, &wrapper); err != nil {
-		return fmt.Errorf("failed to parse rejectChatInvitation response: %w", err)
-	}
-	if wrapper.Code != 0 {
-		return fmt.Errorf("rejectChatInvitation failed: %s", resp)
-	}
-	return nil
+	return c.callChatMembershipRPC(ctx, "rejectChatInvitation", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
 }
 
 // FindContactByUserid looks up a LINE user by their user ID (not MID).

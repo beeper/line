@@ -3,8 +3,6 @@ package connector
 import (
 	"context"
 	"errors"
-	"fmt"
-	"strings"
 
 	"maunium.net/go/mautrix/bridgev2"
 
@@ -16,6 +14,7 @@ var _ bridgev2.MembershipHandlingNetworkAPI = (*LineClient)(nil)
 var (
 	errInviteToDM          = errors.New("can't add people to a LINE direct chat")
 	errLegacyRoomMemberOps = errors.New("LINE doesn't support removing people from this chat")
+	errNotLineUser         = errors.New("only LINE users can be added to or removed from LINE chats")
 )
 
 func (lc *LineClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
@@ -35,14 +34,18 @@ func (lc *LineClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.
 		targetMid = string(target.ID)
 	case *bridgev2.UserLogin:
 		targetMid = string(target.ID)
-	default:
-		return nil, fmt.Errorf("unknown membership target type %T", target)
 	}
-	legacyRoom := strings.HasPrefix(strings.ToLower(chatMid), "r")
+	switch msg.Type {
+	case bridgev2.Invite, bridgev2.Kick, bridgev2.RevokeInvite:
+		if !isUserMID(targetMid) {
+			return nil, errNotLineUser
+		}
+	}
+	legacyRoom := isLegacyRoomMID(chatMid)
 	reqSeq := int64(lc.nextUntrackedReqSeq())
 	var call func(client *line.Client) error
 	switch msg.Type {
-	case bridgev2.Leave:
+	case bridgev2.Leave, bridgev2.RejectInvite:
 		switch {
 		case msg.Portal.MessageRequest:
 			call = func(client *line.Client) error { return client.RejectChatInvitationContext(ctx, reqSeq, chatMid) }
