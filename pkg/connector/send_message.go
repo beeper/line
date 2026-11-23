@@ -186,6 +186,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	var chunks []string
+	var sentPeerKey int
 	var err error
 	contentType := int(ContentText)
 	contentMetadata := map[string]string{}
@@ -804,6 +805,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			if errPeer != nil {
 				return nil, wrapSendError(fmt.Errorf("failed to get peer key: %w", errPeer))
 			}
+			sentPeerKey = peerRaw
 
 			chunks, err = lc.E2EE.EncryptMessageV2Raw(portalMid, fromMid, myKeyID, peerPub, myRaw, peerRaw, contentType, payload)
 		}
@@ -868,11 +870,13 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	if err != nil && !isGroup && !plainText && line.IsE2EEReceiverKeyRejected(err) {
 		lc.cacheMu.Lock()
-		delete(lc.peerKeys, portalMid)
+		if lc.peerKeys[portalMid].raw == sentPeerKey {
+			delete(lc.peerKeys, portalMid)
+		}
 		lc.cacheMu.Unlock()
 		myRaw, myKeyID, errKey := lc.E2EE.MyKeyIDs()
 		peerRaw, peerPub, errPeer := lc.ensurePeerKey(ctx, portalMid)
-		if errKey == nil && errPeer == nil {
+		if errKey == nil && errPeer == nil && peerRaw != sentPeerKey {
 			lc.UserLogin.Bridge.Log.Info().Err(err).
 				Str("chat_mid", portalMid).
 				Int("peer_key_id", peerRaw).
