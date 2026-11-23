@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/nyaruka/phonenumbers"
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -407,8 +410,60 @@ func (lc *LineClient) setCachedContact(mid string, contact line.Contact) {
 	lc.cacheMu.Unlock()
 }
 
+var lineUserMIDRegex = regexp.MustCompile(`^[Uu][A-Za-z0-9_-]{32,}$`)
+
+func linePhoneQuery(identifier string) (string, bool) {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(identifier), "tel:")
+	if !strings.HasPrefix(trimmed, "+") {
+		return "", false
+	}
+	cleaned, err := bridgev2.CleanPhoneNumber(trimmed)
+	if err != nil {
+		return "", false
+	}
+	num, err := phonenumbers.Parse(cleaned, "")
+	if err != nil || !phonenumbers.IsPossibleNumber(num) {
+		return "", false
+	}
+	return fmt.Sprintf("+%d %s", num.GetCountryCode(), phonenumbers.GetNationalSignificantNumber(num)), true
+}
+
+func isInvalidUseridError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), `"reason":"userid is invalid"`)
+}
+
+func (lc *LineClient) resolveIdentifierMID(ctx context.Context, identifier string) (string, error) {
+	identifier = strings.TrimSpace(identifier)
+	if lineUserMIDRegex.MatchString(identifier) {
+		return identifier, nil
+	}
+	var contact *line.Contact
+	var err error
+	if phone, ok := linePhoneQuery(identifier); ok {
+		_, contact, err = callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByPhone(phone)
+		})
+	} else {
+		userID := strings.ToLower(strings.TrimPrefix(identifier, "@"))
+		_, contact, err = callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByUserid(userID)
+		})
+	}
+	if line.IsTalkExceptionNotFound(err) || isInvalidUseridError(err) || (err == nil && (contact == nil || contact.Mid == "")) {
+		return "", bridgev2.WrapRespErr(fmt.Errorf("no LINE user found for %q", identifier), mautrix.MNotFound)
+	} else if err != nil {
+		return "", fmt.Errorf("failed to look up LINE user: %w", err)
+	}
+	lc.setCachedContact(contact.Mid, *contact)
+	return contact.Mid, nil
+}
+
 func (lc *LineClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
-	userID := makeUserID(strings.TrimSpace(identifier))
+	mid, err := lc.resolveIdentifierMID(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	userID := makeUserID(mid)
 	portalID := networkid.PortalKey{ID: makePortalID(string(userID)), Receiver: lc.UserLogin.ID}
 	ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, userID)
 	if err != nil {
