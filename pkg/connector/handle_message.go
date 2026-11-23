@@ -297,6 +297,7 @@ func (lc *LineClient) decryptMessageBody(msg *line.Message, portalIDStr string, 
 							decryptionFailed = false
 						} else {
 							groupDecryptLogContext(lc.UserLogin.Bridge.Log.Warn().Err(errRetry), msg, portalIDStr, opType).
+								Bool("sender_key_decrypted_before", lc.E2EE.HasDecryptedGroupSender(msg)).
 								Msg("DecryptGroupMessage failed after group key refresh")
 						}
 					}
