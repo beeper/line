@@ -12,7 +12,7 @@ import (
 )
 
 // ConvertCall converts a LINE call event to a Matrix notice message.
-func (h *Handler) ConvertCall(data line.Message, relatesTo *event.RelatesTo) (*bridgev2.ConvertedMessage, error) {
+func (h *Handler) ConvertCall(data line.Message, relatesTo *event.RelatesTo, fromMe bool) (*bridgev2.ConvertedMessage, error) {
 	callType := "Voice"
 	beeperCallType := event.BeeperActionMessageCallTypeVoice
 	if data.ContentMetadata["TYPE"] == "V" {
@@ -22,7 +22,6 @@ func (h *Handler) ConvertCall(data line.Message, relatesTo *event.RelatesTo) (*b
 
 	durationMs, _ := strconv.Atoi(data.ContentMetadata["DURATION"])
 	duration := durationMs / 1000
-	result := data.ContentMetadata["RESULT"]
 
 	var body string
 	switch {
@@ -34,8 +33,8 @@ func (h *Handler) ConvertCall(data line.Message, relatesTo *event.RelatesTo) (*b
 		} else {
 			body = fmt.Sprintf("%s call (%ds)", callType, secs)
 		}
-	case result == "CANCELED":
-		body = fmt.Sprintf("Missed %s call", strings.ToLower(callType))
+	case fromMe:
+		body = fmt.Sprintf("Unanswered %s call", strings.ToLower(callType))
 	default:
 		body = fmt.Sprintf("Missed %s call", strings.ToLower(callType))
 	}
