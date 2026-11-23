@@ -41,8 +41,8 @@ func TestSubmitUserInputLogsStructuredLoginErrorWithoutCredentials(t *testing.T)
 	if err != nil {
 		t.Fatalf("SubmitUserInput returned error: %v", err)
 	}
-	if step == nil || step.Instructions != loginTooManyAttemptsInstructions {
-		t.Fatalf("step instructions = %q, want %q", step.Instructions, loginTooManyAttemptsInstructions)
+	if step == nil || step.Instructions.Key != msgStepCredsTooManyAttemptsInstructions.Message().Key {
+		t.Fatalf("step instructions = %v, want %v", step.Instructions, msgStepCredsTooManyAttemptsInstructions.Message())
 	}
 
 	var event map[string]any
