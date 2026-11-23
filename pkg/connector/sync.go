@@ -348,7 +348,7 @@ func (lc *LineClient) messageBoxNeedsBackfill(last line.MessageIDWrapper) func(c
 		} else if string(latestMessage.ID) == last.MessageID {
 			return false, nil
 		}
-		existing, err := lc.UserLogin.Bridge.DB.Message.GetPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(last.MessageID), "")
+		existing, err := lc.UserLogin.Bridge.DB.Message.GetLastPartByID(ctx, lc.UserLogin.ID, networkid.MessageID(last.MessageID))
 		if err != nil {
 			return false, err
 		} else if existing != nil {
