@@ -28,10 +28,7 @@ import (
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 	mauffmpeg "go.mau.fi/util/ffmpeg"
 	"golang.org/x/crypto/hkdf"
-	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
-	_ "golang.org/x/image/tiff"
-	_ "golang.org/x/image/webp"
 )
 
 const maxLineImagePixels = 100_000_000
@@ -67,7 +64,7 @@ func lineImageSizeAllowed(width, height int) bool {
 var errSendImageAsFile = errors.New("image must be sent to LINE as a file")
 
 func prepareLineImage(ctx context.Context, data []byte, fileName string) ([]byte, string, string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	mimeType := http.DetectContentType(data)
 	switch {
@@ -77,8 +74,8 @@ func prepareLineImage(ctx context.Context, data []byte, fileName string) ([]byte
 			return nil, "", "", fmt.Errorf("%w: %w", errSendImageAsFile, err)
 		}
 		data, mimeType, fileName = converted, "image/jpeg", replaceExtension(fileName, ".jpg")
-	case mimeType == "image/jpeg", mimeType == "image/png", mimeType == "image/gif", mimeType == "image/bmp":
-	case strings.HasPrefix(mimeType, "text/"):
+	case mimeType == "image/jpeg", mimeType == "image/png", mimeType == "image/gif":
+	case !strings.HasPrefix(mimeType, "image/") && mimeType != "application/octet-stream":
 		return nil, "", "", errSendImageAsFile
 	default:
 		converted, convertedMime, err := reencodeImage(ctx, data)
@@ -104,10 +101,8 @@ func reencodeImage(ctx context.Context, data []byte) ([]byte, string, error) {
 		if !mauffmpeg.Supported() {
 			return nil, "", err
 		}
-		if err = probeLineImageSize(ctx, data); err != nil {
-			return nil, "", err
-		}
-		data, err = mauffmpeg.ConvertBytes(ctx, data, ".png", nil, []string{"-frames:v", "1"}, http.DetectContentType(data))
+		data, err = mauffmpeg.ConvertBytes(ctx, data, ".png",
+			[]string{"-max_pixels", fmt.Sprint(maxLineImagePixels)}, []string{"-frames:v", "1"}, http.DetectContentType(data))
 		if err != nil {
 			return nil, "", err
 		}
@@ -129,34 +124,6 @@ func reencodeImage(ctx context.Context, data []byte) ([]byte, string, error) {
 	}
 	err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90})
 	return buf.Bytes(), "image/jpeg", err
-}
-
-func probeLineImageSize(ctx context.Context, data []byte) error {
-	if !mauffmpeg.ProbeSupported() {
-		return errors.New("image dimensions are unknown")
-	}
-	file, err := os.CreateTemp("", "line-image-probe-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	_, err = file.Write(data)
-	if closeErr := file.Close(); err != nil || closeErr != nil {
-		return errors.Join(err, closeErr)
-	}
-	probe, err := mauffmpeg.Probe(ctx, file.Name())
-	if err != nil {
-		return err
-	}
-	for _, stream := range probe.Streams {
-		if stream.CodecType == "video" {
-			if !lineImageSizeAllowed(stream.Width, stream.Height) {
-				return fmt.Errorf("image is %dx%d", stream.Width, stream.Height)
-			}
-			return nil
-		}
-	}
-	return errors.New("image dimensions are unknown")
 }
 
 func replaceExtension(fileName, extension string) string {

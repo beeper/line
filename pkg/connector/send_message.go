@@ -227,7 +227,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 		}
 		originalData := mediaData
-		if effectiveMsgType == event.MsgImage {
+		if effectiveMsgType == event.MsgImage && len(mediaData) <= lineMediaSizeLimits[event.MsgImage] {
 			var imageData []byte
 			imageData, imageMimeType, imageFileName, err = prepareLineImage(ctx, mediaData, msg.Content.GetFileName())
 			if errors.Is(err, errSendImageAsFile) {
@@ -337,7 +337,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 		extension := "jpg"
 		switch mimeType {
-		case "image/gif", "image/png", "image/bmp":
+		case "image/gif", "image/png":
 			extension = strings.TrimPrefix(mimeType, "image/")
 		}
 
