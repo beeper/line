@@ -19,7 +19,7 @@ func (lc *LineClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.
 	}
 	chatMid := string(msg.Portal.ID)
 	if msg.Portal.MessageRequest {
-		reqSeq := lc.nextUntrackedReqSeq()
+		reqSeq := lc.nextReqSeq()
 		_, err := lc.callLine(ctx, func(client *line.Client) error {
 			return client.RejectChatInvitationContext(ctx, int64(reqSeq), chatMid)
 		})
