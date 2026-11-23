@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"image"
 	"image/jpeg"
 	"maps"
@@ -724,12 +723,14 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	// Process mentions — set MENTION content metadata for LINE notification
-	mentions := msg.Content.Mentions
-	if mentions == nil {
-		_, _, legacyRoomMention := findRoomMention(msg.Content.Body)
-		mentions = &event.Mentions{Room: legacyRoomMention}
+	var mentions event.Mentions
+	if msg.Content.Mentions != nil {
+		mentions = *msg.Content.Mentions
 	}
-	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, mentions, sticonBodies)
+	if !mentions.Room {
+		_, _, mentions.Room = findRoomMention(msg.Content.Body)
+	}
+	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, &mentions, sticonBodies)
 	for k, v := range mentionMeta {
 		contentMetadata[k] = v
 	}
@@ -1231,7 +1232,6 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 		labelOwners[label] = pill.userID
 	}
 	for _, pill := range pills {
-		pillUsers[pill.userID] = true
 		if !mentioned[pill.userID] {
 			continue
 		}
@@ -1243,11 +1243,11 @@ func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedB
 			if ambiguousLabels[strings.TrimPrefix(strings.TrimSpace(pill.text), "@")] {
 				continue
 			}
-			if start, end, ok := findUniquePillText(body, pill.text); ok {
-				addMentionee(start, end, mentionEntry{M: string(mid)})
+			if start, end, ok := findUniquePillText(body, pill.text); ok && addMentionee(start, end, mentionEntry{M: string(mid)}) {
+				pillUsers[pill.userID] = true
 			}
-		} else {
-			addMentionee(pill.start, pill.end, mentionEntry{M: string(mid)})
+		} else if addMentionee(pill.start, pill.end, mentionEntry{M: string(mid)}) {
+			pillUsers[pill.userID] = true
 		}
 	}
 
@@ -1394,10 +1394,9 @@ func findUniquePillText(body, text string) (start, end int, ok bool) {
 		}
 		before, _ := utf8.DecodeLastRuneInString(body[:candidateStart])
 		after, _ := utf8.DecodeRuneInString(body[candidateEnd:])
-		bounded := !isMentionWordRune(before) && !isMentionWordRune(after)
+		bounded := !isLatinWordRune(before) && !isLatinWordRune(after)
 		if hasAt {
-			isLatinWord := func(r rune) bool { return unicode.In(r, unicode.Latin) || unicode.IsDigit(r) || r == '_' }
-			bounded = !isLatinWord(before) && !strings.ContainsRune("._-+@", before) && !isLatinWord(after)
+			bounded = bounded && !strings.ContainsRune("._-+@", before)
 		}
 		if bounded {
 			if ok {
@@ -1420,7 +1419,7 @@ func findWholeWord(body string, from int, text string) (int, int, bool) {
 		end := start + len(text)
 		before, _ := utf8.DecodeLastRuneInString(body[:start])
 		after, _ := utf8.DecodeRuneInString(body[end:])
-		if !isMentionWordRune(before) && !isMentionWordRune(after) {
+		if !isLatinWordRune(before) && !isLatinWordRune(after) {
 			return start, end, true
 		}
 		offset = start + 1
@@ -1458,4 +1457,9 @@ func findRoomMention(body string) (int, int, bool) {
 
 func isMentionWordRune(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+// CJK names are often written without spaces around them, so only Latin letters break a name match.
+func isLatinWordRune(r rune) bool {
+	return unicode.In(r, unicode.Latin) || unicode.IsDigit(r) || r == '_'
 }
