@@ -288,6 +288,7 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 	type dmResync struct {
 		mid                string
 		checkNeedsBackfill func(context.Context, *database.Message) (bool, error)
+		lastSeen           string
 	}
 	dms := make([]dmResync, 0, len(messageBoxes))
 	dmMIDs := make([]string, 0, len(messageBoxes))
@@ -312,10 +313,11 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 					},
 					CheckNeedsBackfillFunc: checkNeedsBackfill,
 				})
+				lc.queueCatchUpReadReceipt(mid, box.LastSeenMessageID)
 			}
 			continue
 		}
-		dms = append(dms, dmResync{mid, checkNeedsBackfill})
+		dms = append(dms, dmResync{mid, checkNeedsBackfill, box.LastSeenMessageID})
 		dmMIDs = append(dmMIDs, mid)
 	}
 	if err := lc.fetchContacts(ctx, dmMIDs); err != nil {
@@ -323,11 +325,20 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 	}
 	for _, dm := range dms {
 		lc.queueDMChatResync(ctx, dm.mid, dm.checkNeedsBackfill != nil, true, dm.checkNeedsBackfill)
+		if dm.checkNeedsBackfill != nil {
+			lc.queueCatchUpReadReceipt(dm.mid, dm.lastSeen)
+		}
 	}
 	if backfillEnabled {
-		lc.prefetchMessageBoxes(ctx, messageBoxes)
 		lc.queueBackfillRetryChats(ctx)
 	}
+}
+
+func (lc *LineClient) queueCatchUpReadReceipt(mid, lastSeen string) {
+	if lastSeen == "" {
+		return
+	}
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, lc.startupReadReceipt(mid, lastSeen, []networkid.MessageID{networkid.MessageID(lastSeen)}))
 }
 
 func (lc *LineClient) messageBoxNeedsBackfill(last line.MessageIDWrapper) func(context.Context, *database.Message) (bool, error) {
@@ -1887,6 +1898,8 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			if lc.UserLogin.Bridge.Config.Backfill.Enabled {
 				lc.syncChatsNow(ctx)
 				lc.syncMessageBoxes(ctx)
+				lc.wg.Add(1)
+				go lc.prefetchMessages(ctx)
 			} else {
 				lc.wg.Add(3)
 				go lc.syncChats(ctx)
