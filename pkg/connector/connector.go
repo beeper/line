@@ -54,7 +54,7 @@ func (lc *LineConnector) Start(ctx context.Context) error {
 }
 
 func (lc *LineConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 7
+	return 1, 9
 }
 
 func (lc *LineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
@@ -132,6 +132,8 @@ type UserLoginMetadata struct {
 	RefreshToken       string            `json:"refresh_token,omitempty"`
 	SessionInvalidated bool              `json:"session_invalidated,omitempty"`
 	SessionExpired     bool              `json:"session_expired,omitempty"`
+	LogoutCode         int               `json:"logout_code,omitempty"`
+	LogoutReason       string            `json:"logout_reason,omitempty"`
 	Email              string            `json:"email,omitempty"`
 	Password           string            `json:"password,omitempty"`
 	Certificate        string            `json:"certificate,omitempty"`
@@ -230,14 +232,16 @@ func (ll *LineEmailLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
-					Type: bridgev2.LoginInputFieldTypeUsername,
-					ID:   "email",
-					Name: "Email",
+					Type:           bridgev2.LoginInputFieldTypeUsername,
+					ID:             "email",
+					Name:           "Email",
+					AutofillDomain: "line.me",
 				},
 				{
-					Type: bridgev2.LoginInputFieldTypePassword,
-					ID:   "password",
-					Name: "Password",
+					Type:           bridgev2.LoginInputFieldTypePassword,
+					ID:             "password",
+					Name:           "Password",
+					AutofillDomain: "line.me",
 				},
 			},
 		},
@@ -291,6 +295,12 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 }
 
 func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	ll.mu.Lock()
+	qrLogin := ll.qrLogin
+	ll.mu.Unlock()
+	if qrLogin != nil {
+		return qrLogin.SubmitUserInput(ctx, input)
+	}
 	if ll.Verifier != "" {
 		return ll.Wait(ctx)
 	}
@@ -326,14 +336,16 @@ func (ll *LineEmailLogin) loginErrorStep(message string) *bridgev2.LoginStep {
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
-					Type: bridgev2.LoginInputFieldTypeUsername,
-					ID:   "email",
-					Name: "Email",
+					Type:           bridgev2.LoginInputFieldTypeUsername,
+					ID:             "email",
+					Name:           "Email",
+					AutofillDomain: "line.me",
 				},
 				{
-					Type: bridgev2.LoginInputFieldTypePassword,
-					ID:   "password",
-					Name: "Password",
+					Type:           bridgev2.LoginInputFieldTypePassword,
+					ID:             "password",
+					Name:           "Password",
+					AutofillDomain: "line.me",
 				},
 			},
 		},
@@ -751,7 +763,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 
 	loginManager, err := ll.fetchLoginKeys(res, meta, client)
 	if err != nil {
-		if isTerminalCryptoError(err) || errors.Is(err, context.Canceled) || !sameAccount || !shouldPreserveExistingE2EEKeys(false, ll.ExistingMetadata) {
+		if isTerminalCryptoError(err) || errors.Is(err, context.Canceled) || line.IsLoggedOut(err) || !sameAccount || !shouldPreserveExistingE2EEKeys(false, ll.ExistingMetadata) {
 			return nil, err
 		}
 		if err := ll.admitLogin(ctx, res); err != nil {
@@ -1042,8 +1054,14 @@ func (ll *LineEmailLogin) Cancel() {
 		ll.attemptCancel()
 	}
 	attempt := ll.attempt
+	qrLogin := ll.qrLogin
 	ll.mu.Unlock()
 	if attempt != nil {
 		attempt.Close()
+	}
+	if qrLogin != nil {
+		if email := qrLogin.emailLogin(); email != nil {
+			email.Cancel()
+		}
 	}
 }

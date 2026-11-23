@@ -1,6 +1,7 @@
 package line
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -67,6 +68,23 @@ func (c *Client) LoginV2WithType(loginType int, email, password, certificate, se
 		E2EEVersion:      1,
 	}
 	return c.callRPC("AuthService", "loginV2", req)
+}
+
+func (c *Client) Logout(ctx context.Context) error {
+	resp, err := c.callRPCContext(ctx, "AuthService", "logoutV2")
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse logoutV2 response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("logoutV2 failed: %s", resp)
+	}
+	return nil
 }
 
 // LoginV2WithVerifier finalizes login using the verifier (post-E2EE confirm flow)
@@ -480,9 +498,21 @@ func (c *Client) CancelReaction(reqSeq int64, messageID string) error {
 }
 
 // SendChatChecked sends a read receipt for a message in a chat
-func (c *Client) SendChatChecked(chatMid, messageID string) error {
-	_, err := c.callRPC("TalkService", "sendChatChecked", 0, chatMid, messageID)
-	return err
+func (c *Client) SendChatChecked(reqSeq int64, chatMid, messageID string) error {
+	resp, err := c.callRPC("TalkService", "sendChatChecked", reqSeq, chatMid, messageID, 0)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse sendChatChecked response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("sendChatChecked failed: %s", resp)
+	}
+	return nil
 }
 
 // GetContactsV2 fetches contact details for a list of MIDs.
@@ -651,6 +681,68 @@ func (c *Client) GetChats(mids []string, withMembers, withInvitees bool) (*GetCh
 		return nil, fmt.Errorf("getChats failed: %s", wrapper.Message)
 	}
 	return &wrapper.Data, nil
+}
+
+func (c *Client) GetChatRaw(ctx context.Context, chatMid string) (map[string]any, error) {
+	resp, err := c.callRPCContext(ctx, "TalkService", "getChats", GetChatsRequest{
+		ChatMids:     []string{chatMid},
+		WithMembers:  true,
+		WithInvitees: true,
+	}, 2)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Chats []map[string]any `json:"chats"`
+		} `json:"data"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(resp))
+	dec.UseNumber()
+	if err := dec.Decode(&wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse getChats response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("getChats failed: %s", wrapper.Message)
+	}
+	if len(wrapper.Data.Chats) == 0 {
+		return nil, fmt.Errorf("chat not found")
+	}
+	return wrapper.Data.Chats[0], nil
+}
+
+const (
+	ChatAttributeName          = 1
+	ChatAttributePictureStatus = 2
+)
+
+type UpdateChatRequest struct {
+	ReqSeq           int64          `json:"reqSeq"`
+	Chat             map[string]any `json:"chat"`
+	UpdatedAttribute int            `json:"updatedAttribute"`
+}
+
+func (c *Client) UpdateChat(ctx context.Context, reqSeq int64, chat map[string]any, attribute int) error {
+	resp, err := c.callRPCContext(ctx, "TalkService", "updateChat", UpdateChatRequest{
+		ReqSeq:           reqSeq,
+		Chat:             chat,
+		UpdatedAttribute: attribute,
+	})
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse updateChat response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("updateChat failed: %s", resp)
+	}
+	return nil
 }
 
 func (c *Client) GetRoomsV2(mids []string) ([]Room, error) {
