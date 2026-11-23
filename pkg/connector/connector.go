@@ -387,6 +387,15 @@ func parseLoginErrorDetails(err error) loginErrorDetails {
 	}
 
 	msg := err.Error()
+	var qrErr *line.QRError
+	if errors.As(err, &qrErr) {
+		return loginErrorDetails{
+			HTTPStatus: qrErr.HTTPStatus, HasHTTPStatus: true,
+			ResponseCode: qrErr.Code, HasResponseCode: true, HasResponseFields: true,
+			ErrorName: qrErr.Name, ErrorCode: qrErr.ExceptionCode, HasErrorCode: qrErr.Name != "" || qrErr.ExceptionCode != 0,
+			ErrorMessage: qrErr.AlertMessage, ErrorReason: qrErr.Reason,
+		}
+	}
 	if apiErrorIndex := strings.Index(msg, "API error "); apiErrorIndex >= 0 {
 		if parsed, scanErr := fmt.Sscanf(msg[apiErrorIndex:], "API error %d:", &details.HTTPStatus); parsed == 1 && scanErr == nil {
 			details.HasHTTPStatus = true

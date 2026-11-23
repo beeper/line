@@ -2,6 +2,7 @@ package line
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -87,25 +88,48 @@ func (c *Client) CheckQRCodeVerifiedContext(ctx context.Context, session string,
 
 func (c *Client) VerifyQRCertificate(ctx context.Context, session, certificate string) (bool, error) {
 	err := c.callQRRPC(ctx, "verifyCertificate", "", 0, map[string]string{"authSessionId": session, "certificate": certificate}, nil)
-	var response *qrRPCError
-	if errors.As(err, &response) && response.httpStatus == http.StatusBadRequest {
+	var response *QRError
+	if errors.As(err, &response) && response.HTTPStatus == http.StatusBadRequest {
 		return false, nil
 	}
 	return err == nil, err
 }
 
-type qrRPCError struct {
-	method                       string
-	httpStatus, code, statusCode int
+// QRError.Code is the gateway's wrapper code; the rest come from its data (an exception for 10051).
+type QRError struct {
+	Method        string `json:"-"`
+	HTTPStatus    int    `json:"-"`
+	Code          int    `json:"-"`
+	StatusCode    int    `json:"statusCode"`
+	Name          string `json:"name"`
+	ExceptionCode int    `json:"code"`
+	Reason        string `json:"reason"`
+	AlertMessage  string `json:"alertMessage"`
+	poll          bool
 }
 
-func (e *qrRPCError) Error() string {
-	return fmt.Sprintf("QR %s failed: HTTP %d, code %d, status %d", e.method, e.httpStatus, e.code, e.statusCode)
+func (e *QRError) Error() string {
+	msg := fmt.Sprintf("QR %s failed: HTTP %d, code %d, status %d", e.Method, e.HTTPStatus, e.Code, e.StatusCode)
+	if e.Name != "" || e.ExceptionCode != 0 {
+		msg += fmt.Sprintf(", %s code %d", cmp.Or(e.Name, "exception"), e.ExceptionCode)
+	}
+	if e.Reason != "" {
+		msg += ", reason " + strconv.Quote(e.Reason)
+	}
+	if e.AlertMessage != "" {
+		msg += ", alert " + strconv.Quote(e.AlertMessage)
+	}
+	return msg
 }
 
 func IsQRLoginPollExpired(err error) bool {
-	var response *qrRPCError
-	return errors.As(err, &response) && response.code == 10052 && response.statusCode == 410
+	var response *QRError
+	return errors.As(err, &response) && response.Code == 10052 && response.StatusCode == http.StatusGone
+}
+
+func IsQRLoginPollRejected(err error) bool {
+	var response *QRError
+	return errors.As(err, &response) && response.poll && response.Code == 10051
 }
 
 func (c *Client) CreatePinCode(ctx context.Context, session string) (string, error) {
@@ -206,15 +230,12 @@ func (c *Client) callQRRPC(ctx context.Context, method, session string, pollTime
 	}
 	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&wrapper)
 	if resp.StatusCode != http.StatusOK || (wrapper.Code != nil && *wrapper.Code != 0) {
-		response := &qrRPCError{method: method, httpStatus: resp.StatusCode}
+		response := &QRError{}
+		// A mistyped field doesn't stop the others from decoding.
+		_ = json.Unmarshal(wrapper.Data, response)
+		response.Method, response.HTTPStatus, response.poll = method, resp.StatusCode, pollTimeout > 0
 		if wrapper.Code != nil {
-			response.code = *wrapper.Code
-		}
-		var details struct {
-			StatusCode int `json:"statusCode"`
-		}
-		if json.Unmarshal(wrapper.Data, &details) == nil {
-			response.statusCode = details.StatusCode
+			response.Code = *wrapper.Code
 		}
 		return response
 	}
