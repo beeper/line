@@ -1,13 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
 
+	"go.mau.fi/util/exmime"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
 
@@ -34,7 +38,7 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	} else if downloadSource.publicPath != "" {
 		sid = ""
 	}
-	width, height := lineMediaDimensions(data.ContentMetadata)
+	width, height := lineMediaInfoDimensions(data.ContentMetadata["MEDIA_CONTENT_INFO"])
 	if h.GenerateDirectMediaURI != nil {
 		directMedia, err := newDirectMedia(
 			"image", downloadSource.oid, downloadSource.publicPath, sid, downloadOptions,
@@ -116,7 +120,10 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 
 	fileName, mimeType := lineImageType(data.ContentMetadata)
 	if sniffed := http.DetectContentType(imgData); strings.HasPrefix(sniffed, "image/") {
-		fileName, mimeType = imageTypeForExtension(strings.TrimPrefix(sniffed, "image/"))
+		fileName, mimeType = imageTypeForMime(sniffed)
+	}
+	if config, _, err := image.DecodeConfig(bytes.NewReader(imgData)); err == nil {
+		width, height = config.Width, config.Height
 	}
 
 	// Upload to Matrix
@@ -204,15 +211,6 @@ func lineMediaCategory(metadata map[string]string) string {
 	return info.Category
 }
 
-func lineMediaDimensions(metadata map[string]string) (width, height int) {
-	for _, key := range []string{"MEDIA_CONTENT_INFO", "MEDIA_THUMB_INFO"} {
-		if width, height := lineMediaInfoDimensions(metadata[key]); width > 0 && height > 0 {
-			return width, height
-		}
-	}
-	return 0, 0
-}
-
 func lineMediaInfoDimensions(raw string) (width, height int) {
 	var info struct {
 		Width  int `json:"width"`
@@ -229,22 +227,14 @@ func lineImageType(metadata map[string]string) (fileName, mimeType string) {
 		Extension string `json:"extension"`
 	}
 	_ = json.Unmarshal([]byte(metadata["MEDIA_CONTENT_INFO"]), &info)
-	return imageTypeForExtension(info.Extension)
+	return imageTypeForMime(mime.TypeByExtension("." + strings.ToLower(info.Extension)))
 }
 
-func imageTypeForExtension(extension string) (fileName, mimeType string) {
-	switch strings.ToLower(extension) {
-	case "gif":
-		return "image.gif", "image/gif"
-	case "png":
-		return "image.png", "image/png"
-	case "bmp":
-		return "image.bmp", "image/bmp"
-	case "webp":
-		return "image.webp", "image/webp"
-	default:
-		return "image.jpg", "image/jpeg"
+func imageTypeForMime(mimeType string) (string, string) {
+	if !strings.HasPrefix(mimeType, "image/") {
+		mimeType = "image/jpeg"
 	}
+	return "image" + exmime.ExtensionFromMimetype(mimeType), mimeType
 }
 
 func lineOBSDownloadOptions(metadata map[string]string, isPlainMedia bool) line.OBSDownloadOptions {

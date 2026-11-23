@@ -41,7 +41,7 @@ func newDirectMedia(
 	contentMetadata map[string]string,
 ) (*DirectMedia, error) {
 	kind = strings.ToLower(kind)
-	keys, _, err := mediaDecryptionKeys(decryptedBody, contentMetadata, kind)
+	keys, encrypted, err := mediaDecryptionKeys(decryptedBody, contentMetadata, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +59,7 @@ func newDirectMedia(
 		OBSPop:      opts.OBSPop,
 		ContentType: contentType,
 		Keys:        keys,
-		Size:        directMediaReportedSize(contentMetadata),
+		Size:        directMediaReportedSize(contentMetadata, encrypted),
 		FileName:    fileName,
 		Duration:    directMediaDuration(contentMetadata),
 	}
@@ -132,10 +132,13 @@ func (h *Handler) generateDirectMedia(
 	}}}, nil
 }
 
-func directMediaReportedSize(contentMetadata map[string]string) int {
+func directMediaReportedSize(contentMetadata map[string]string, encrypted bool) int {
 	size, err := strconv.ParseInt(strings.TrimSpace(contentMetadata["FILE_SIZE"]), 10, 64)
 	if err != nil || size <= 0 {
 		return 0
+	}
+	if encrypted && size >= encryptedMediaSizeOverhead {
+		size -= encryptedMediaSizeOverhead
 	}
 	if int64(int(size)) != size {
 		return 0
