@@ -1141,8 +1141,7 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
 		info.Members.PowerLevels = lineGroupPowerLevels()
 	}
-	// Only a confirmed membership clears the request: GetChats can omit the caller from both
-	// lists, and that must not drop a pending invite out of Requests.
+	// GetChats can omit self from both lists, so only confirmed membership clears a request.
 	if selfInvitePending {
 		info.MessageRequest = ptr.Ptr(true)
 	} else if selfIsGroupMember {
