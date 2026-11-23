@@ -7,11 +7,11 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.53
 	github.com/rs/zerolog v1.35.1
 	github.com/u2takey/ffmpeg-go v0.5.0
-	go.mau.fi/util v0.11.2-0.20261123182504-13194d8788b7
+	go.mau.fi/util v0.11.2-0.20261123232031-42f343a1bef8
 	golang.org/x/crypto v0.59.0
 	golang.org/x/image v0.23.0
 	golang.org/x/net v0.62.0
-	maunium.net/go/mautrix v0.33.1-0.20261123182552-2fd758b53ce1
+	maunium.net/go/mautrix v0.33.1-0.20261123232130-ca9c6fb3c83f
 )
 
 require (
