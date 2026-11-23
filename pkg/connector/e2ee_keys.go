@@ -25,12 +25,37 @@ func groupKeyFetchError(groupKeyID int, err error) error {
 	if groupKeyID == 0 && line.IsNotAMemberError(err) {
 		return fmt.Errorf("%w: latest group key lookup reported not a member: %w", line.ErrNoUsableE2EEGroupKey, err)
 	}
+	if line.IsGroupKeyNotFound(err) {
+		return fmt.Errorf("%w: %w", line.ErrGroupKeyNotFound, err)
+	}
+	if line.IsNoUsableE2EEGroupKey(err) {
+		return fmt.Errorf("%w: %w", line.ErrNoUsableE2EEGroupKey, err)
+	}
+	return err
+}
+
+func (lc *LineClient) ensureGroupKey(ctx context.Context, chatMid string, groupKeyID int) error {
+	if lc.E2EE == nil {
+		return fmt.Errorf("E2EE manager not initialized")
+	}
+	if lc.E2EE.HasGroupKey(chatMid, groupKeyID) {
+		return nil
+	}
+	generation, err := lc.E2EE.GroupKeyError(chatMid, groupKeyID)
+	if err != nil {
+		return err
+	}
+	err = lc.fetchAndUnwrapGroupKey(ctx, chatMid, groupKeyID)
+	if errors.Is(err, e2ee.ErrMissingOwnPrivateKey) || errors.Is(err, line.ErrGroupKeyNotFound) ||
+		errors.Is(err, line.ErrNoUsableE2EEGroupKey) {
+		lc.E2EE.SetGroupKeyError(chatMid, groupKeyID, err, generation)
+	}
 	return err
 }
 
 // fetchAndUnwrapGroupKey retrieves a specific group key (or the latest when groupKeyID == 0)
 // and unwraps it so the E2EE manager can encrypt/decrypt group messages.
-// If no group key exists yet (TalkException code 5), it auto-registers one and retries.
+// If the chat has no latest group key yet (TalkException code 5), it registers one and retries.
 func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string, groupKeyID int) error {
 	if lc.E2EE == nil {
 		return fmt.Errorf("E2EE manager not initialized")
@@ -49,8 +74,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 	}
 
 	client, sharedKey, err := callLineResultUsing(lc, ctx, client, fetch)
-	// No group key exists yet — auto-register one so the group can use E2EE.
-	if err != nil && line.IsGroupKeyNotFound(err) {
+	if err != nil && groupKeyID == 0 && line.IsGroupKeyNotFound(err) {
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", chatMid).
 			Msg("No group key found, auto-registering")
 		if registerErr := lc.autoRegisterGroupKey(ctx, chatMid); registerErr != nil {

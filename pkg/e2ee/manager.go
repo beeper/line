@@ -69,6 +69,8 @@ type Manager struct {
 
 	groupKeyLRU        []groupKeyRef
 	groupNativeObjects int
+	groupKeyErrors     map[groupKeyRef]error
+	groupKeyGeneration uint64
 }
 
 type groupKeyRef struct {
@@ -99,6 +101,7 @@ func NewManagerWithRunner(r *gen.Runner) *Manager {
 		groupSessionChannels: make(map[string]map[int]map[int]int),
 		latestGroupKey:       make(map[string]int),
 		groupSpecVersion:     make(map[string]int),
+		groupKeyErrors:       make(map[groupKeyRef]error),
 
 		decryptedGroupSenders: make(map[int]struct{}),
 	}
@@ -252,6 +255,8 @@ func (m *Manager) LoadMyKeyFromSecureData(data map[string]any) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	clear(m.groupKeyErrors)
+	m.groupKeyGeneration++
 	return m.errLocked()
 }
 
@@ -595,6 +600,8 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 		m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
 		m.groupSpecVersion[chatMid] = sharedKey.SpecVersion
 		m.touchGroupKeyLocked(ref)
+		delete(m.groupKeyErrors, ref)
+		m.groupKeyGeneration++
 		return id, nil
 	}
 
@@ -630,6 +637,8 @@ func (m *Manager) UnwrapGroupSharedKey(chatMid string, sharedKey *line.E2EEGroup
 		m.groupKeys[chatMid] = make(map[int]int)
 	}
 	m.groupKeys[chatMid][sharedKey.GroupKeyID] = unwrappedKeyID
+	delete(m.groupKeyErrors, ref)
+	m.groupKeyGeneration++
 
 	m.latestGroupKey[chatMid] = sharedKey.GroupKeyID
 	m.groupSpecVersion[chatMid] = sharedKey.SpecVersion
@@ -957,6 +966,27 @@ func (m *Manager) EncryptGroupMessageRaw(chatMid, fromMid string, contentType in
 	// [first, body, tag, senderKeyID, groupKeyID]
 	chunks := []string{toB64(first), toB64(body), toB64(tag), toB64(senderBuf), toB64(receiverBuf)}
 	return chunks, nil
+}
+
+func (m *Manager) HasGroupKey(chatMid string, groupKeyID int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.errLocked() == nil && m.groupKeys[chatMid][groupKeyID] != 0
+}
+
+func (m *Manager) GroupKeyError(chatMid string, groupKeyID int) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.groupKeyGeneration, m.groupKeyErrors[groupKeyRef{chatMid, groupKeyID}]
+}
+
+func (m *Manager) SetGroupKeyError(chatMid string, groupKeyID int, err error, generation uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if generation != m.groupKeyGeneration || m.groupKeys[chatMid][groupKeyID] != 0 {
+		return
+	}
+	m.groupKeyErrors[groupKeyRef{chatMid, groupKeyID}] = err
 }
 
 func (m *Manager) HasPeerPublicKey(rawKeyID int) bool {
