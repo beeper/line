@@ -29,6 +29,10 @@ type postPreviewMedia struct {
 type albumPreviewContext struct {
 	ChatID  string
 	AlbumID string
+
+	CreatedTime       string
+	PreviewCount      int
+	FromPreviewMedias bool
 }
 
 // ConvertPostNotification converts a LINE note, album, or unknown post
@@ -96,6 +100,9 @@ func (h *Handler) ConvertPostNotification(
 		return converted, nil
 	}
 	previewContext := parseAlbumPreviewContext(data.ContentMetadata)
+	previewContext.CreatedTime = data.CreatedTime.String()
+	previewContext.PreviewCount = len(previewMedias)
+	previewContext.FromPreviewMedias = strings.TrimSpace(data.ContentMetadata["previewMedias"]) != ""
 	if previewContext.ChatID == "" {
 		h.Log.Warn().
 			Str("msg_id", data.ID).
@@ -226,6 +233,11 @@ func (h *Handler) convertAlbumPreview(
 		h.Log.Warn().
 			Str("msg_id", messageID).
 			Str("media_oid", media.OID).
+			Str("created_time", previewContext.CreatedTime).
+			Int("preview_index", index).
+			Int("preview_count", previewContext.PreviewCount).
+			Bool("from_preview_medias", previewContext.FromPreviewMedias).
+			Bool("has_album_id", previewContext.AlbumID != "").
 			Msg("LINE album preview image expired before it could be bridged")
 		return nil, nil
 	} else if err != nil {
