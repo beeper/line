@@ -733,6 +733,13 @@ func (lc *LineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Ma
 		if line.IsInvalidPaidReactionType(err) {
 			return nil, unsupportedMatrixReactionError(key)
 		}
+		if line.IsSticonNotOwned(err) {
+			return nil, bridgev2.WrapErrorInStatus(err).
+				WithStatus(event.MessageStatusFail).
+				WithIsCertain(true).
+				WithMessage("you don't own this LINE emoji, so it can't be used as a reaction").
+				WithErrorReason(event.MessageStatusUnsupported)
+		}
 		return nil, wrapSendError(err)
 	}
 
