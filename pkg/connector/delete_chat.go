@@ -62,9 +62,13 @@ func (lc *LineClient) handleChatRemovedElsewhere(ctx context.Context, op line.Op
 	}
 	portalKey := networkid.PortalKey{ID: makePortalID(chatMid), Receiver: lc.UserLogin.ID}
 	log := lc.UserLogin.Log.With().Str("chat_mid", chatMid).Str("last_message_id", op.Param2).Logger()
-	cutoffID, ok := new(big.Int).SetString(op.Param2, 10)
-	if !ok || cutoffID.Sign() <= 0 {
-		log.Warn().Msg("Skipping chat removal without a positive deletion cutoff")
+	cutoffParam := op.Param2
+	if cutoffParam == "" || cutoffParam == "-1" {
+		cutoffParam = "0"
+	}
+	cutoffID, ok := new(big.Int).SetString(cutoffParam, 10)
+	if !ok || cutoffID.Sign() < 0 {
+		log.Warn().Msg("Skipping chat removal with an invalid deletion cutoff")
 		return
 	}
 	cutoff := cutoffID.String()
