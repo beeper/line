@@ -37,16 +37,16 @@ func (lc *LineClient) newMessageHandler() *handlers.Handler {
 	}
 	connector, ok := lc.UserLogin.Bridge.Network.(*LineConnector)
 	if ok && connector.directMedia.Load() {
-		handler.GenerateDirectMediaURI = func(ctx context.Context, messageID string, metadata *handlers.DirectMedia) (id.ContentURIString, any, error) {
+		handler.GenerateDirectMediaURI = func(ctx context.Context, roomID id.RoomID, messageID string, metadata *handlers.DirectMedia) (id.ContentURIString, *event.EncryptedFileInfo, any, error) {
 			mediaID, err := makeLineDirectMediaID(lc.UserLogin.ID, networkid.MessageID(messageID), metadata.IsPreview)
 			if err != nil {
-				return "", nil, err
+				return "", nil, nil, err
 			}
-			uri, err := lc.UserLogin.Bridge.Matrix.GenerateContentURI(ctx, mediaID)
+			uri, file, err := lc.UserLogin.Bridge.GenerateContentURI(ctx, roomID, mediaID)
 			if err != nil {
-				return "", nil, fmt.Errorf("failed to generate LINE direct media URI: %w", err)
+				return "", nil, nil, fmt.Errorf("failed to generate LINE direct media URI: %w", err)
 			}
-			return uri, &MessageMetadata{DirectMedia: metadata}, nil
+			return uri, file, &MessageMetadata{DirectMedia: metadata}, nil
 		}
 	}
 	return handler

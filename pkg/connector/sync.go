@@ -1066,6 +1066,9 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	if chat.Extra.GroupExtra != nil {
 		if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
 			members[0].PowerLevel = ptr.Ptr(100)
+		} else if isEditableGroupMID(chat.ChatMid) {
+			// Matrix only allows kicking users with a lower power level than the kicker.
+			members[0].PowerLevel = ptr.Ptr(1)
 		}
 		// If the bridge user is invited but not yet a full member of a GROUP (type 0), surface the
 		// chat as a Beeper message request (Requests section) via info.MessageRequest below. The
@@ -1177,6 +1180,13 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	}
 	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
 		info.Members.PowerLevels = lineGroupPowerLevels()
+	}
+	if chat.Extra.GroupExtra != nil {
+		mutedUntil := bridgev2.Unmuted
+		if chat.NotificationDisabled {
+			mutedUntil = event.MutedForever
+		}
+		info.UserLocal = &bridgev2.UserLocalPortalInfo{MutedUntil: &mutedUntil}
 	}
 	// GetChats can omit self from both lists, so only confirmed membership clears a request.
 	if selfInvitePending {

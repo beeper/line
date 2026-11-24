@@ -60,15 +60,16 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 			return nil, err
 		}
 		info := &event.FileInfo{Width: width, Height: height}
-		if thumbWidth > 0 {
-			if thumbnailURI, _, err := h.GenerateDirectMediaURI(ctx, data.ID, directMedia.Preview()); err != nil {
+		if thumbWidth > 0 && portal != nil {
+			if thumbnailURI, thumbnailFile, _, err := h.GenerateDirectMediaURI(ctx, portal.MXID, data.ID, directMedia.Preview()); err != nil {
 				h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to generate LINE video preview URI")
 			} else {
 				info.ThumbnailURL = thumbnailURI
+				info.ThumbnailFile = thumbnailFile
 				info.ThumbnailInfo = &event.FileInfo{MimeType: "image/jpeg", Width: thumbWidth, Height: thumbHeight}
 			}
 		}
-		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
+		if converted, err := h.generateDirectMedia(ctx, portal, data.ID, directMedia, &event.MessageEventContent{
 			MsgType: event.MsgVideo, RelatesTo: relatesTo, Info: info,
 		}); converted != nil || err != nil {
 			return converted, err

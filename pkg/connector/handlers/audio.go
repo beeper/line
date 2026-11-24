@@ -56,7 +56,7 @@ func (h *Handler) ConvertAudio(ctx context.Context, portal *bridgev2.Portal, int
 		if err != nil {
 			return nil, err
 		}
-		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
+		if converted, err := h.generateDirectMedia(ctx, portal, data.ID, directMedia, &event.MessageEventContent{
 			MsgType: event.MsgAudio, RelatesTo: relatesTo,
 			MSC1767Audio: &event.MSC1767Audio{Duration: directMedia.Duration},
 			MSC3245Voice: &event.MSC3245Voice{},

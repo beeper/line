@@ -32,7 +32,7 @@ type DirectMedia struct {
 	IsPreview   bool     `json:"-"`
 }
 
-type GenerateDirectMediaURI func(context.Context, string, *DirectMedia) (id.ContentURIString, any, error)
+type GenerateDirectMediaURI func(context.Context, id.RoomID, string, *DirectMedia) (id.ContentURIString, *event.EncryptedFileInfo, any, error)
 
 func newDirectMedia(
 	kind, oid, publicPath, sid string,
@@ -108,6 +108,7 @@ func (dm *DirectMedia) Preview() *DirectMedia {
 
 func (h *Handler) generateDirectMedia(
 	ctx context.Context,
+	portal *bridgev2.Portal,
 	messageID string,
 	metadata *DirectMedia,
 	content *event.MessageEventContent,
@@ -115,11 +116,16 @@ func (h *Handler) generateDirectMedia(
 	if h.GenerateDirectMediaURI == nil {
 		return nil, nil
 	}
-	uri, dbMetadata, err := h.GenerateDirectMediaURI(ctx, messageID, metadata)
+	var roomID id.RoomID
+	if portal != nil {
+		roomID = portal.MXID
+	}
+	uri, file, dbMetadata, err := h.GenerateDirectMediaURI(ctx, roomID, messageID, metadata)
 	if err != nil {
 		return nil, err
 	}
 	content.URL = uri
+	content.File = file
 	content.Body = metadata.FileName
 	if content.Info == nil {
 		content.Info = &event.FileInfo{}
