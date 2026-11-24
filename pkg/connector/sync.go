@@ -1066,6 +1066,9 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	if chat.Extra.GroupExtra != nil {
 		if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
 			members[0].PowerLevel = ptr.Ptr(100)
+		} else if isEditableGroupMID(chat.ChatMid) {
+			// Matrix only allows kicking users with a lower power level than the kicker.
+			members[0].PowerLevel = ptr.Ptr(1)
 		}
 		// If the bridge user is invited but not yet a full member of a GROUP (type 0), surface the
 		// chat as a Beeper message request (Requests section) via info.MessageRequest below. The

@@ -15,6 +15,7 @@ import (
 
 	"github.com/disintegration/imaging"
 	"go.mau.fi/util/ffmpeg"
+	"go.mau.fi/util/ptr"
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
@@ -44,7 +45,11 @@ var (
 )
 
 func isEditableGroupMID(mid string) bool {
-	return isChatMID(mid) && !strings.HasPrefix(strings.ToLower(mid), "r")
+	return isChatMID(mid) && !isLegacyRoomMID(mid)
+}
+
+func isLegacyRoomMID(mid string) bool {
+	return strings.HasPrefix(strings.ToLower(mid), "r")
 }
 
 func lineGroupPowerLevels() *bridgev2.PowerLevelOverrides {
@@ -53,6 +58,7 @@ func lineGroupPowerLevels() *bridgev2.PowerLevelOverrides {
 			event.StateRoomName:   0,
 			event.StateRoomAvatar: 0,
 		},
+		Kick: ptr.Ptr(1),
 	}
 }
 
