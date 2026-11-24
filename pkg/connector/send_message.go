@@ -41,6 +41,7 @@ type mentionEntry struct {
 var lineMediaSizeLimits = map[event.MessageType]int{
 	event.MsgImage: 20 * 1024 * 1024,
 	event.MsgAudio: 30 * 1024 * 1024,
+	event.MsgVideo: 200 * 1024 * 1024,
 }
 
 const lineGroupE2EEReconnectNotice = "LINE encryption keys for this group are unavailable. Reconnect LINE in Beeper, then try sending again."
@@ -220,6 +221,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	var mediaData []byte
 	var imageMimeType, imageFileName string
+	var videoDurationMS int
 	switch effectiveMsgType {
 	case event.MsgImage, event.MsgFile, event.MsgVideo, event.MsgAudio:
 		mediaData, err = lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
@@ -237,6 +239,18 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				return nil, err
 			} else {
 				mediaData = imageData
+			}
+		}
+		if effectiveMsgType == event.MsgVideo && len(mediaData) <= lineMediaSizeLimits[event.MsgVideo] {
+			var videoData []byte
+			videoData, videoDurationMS, err = prepareLineVideo(ctx, mediaData, msg.Content.Info)
+			if errors.Is(err, errSendVideoAsFile) {
+				lc.UserLogin.Bridge.Log.Info().Err(err).Msg("LINE can't play this video, sending it as a file")
+				effectiveMsgType = event.MsgFile
+			} else if err != nil {
+				return nil, err
+			} else {
+				mediaData = videoData
 			}
 		}
 		if sizeLimit, ok := lineMediaSizeLimits[effectiveMsgType]; ok && len(mediaData) > sizeLimit {
@@ -531,7 +545,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 		contentMetadata["contentType"] = fmt.Sprintf("%d", ContentVideo)
 
-		if msg.Content.Info.Duration > 0 {
+		if videoDurationMS > 0 {
+			contentMetadata["DURATION"] = fmt.Sprintf("%d", videoDurationMS)
+		} else if msg.Content.Info != nil && msg.Content.Info.Duration > 0 {
 			contentMetadata["DURATION"] = fmt.Sprintf("%d", msg.Content.Info.Duration)
 		}
 

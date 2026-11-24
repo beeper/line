@@ -29,6 +29,7 @@ import (
 	mauffmpeg "go.mau.fi/util/ffmpeg"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/image/draw"
+	"maunium.net/go/mautrix/event"
 )
 
 const maxLineImagePixels = 100_000_000
@@ -552,4 +553,99 @@ func generateChunkHashes(encryptedData []byte) []byte {
 	}
 
 	return allHashes
+}
+
+const (
+	maxLineVideoDuration    = 300 * time.Second
+	maxLineVideoConvertSize = 50 * 1024 * 1024
+	maxLineVideoConvertTime = 2 * time.Minute
+)
+
+var errSendVideoAsFile = errors.New("video must be sent to LINE as a file")
+
+// prepareLineVideo returns the video to send to LINE and its duration in milliseconds, 0 if unknown.
+func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([]byte, int, error) {
+	var durationMS int
+	if info != nil {
+		durationMS = info.Duration
+	}
+	if int64(durationMS) > maxLineVideoDuration.Milliseconds() {
+		return nil, 0, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
+	}
+	ctx, cancel := context.WithTimeout(ctx, maxLineVideoConvertTime)
+	defer cancel()
+	probed, hasVideo, playable, probedMS := probeLineVideo(ctx, data)
+	if probed && !hasVideo {
+		return nil, 0, fmt.Errorf("%w: no video stream", errSendVideoAsFile)
+	}
+	if probedMS > 0 {
+		durationMS = probedMS
+	}
+	if int64(durationMS) > maxLineVideoDuration.Milliseconds() {
+		return nil, 0, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
+	}
+	// Without ffprobe an MP4 keeps the old passthrough instead of every video becoming a file.
+	if playable || (!probed && len(data) >= 12 && string(data[4:8]) == "ftyp") {
+		return data, durationMS, nil
+	}
+	mimeType := http.DetectContentType(data)
+	if len(data) > maxLineVideoConvertSize || !mauffmpeg.Supported() {
+		return nil, 0, fmt.Errorf("%w: not converting %d byte %s", errSendVideoAsFile, len(data), mimeType)
+	}
+	converted, err := mauffmpeg.ConvertBytes(ctx, data, ".mp4", []string{"-threads", "2"}, []string{
+		"-pix_fmt", "yuv420p", "-c:v", "h264", "-preset", "veryfast", "-b:v", "2M", "-c:a", "aac", "-threads", "2",
+		"-movflags", "+faststart", "-filter:v",
+		"scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,crop='floor(in_w/2)*2:floor(in_h/2)*2'",
+	}, "") // An empty mime keeps the input path from colliding with the .mp4 output.
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: converting %s to mp4: %w", errSendVideoAsFile, mimeType, err)
+	}
+	if durationMS <= 0 {
+		_, _, _, durationMS = probeLineVideo(ctx, converted)
+		if int64(durationMS) > maxLineVideoDuration.Milliseconds() {
+			return nil, 0, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
+		}
+	}
+	return converted, durationMS, nil
+}
+
+// probeLineVideo reports whether ffprobe read the file, whether it has a video stream, whether LINE can play it as is, and its duration in milliseconds.
+func probeLineVideo(ctx context.Context, data []byte) (bool, bool, bool, int) {
+	if !mauffmpeg.ProbeSupported() {
+		return false, false, false, 0
+	}
+	file, err := os.CreateTemp("", "line-video-probe-*")
+	if err != nil {
+		return false, false, false, 0
+	}
+	defer os.Remove(file.Name())
+	_, err = file.Write(data)
+	if closeErr := file.Close(); err != nil || closeErr != nil {
+		return false, false, false, 0
+	}
+	probe, err := mauffmpeg.Probe(ctx, file.Name())
+	if err != nil || probe.Format == nil {
+		return false, false, false, 0
+	}
+	var durationMS int
+	if seconds := probe.Format.Duration; seconds > maxLineVideoDuration.Seconds() {
+		durationMS = int(maxLineVideoDuration.Milliseconds()) + 1000
+	} else if seconds > 0 {
+		durationMS = int(seconds * 1000)
+	}
+	playable := strings.Contains(","+probe.Format.FormatName+",", ",mov,")
+	hasVideo := false
+	for _, stream := range probe.Streams {
+		if stream.Disposition.AttachedPic != 0 {
+			continue
+		}
+		switch stream.CodecType {
+		case "video":
+			hasVideo = true
+			playable = playable && stream.CodecName == "h264" && (stream.PixFmt == "yuv420p" || stream.PixFmt == "yuvj420p")
+		case "audio":
+			playable = playable && (stream.CodecName == "aac" || stream.CodecName == "mp3")
+		}
+	}
+	return true, hasVideo, playable && hasVideo, durationMS
 }
