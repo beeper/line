@@ -265,26 +265,30 @@ func (lc *LineClient) updateBlockedRecommendation(mid string, blocked bool) {
 	}
 }
 
+func (lc *LineClient) backfillEnabled() bool {
+	return lc != nil && lc.UserLogin != nil && lc.UserLogin.Bridge != nil && lc.UserLogin.Bridge.Config != nil && lc.UserLogin.Bridge.Config.Backfill.Enabled
+}
+
 func (lc *LineClient) syncDMChats(ctx context.Context) {
 	defer lc.wg.Done()
 	lc.syncMessageBoxes(ctx)
 }
 
-func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
+func (lc *LineClient) syncMessageBoxes(ctx context.Context) ([]line.MessageBox, bool) {
+	backfillEnabled := lc.backfillEnabled()
 	opts := line.MessageBoxesOptions{
 		ActiveOnly:                     true,
 		MessageBoxCountLimit:           messageBoxPageLimit,
-		WithUnreadCount:                lc.UserLogin.Bridge.Config.Backfill.Enabled,
+		WithUnreadCount:                backfillEnabled,
 		LastMessagesPerMessageBoxCount: 0,
 	}
 
 	messageBoxes, err := lc.fetchAllMessageBoxes(ctx, opts)
 	if err != nil {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch message boxes for DM sync")
-		return
+		return nil, false
 	}
 
-	backfillEnabled := lc.UserLogin.Bridge.Config.Backfill.Enabled
 	type dmResync struct {
 		mid                string
 		checkNeedsBackfill func(context.Context, *database.Message) (bool, error)
@@ -324,14 +328,12 @@ func (lc *LineClient) syncMessageBoxes(ctx context.Context) {
 		lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to fetch contacts for DM sync")
 	}
 	for _, dm := range dms {
-		lc.queueDMChatResync(ctx, dm.mid, dm.checkNeedsBackfill != nil, true, dm.checkNeedsBackfill)
+		lc.queueDMChatResync(ctx, dm.mid, dm.checkNeedsBackfill != nil, backfillEnabled, dm.checkNeedsBackfill)
 		if dm.checkNeedsBackfill != nil {
 			lc.queueCatchUpReadReceipt(dm.mid, dm.lastSeen)
 		}
 	}
-	if backfillEnabled {
-		lc.queueBackfillRetryChats(ctx)
-	}
+	return messageBoxes, true
 }
 
 func (lc *LineClient) queueCatchUpReadReceipt(mid, lastSeen string) {
@@ -678,14 +680,6 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 			return &bridgev2.FetchMessagesResponse{HasMore: false, MarkRead: true}, nil
 		}
 	}
-	recovered := lc.retryBackfillMessages(ctx, params.Portal)
-	if unblockState == nil && !manualUnblockBackfill {
-		lc.queueCompletedBackfillReceipts(ctx, chatMID, recovered)
-	}
-	recoveredIDs := make(map[string]bool, len(recovered))
-	for _, msgID := range recovered {
-		recoveredIDs[string(msgID)] = true
-	}
 	limit := params.Count
 	if limit <= 0 {
 		limit = startupBackfillMessageLimit
@@ -717,10 +711,13 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 	// LINE returns newest-first; backfill wants oldest-first.
 	backfillMsgs := make([]*bridgev2.BackfillMessage, 0, len(msgs))
 	for i := len(msgs) - 1; i >= 0; i-- {
-		msg := msgs[i]
-		if recoveredIDs[msg.ID] {
-			continue
+		if ctx.Err() != nil {
+			if unblockState != nil {
+				unblockState.complete()
+			}
+			return nil, ctx.Err()
 		}
+		msg := msgs[i]
 		if lc.shouldSkipDeletedChat(chatMID, msg.ID) {
 			hasMore = false
 			continue
@@ -735,18 +732,14 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 
 		converted, err := lc.convertBackfillMessage(ctx, params.Portal, msg)
 		if err != nil {
-			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
-			stored, saveErr := lc.storeBackfillRetry(ctx, chatMID, msg)
-			if saveErr != nil {
+			if ctx.Err() != nil {
 				if unblockState != nil {
 					unblockState.complete()
 				}
-				return nil, saveErr
-			} else if stored {
-				converted = lc.backfillRetryPlaceholder(msg)
-			} else {
-				converted = lc.backfillRetryOverflow(msg)
+				return nil, ctx.Err()
 			}
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
+			converted = lc.unavailableBackfillMessage(msg)
 		}
 		if converted != nil {
 			backfillMsgs = append(backfillMsgs, converted)
@@ -798,42 +791,108 @@ func backfillCursorEnd(params bridgev2.FetchMessagesParams) (line.MessageIDWrapp
 	}, true
 }
 
+func (lc *LineClient) unavailableBackfillMessage(msg *line.Message) *bridgev2.BackfillMessage {
+	return &bridgev2.BackfillMessage{
+		ID:        networkid.MessageID(msg.ID),
+		Sender:    lc.eventSenderForMID(msg.From),
+		Timestamp: lc.parseMessageTimestamp(msg),
+		ConvertedMessage: &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{{
+				Type: event.EventMessage,
+				Content: &event.MessageEventContent{
+					MsgType: event.MsgNotice,
+					Body:    "[LINE message unavailable. Open LINE to view it.]",
+				},
+			}},
+		},
+	}
+}
+
+func (lc *LineClient) convertBackfillMessage(ctx context.Context, portal *bridgev2.Portal, msg *line.Message) (*bridgev2.BackfillMessage, error) {
+	sender := lc.eventSenderForMID(msg.From)
+	intent, ok := portal.GetIntentFor(ctx, sender, lc.UserLogin, bridgev2.RemoteEventMessage)
+	if !ok {
+		return nil, fmt.Errorf("failed to get backfill sender intent")
+	}
+	opType := OpReceiveMessage
+	if msg.From == lc.Mid {
+		opType = OpSendMessage
+	}
+	bodyText, unwrappedText, decryptionFailed := lc.decryptMessageBody(msg, string(portal.ID), int(opType))
+	converted, err := lc.convertLineMessage(ctx, portal, intent, *msg, bodyText, unwrappedText, decryptionFailed)
+	if err != nil || converted == nil {
+		return nil, err
+	}
+	reactions, _ := lc.convertMessageReactions(ctx, msg)
+	return &bridgev2.BackfillMessage{
+		ConvertedMessage: converted,
+		Sender:           sender,
+		ID:               networkid.MessageID(msg.ID),
+		Timestamp:        lc.parseMessageTimestamp(msg),
+		Reactions:        reactions,
+	}, nil
+}
+
 func (lc *LineClient) fetchMessagesSince(ctx context.Context, chatMID string, anchor *database.Message, limit int) ([]*line.Message, error) {
-	client, msgs, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
-		return client.GetRecentMessagesV2(chatMID, min(limit, backfillPageSize))
+	firstCount := min(limit, backfillPageSize)
+	client, page, err := callLineResult(lc, ctx, func(client *line.Client) ([]*line.Message, error) {
+		return client.GetRecentMessagesV2(chatMID, firstCount)
 	})
 	if err != nil {
 		return nil, err
 	}
-	reachedAnchor := func(page []*line.Message) bool {
+	seen := make(map[string]struct{}, limit)
+	msgs := make([]*line.Message, 0, len(page))
+	appendUnique := func(items []*line.Message) int {
+		added := 0
+		for _, msg := range items {
+			if msg == nil || len(msgs) >= limit {
+				continue
+			}
+			if _, dup := seen[msg.ID]; dup {
+				continue
+			}
+			seen[msg.ID] = struct{}{}
+			msgs = append(msgs, msg)
+			added++
+		}
+		return added
+	}
+	reachedAnchor := func(items []*line.Message) bool {
 		if anchor == nil {
 			return false
 		}
-		for _, msg := range page {
-			if msg.ID == string(anchor.ID) || lc.parseMessageTimestamp(msg).Before(anchor.Timestamp) {
+		for _, msg := range items {
+			if msg != nil && (msg.ID == string(anchor.ID) || lc.parseMessageTimestamp(msg).Before(anchor.Timestamp)) {
 				return true
 			}
 		}
 		return false
 	}
-	page := msgs
-	for len(page) > 0 && len(msgs) < limit && !reachedAnchor(page) {
-		end := lineMessageIDWrapper(page[len(page)-1])
+	appendUnique(page)
+	// Fewer messages than requested means the start of chat history was already reached.
+	if len(page) < firstCount {
+		return msgs, nil
+	}
+	for len(page) > 0 && len(msgs) > 0 && len(msgs) < limit && !reachedAnchor(page) {
+		end := lineMessageIDWrapper(msgs[len(msgs)-1])
+		reqCount := min(limit-len(msgs)+1, backfillPageSize)
 		client, page, err = callLineResultUsing(lc, ctx, client, func(client *line.Client) ([]*line.Message, error) {
-			return client.GetPreviousMessagesV2WithRequest(ctx, chatMID, end, min(limit-len(msgs)+1, backfillPageSize))
+			return client.GetPreviousMessagesV2WithRequest(ctx, chatMID, end, reqCount)
 		})
 		if err != nil {
 			return nil, err
 		}
-		page = slices.DeleteFunc(page, func(msg *line.Message) bool { return msg.ID == end.MessageID })
-		page = page[:min(len(page), limit-len(msgs))]
-		msgs = append(msgs, page...)
+		if appendUnique(page) == 0 || len(page) < reqCount {
+			break
+		}
 	}
 	return msgs, nil
 }
 
 func (lc *LineClient) fetchMessagesBefore(ctx context.Context, chatMID string, end line.MessageIDWrapper, limit int) (msgs []*line.Message, hasMore bool, err error) {
 	var client *line.Client
+	seen := map[string]struct{}{end.MessageID: {}}
 	for len(msgs) < limit {
 		count := min(limit-len(msgs)+1, backfillPageSize)
 		var page []*line.Message
@@ -844,16 +903,26 @@ func (lc *LineClient) fetchMessagesBefore(ctx context.Context, chatMID string, e
 			return nil, false, err
 		}
 		hasMore = len(page) >= count
-		page = slices.DeleteFunc(page, func(msg *line.Message) bool { return msg.ID == end.MessageID })
-		if len(page) == 0 {
+		added := 0
+		for _, msg := range page {
+			if msg == nil || len(msgs) >= limit {
+				continue
+			}
+			if _, dup := seen[msg.ID]; dup {
+				continue
+			}
+			seen[msg.ID] = struct{}{}
+			msgs = append(msgs, msg)
+			added++
+		}
+		if added == 0 {
 			return msgs, false, nil
 		}
-		page = page[:min(len(page), limit-len(msgs))]
-		msgs = append(msgs, page...)
-		if !hasMore {
+		// Full 50-item inclusive pages yield 49 older messages; return them instead of making an extra RPC for 1-2 items.
+		if !hasMore || (count == backfillPageSize && limit-len(msgs) <= 2) {
 			break
 		}
-		end = lineMessageIDWrapper(page[len(page)-1])
+		end = lineMessageIDWrapper(msgs[len(msgs)-1])
 	}
 	return msgs, hasMore, nil
 }
@@ -1028,7 +1097,7 @@ func (lc *LineClient) backfillRecentMessages(ctx context.Context, chatMID string
 		var didQueue bool
 		if ContentType(msg.ContentType) == ContentSystem {
 			didQueue = lc.queueHistoricalSystemMessage(msg, int(opType))
-		} else if !lc.UserLogin.Bridge.Config.Backfill.Enabled {
+		} else if !lc.backfillEnabled() {
 			didQueue = lc.queueIncomingMessage(msg, int(opType))
 		}
 		if didQueue {
@@ -1871,9 +1940,6 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 
 		switch eventType {
 		case line.SSEEventOpen, "ping", "connInfoRevision":
-			if eventType == line.SSEEventOpen && lc.UserLogin.Bridge.Config != nil && lc.UserLogin.Bridge.Config.Backfill.Enabled {
-				lc.queueBackfillRetryChats(ctx)
-			}
 		case "reconnect":
 			lc.UserLogin.Bridge.Log.Debug().Msg("LINE asked to reconnect the operation stream")
 			cancelListen(errSSEReconnect)
@@ -1909,11 +1975,16 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			for _, mid := range newlyUnblocked {
 				lc.queueUnblockedDMRestore(ctx, mid, "full_sync")
 			}
-			if lc.UserLogin.Bridge.Config.Backfill.Enabled {
+			if lc.backfillEnabled() {
+				// Queue chat portals and catch-up resyncs before later live ops can advance the backfill anchor.
 				lc.syncChatsNow(ctx)
-				lc.syncMessageBoxes(ctx)
-				lc.wg.Add(1)
-				go lc.prefetchMessages(ctx)
+				if boxes, ok := lc.syncMessageBoxes(ctx); ok {
+					lc.wg.Add(1)
+					go func() {
+						defer lc.wg.Done()
+						lc.prefetchMessageBoxes(ctx, boxes)
+					}()
+				}
 			} else {
 				lc.wg.Add(3)
 				go lc.syncChats(ctx)
@@ -2260,7 +2331,6 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 	case OpUnsendLocal, OpUnsendRemote:
 		chatMid := op.Param1
 		msgID := op.Param2
-		lc.discardBackfillRetry(ctx, msgID)
 		lc.UserLogin.Bridge.Log.Info().Str("msg_id", msgID).Str("chat_mid", chatMid).Int("op_type", op.Type).Msg("Received unsend operation")
 
 		ts, _ := op.CreatedTime.Int64()
