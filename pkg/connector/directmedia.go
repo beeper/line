@@ -24,8 +24,7 @@ const (
 )
 
 type MessageMetadata struct {
-	BackfillRetry bool                  `json:"backfill_retry,omitempty"`
-	DirectMedia   *handlers.DirectMedia `json:"direct_media,omitempty"`
+	DirectMedia *handlers.DirectMedia `json:"direct_media,omitempty"`
 }
 
 type lineDirectMediaID struct {
