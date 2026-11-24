@@ -1121,6 +1121,8 @@ func (lc *LineClient) tryLogin(ctx context.Context) error {
 	}
 	lc.missingE2EEKeyMu.Lock()
 	defer lc.missingE2EEKeyMu.Unlock()
+	// The operation stream may have saved a newer revision while recovery ran.
+	staged.OpRevision, staged.LastOpRevisionAt = meta.OpRevision, meta.LastOpRevisionAt
 	previous := *meta
 	*meta = staged
 	if err := lc.UserLogin.Save(ctx); err != nil {
