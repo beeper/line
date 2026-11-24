@@ -574,7 +574,10 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxLineVideoConvertTime)
 	defer cancel()
-	probed, playable, probedMS := probeLineVideo(ctx, data)
+	probed, hasVideo, playable, probedMS := probeLineVideo(ctx, data)
+	if probed && !hasVideo {
+		return nil, 0, fmt.Errorf("%w: no video stream", errSendVideoAsFile)
+	}
 	if probedMS > 0 {
 		durationMS = probedMS
 	}
@@ -591,13 +594,14 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	}
 	converted, err := mauffmpeg.ConvertBytes(ctx, data, ".mp4", []string{"-threads", "2"}, []string{
 		"-pix_fmt", "yuv420p", "-c:v", "h264", "-preset", "veryfast", "-b:v", "2M", "-c:a", "aac", "-threads", "2",
-		"-movflags", "+faststart", "-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
+		"-movflags", "+faststart", "-filter:v",
+		"scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,crop='floor(in_w/2)*2:floor(in_h/2)*2'",
 	}, "") // An empty mime keeps the input path from colliding with the .mp4 output.
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: converting %s to mp4: %w", errSendVideoAsFile, mimeType, err)
 	}
 	if durationMS <= 0 {
-		_, _, durationMS = probeLineVideo(ctx, converted)
+		_, _, _, durationMS = probeLineVideo(ctx, converted)
 		if int64(durationMS) > maxLineVideoDuration.Milliseconds() {
 			return nil, 0, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
 		}
@@ -605,23 +609,23 @@ func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([
 	return converted, durationMS, nil
 }
 
-// probeLineVideo reports whether ffprobe read the video, whether LINE can play it as is, and its duration in milliseconds.
-func probeLineVideo(ctx context.Context, data []byte) (bool, bool, int) {
+// probeLineVideo reports whether ffprobe read the file, whether it has a video stream, whether LINE can play it as is, and its duration in milliseconds.
+func probeLineVideo(ctx context.Context, data []byte) (bool, bool, bool, int) {
 	if !mauffmpeg.ProbeSupported() {
-		return false, false, 0
+		return false, false, false, 0
 	}
 	file, err := os.CreateTemp("", "line-video-probe-*")
 	if err != nil {
-		return false, false, 0
+		return false, false, false, 0
 	}
 	defer os.Remove(file.Name())
 	_, err = file.Write(data)
 	if closeErr := file.Close(); err != nil || closeErr != nil {
-		return false, false, 0
+		return false, false, false, 0
 	}
 	probe, err := mauffmpeg.Probe(ctx, file.Name())
 	if err != nil || probe.Format == nil {
-		return false, false, 0
+		return false, false, false, 0
 	}
 	var durationMS int
 	if seconds := probe.Format.Duration; seconds > maxLineVideoDuration.Seconds() {
@@ -643,5 +647,5 @@ func probeLineVideo(ctx context.Context, data []byte) (bool, bool, int) {
 			playable = playable && (stream.CodecName == "aac" || stream.CodecName == "mp3")
 		}
 	}
-	return true, playable && hasVideo, durationMS
+	return true, hasVideo, playable && hasVideo, durationMS
 }
