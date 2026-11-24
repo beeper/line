@@ -59,14 +59,19 @@ func wrapLineLoginError(err error) error {
 		reason = details.ErrorMessage
 	}
 	switch {
-	case errors.Is(err, line.ErrLoginVerificationExpired):
+	case errors.Is(err, line.ErrLoginVerificationExpired), line.IsQRLoginPollExpired(err):
 		mapped = ErrLoginVerificationFailed
 	case isBlockedUserLoginError(reason):
 		mapped = ErrLoginTooManyAttempts
 	case details.HTTPStatus == http.StatusTooManyRequests:
 		mapped = ErrLoginTooManyAttempts
-	case details.HTTPStatus == http.StatusUnauthorized, details.HTTPStatus == http.StatusForbidden:
+	case (details.HTTPStatus == http.StatusUnauthorized || details.HTTPStatus == http.StatusForbidden) && !errors.As(err, new(*line.QRError)):
 		mapped = ErrLoginRejected
+	case line.IsQRLoginPollRejected(err):
+		mapped = ErrLoginVerificationFailed
+		if reason != "" {
+			mapped = mapped.WithMessage("%s", reason)
+		}
 	case reason != "":
 		// LINE's own reason strings are short and user-facing, so quote them.
 		mapped = ErrLoginRejected.WithMessage("%s", reason)

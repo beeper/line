@@ -116,11 +116,17 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 	select {
 	case err := <-lq.poll:
 		if err != nil {
+			attemptErr := lq.login.attemptCtx.Err()
 			lq.Cancel()
-			if line.IsQRLoginPollExpired(err) {
-				return nil, fmt.Errorf("%w: %w", ErrLoginVerificationFailed, err)
+			if attemptErr != nil {
+				return nil, attemptErr
 			}
-			return nil, err
+			flow := "qr_poll"
+			if lq.pin {
+				flow = "qr_pin_poll"
+			}
+			lq.login.logLoginFailure(err, flow)
+			return nil, wrapLineLoginError(err)
 		}
 	case <-lq.login.attemptCtx.Done():
 		lq.Cancel()
