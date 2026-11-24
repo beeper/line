@@ -269,7 +269,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 			ll.mu.Unlock()
 			return qrLogin.StartWithOverride(ctx, override)
 		}
-		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
+		return ll.loginLocalErrorStep(msgErrorNoStoredCredentials.Message()), nil
 	}
 	if meta.ForceFullE2EELogin || (!meta.NoE2EE && len(meta.ExportedKeyMap) == 0) {
 		ll.Certificate = ""
@@ -288,7 +288,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 		ll.logLoginFailure(err, "reconnect")
 		reason := loginErrorReason(err)
 		if reason == "" {
-			reason = genericLoginFailureReason
+			return ll.loginLocalErrorStep(msgErrorRejected.Message()), nil
 		}
 		return ll.loginErrorStep(reason), nil
 	}
@@ -313,7 +313,7 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 	}
 
 	if ll.Email == "" || ll.Password == "" {
-		return ll.loginErrorStep("Email and password are required"), nil
+		return ll.loginLocalErrorStep(msgErrorCredentialsRequired.Message()), nil
 	}
 
 	res, err := ll.loginCredentials(ctx, "")
@@ -321,7 +321,7 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 		ll.logLoginFailure(err, "credentials")
 		reason := loginErrorReason(err)
 		if reason == "" {
-			reason = genericLoginFailureReason
+			return ll.loginLocalErrorStep(msgErrorRejected.Message()), nil
 		}
 		return ll.loginErrorStep(reason), nil
 	}
@@ -330,10 +330,18 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 }
 
 func (ll *LineEmailLogin) loginErrorStep(message string) *bridgev2.LoginStep {
+	return ll.loginErrorStepWithInstructions(loginErrorInstructions(message))
+}
+
+func (ll *LineEmailLogin) loginLocalErrorStep(detail l10n.Message) *bridgev2.LoginStep {
+	return ll.loginErrorStepWithInstructions(msgStepCredsErrorInstructions.Render(l10n.Params{"error": detail}))
+}
+
+func (ll *LineEmailLogin) loginErrorStepWithInstructions(instructions l10n.Message) *bridgev2.LoginStep {
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeUserInput,
 		StepID:       "dev.highest.matrix.line.enter_creds",
-		Instructions: loginErrorInstructions(message),
+		Instructions: instructions,
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
@@ -364,7 +372,7 @@ func loginErrorInstructions(message string) l10n.Message {
 	if strings.EqualFold(message, "Account ID or password is invalid") {
 		return msgStepCredsInvalidInstructions.Message()
 	}
-	return msgStepCredsErrorInstructions.Render(l10n.Params{"error": message})
+	return msgStepCredsErrorInstructions.Render(l10n.Params{"error": l10n.Unlocalized(message)})
 }
 
 type loginErrorDetails struct {

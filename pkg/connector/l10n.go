@@ -21,8 +21,12 @@ var (
 	msgStepCredsInvalidInstructions         = L.Define("login.step.enter_creds.invalid.instructions", "LINE rejected the email or password. Make sure you used the email from LINE Settings -> Account -> Email Address, then try again.")
 	msgStepCredsErrorInstructions           = L.Define(
 		"login.step.enter_creds.error.instructions", "Could not log in to LINE: {error}",
-		l10n.WithComment("error is the error message returned by LINE"),
+		l10n.WithComment("error is a message explaining the failure: either text returned by LINE or one of the login.error.* messages"),
 	)
+	msgErrorNoStoredCredentials = L.Define("login.error.no_stored_credentials", "No stored LINE credentials are available. Please enter your LINE email and password to reconnect.")
+	msgErrorCredentialsRequired = L.Define("login.error.credentials_required", "Email and password are required")
+	msgErrorRejected            = L.Define("login.error.rejected", "LINE rejected the sign-in. Please check your email and password and try again.")
+
 	msgStepCredsQRRevokedInstructions = L.Define("login.step.enter_creds.qr_revoked.instructions", "LINE signed this QR login out right away. Log in with your LINE email and password instead.")
 
 	msgStepWaitVerificationInstructions    = L.Define("login.step.wait_verification.instructions", "Please open the LINE app on your mobile device to complete the login.")
