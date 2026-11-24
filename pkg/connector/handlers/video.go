@@ -57,7 +57,7 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		if err != nil {
 			return nil, err
 		}
-		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
+		if converted, err := h.generateDirectMedia(ctx, portal, data.ID, directMedia, &event.MessageEventContent{
 			MsgType: event.MsgVideo, RelatesTo: relatesTo,
 		}); converted != nil || err != nil {
 			return converted, err
