@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	lineDirectMediaIDVersion   = 1
-	lineDirectMediaIDMaxLength = 64
+	lineDirectMediaIDVersion        = 1
+	lineDirectMediaPreviewIDVersion = 2
+	lineDirectMediaIDMaxLength      = 64
 )
 
 type MessageMetadata struct {
@@ -29,6 +30,7 @@ type MessageMetadata struct {
 type lineDirectMediaID struct {
 	UserLoginID networkid.UserLoginID
 	MessageID   networkid.MessageID
+	IsPreview   bool
 }
 
 var _ bridgev2.DirectMediableNetwork = (*LineConnector)(nil)
@@ -37,18 +39,22 @@ func (lc *LineConnector) SetUseDirectMedia() {
 	lc.directMedia.Store(true)
 }
 
-func makeLineDirectMediaID(userLoginID networkid.UserLoginID, messageID networkid.MessageID) (networkid.MediaID, error) {
+func makeLineDirectMediaID(userLoginID networkid.UserLoginID, messageID networkid.MessageID, isPreview bool) (networkid.MediaID, error) {
 	login, message := []byte(userLoginID), []byte(messageID)
 	if len(login) == 0 || len(login) > lineDirectMediaIDMaxLength || len(message) == 0 || len(message) > lineDirectMediaIDMaxLength {
 		return nil, fmt.Errorf("invalid LINE direct media ID components")
 	}
-	mediaID := append([]byte{lineDirectMediaIDVersion, byte(len(login))}, login...)
+	version := byte(lineDirectMediaIDVersion)
+	if isPreview {
+		version = lineDirectMediaPreviewIDVersion
+	}
+	mediaID := append([]byte{version, byte(len(login))}, login...)
 	mediaID = append(mediaID, byte(len(message)))
 	return append(mediaID, message...), nil
 }
 
 func parseLineDirectMediaID(mediaID networkid.MediaID) (*lineDirectMediaID, error) {
-	if len(mediaID) < 4 || mediaID[0] != lineDirectMediaIDVersion {
+	if len(mediaID) < 4 || (mediaID[0] != lineDirectMediaIDVersion && mediaID[0] != lineDirectMediaPreviewIDVersion) {
 		return nil, fmt.Errorf("invalid LINE direct media ID")
 	}
 	loginLength := int(mediaID[1])
@@ -62,6 +68,7 @@ func parseLineDirectMediaID(mediaID networkid.MediaID) (*lineDirectMediaID, erro
 	return &lineDirectMediaID{
 		UserLoginID: networkid.UserLoginID(mediaID[2 : loginLength+2]),
 		MessageID:   networkid.MessageID(mediaID[loginLength+3:]),
+		IsPreview:   mediaID[0] == lineDirectMediaPreviewIDVersion,
 	}, nil
 }
 
@@ -92,14 +99,18 @@ func (lc *LineConnector) Download(ctx context.Context, mediaID networkid.MediaID
 	if !ok || metadata.DirectMedia == nil {
 		return nil, fmt.Errorf("message does not have LINE direct media metadata")
 	}
-	data, err := client.newMessageHandler().DownloadDirectMedia(ctx, string(parsed.MessageID), metadata.DirectMedia)
+	directMedia := metadata.DirectMedia
+	if parsed.IsPreview {
+		directMedia = directMedia.Preview()
+	}
+	data, err := client.newMessageHandler().DownloadDirectMedia(ctx, string(parsed.MessageID), directMedia)
 	if err != nil {
 		return nil, wrapDirectMediaError(err)
 	}
 	if len(data) > handlers.BeeperMaxFileSize {
-		return nil, fmt.Errorf("%w: LINE %s is %.2f MiB", bridgev2.ErrMediaTooLarge, metadata.DirectMedia.Kind, float64(len(data))/(1024*1024))
+		return nil, fmt.Errorf("%w: LINE %s is %.2f MiB", bridgev2.ErrMediaTooLarge, directMedia.Kind, float64(len(data))/(1024*1024))
 	}
-	contentType := metadata.DirectMedia.ContentType
+	contentType := directMedia.ContentType
 	if contentType == "" {
 		contentType = http.DetectContentType(data)
 	}
