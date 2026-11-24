@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.mau.fi/util/configupgrade"
+	"go.mau.fi/util/l10n"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -24,8 +25,7 @@ import (
 )
 
 const (
-	loginTooManyAttemptsReason       = "Too many login attempts"
-	loginTooManyAttemptsInstructions = "Too many login attempts. LINE has locked login for this account temporarily."
+	loginTooManyAttemptsReason = "Too many login attempts"
 )
 
 type LineConnector struct {
@@ -176,12 +176,12 @@ const LoginFlowIDQR = "dev.highest.matrix.line.qr_login"
 
 func (lc *LineConnector) GetLoginFlows() []bridgev2.LoginFlow {
 	flows := []bridgev2.LoginFlow{{
-		Name:        "Login",
-		Description: "Login with your LINE Email and Password",
+		Name:        msgFlowEmailName.Message(),
+		Description: msgFlowEmailDescription.Message(),
 		ID:          LoginFlowIDEmail,
 	}}
 	if lc.Config.QRLogin {
-		flows = append([]bridgev2.LoginFlow{{Name: "QR Code", Description: "Scan a QR code with the LINE mobile app", ID: LoginFlowIDQR}}, flows...)
+		flows = append([]bridgev2.LoginFlow{{Name: msgFlowQRName.Message(), Description: msgFlowQRDescription.Message(), ID: LoginFlowIDQR}}, flows...)
 	}
 	return flows
 }
@@ -229,19 +229,19 @@ func (ll *LineEmailLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeUserInput,
 		StepID:       "dev.highest.matrix.line.enter_creds",
-		Instructions: "Please enter your LINE email and password.",
+		Instructions: msgStepCredsInstructions.Message(),
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
 					Type:           bridgev2.LoginInputFieldTypeUsername,
 					ID:             "email",
-					Name:           "Email",
+					Name:           msgFieldEmailName.Message(),
 					AutofillDomain: "line.me",
 				},
 				{
 					Type:           bridgev2.LoginInputFieldTypePassword,
 					ID:             "password",
-					Name:           "Password",
+					Name:           msgFieldPasswordName.Message(),
 					AutofillDomain: "line.me",
 				},
 			},
@@ -269,7 +269,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 			ll.mu.Unlock()
 			return qrLogin.StartWithOverride(ctx, override)
 		}
-		return ll.loginErrorStep("No stored LINE credentials are available. Please enter your LINE email and password to reconnect."), nil
+		return ll.loginLocalErrorStep(msgErrorNoStoredCredentials.Message()), nil
 	}
 	if meta.ForceFullE2EELogin || (!meta.NoE2EE && len(meta.ExportedKeyMap) == 0) {
 		ll.Certificate = ""
@@ -288,7 +288,7 @@ func (ll *LineEmailLogin) StartWithOverride(ctx context.Context, override *bridg
 		ll.logLoginFailure(err, "reconnect")
 		reason := loginErrorReason(err)
 		if reason == "" {
-			reason = genericLoginFailureReason
+			return ll.loginLocalErrorStep(msgErrorRejected.Message()), nil
 		}
 		return ll.loginErrorStep(reason), nil
 	}
@@ -313,7 +313,7 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 	}
 
 	if ll.Email == "" || ll.Password == "" {
-		return ll.loginErrorStep("Email and password are required"), nil
+		return ll.loginLocalErrorStep(msgErrorCredentialsRequired.Message()), nil
 	}
 
 	res, err := ll.loginCredentials(ctx, "")
@@ -321,7 +321,7 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 		ll.logLoginFailure(err, "credentials")
 		reason := loginErrorReason(err)
 		if reason == "" {
-			reason = genericLoginFailureReason
+			return ll.loginLocalErrorStep(msgErrorRejected.Message()), nil
 		}
 		return ll.loginErrorStep(reason), nil
 	}
@@ -330,22 +330,30 @@ func (ll *LineEmailLogin) SubmitUserInput(ctx context.Context, input map[string]
 }
 
 func (ll *LineEmailLogin) loginErrorStep(message string) *bridgev2.LoginStep {
+	return ll.loginErrorStepWithInstructions(loginErrorInstructions(message))
+}
+
+func (ll *LineEmailLogin) loginLocalErrorStep(detail l10n.Message) *bridgev2.LoginStep {
+	return ll.loginErrorStepWithInstructions(msgStepCredsErrorInstructions.Render(l10n.Params{"error": detail}))
+}
+
+func (ll *LineEmailLogin) loginErrorStepWithInstructions(instructions l10n.Message) *bridgev2.LoginStep {
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeUserInput,
 		StepID:       "dev.highest.matrix.line.enter_creds",
-		Instructions: loginErrorInstructions(message),
+		Instructions: instructions,
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
 					Type:           bridgev2.LoginInputFieldTypeUsername,
 					ID:             "email",
-					Name:           "Email",
+					Name:           msgFieldEmailName.Message(),
 					AutofillDomain: "line.me",
 				},
 				{
 					Type:           bridgev2.LoginInputFieldTypePassword,
 					ID:             "password",
-					Name:           "Password",
+					Name:           msgFieldPasswordName.Message(),
 					AutofillDomain: "line.me",
 				},
 			},
@@ -353,18 +361,18 @@ func (ll *LineEmailLogin) loginErrorStep(message string) *bridgev2.LoginStep {
 	}
 }
 
-func loginErrorInstructions(message string) string {
+func loginErrorInstructions(message string) l10n.Message {
 	message = strings.TrimSpace(message)
 	if message == "" {
-		return "Could not log in to LINE. Please check your email and password and try again."
+		return msgStepCredsFailedInstructions.Message()
 	}
 	if strings.EqualFold(message, loginTooManyAttemptsReason) || isBlockedUserLoginError(message) {
-		return loginTooManyAttemptsInstructions
+		return msgStepCredsTooManyAttemptsInstructions.Message()
 	}
 	if strings.EqualFold(message, "Account ID or password is invalid") {
-		return "LINE rejected the email or password. Make sure you used the email from LINE Settings -> Account -> Email Address, then try again."
+		return msgStepCredsInvalidInstructions.Message()
 	}
-	return fmt.Sprintf("Could not log in to LINE: %s", message)
+	return msgStepCredsErrorInstructions.Render(l10n.Params{"error": l10n.Unlocalized(message)})
 }
 
 type loginErrorDetails struct {
@@ -610,13 +618,13 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 	}
 
 	if (res.Type == 3 || res.Type == 0) && res.Verifier != "" {
-		instructions := "Please open the LINE app on your mobile device to complete the login."
+		instructions := msgStepWaitVerificationInstructions.Message()
 		pin := res.Pin
 		if res.PinCode != "" {
 			pin = res.PinCode
 		}
 		if pin != "" {
-			instructions = fmt.Sprintf("Open LINE and enter this PIN on your mobile device: %s", pin)
+			instructions = msgStepWaitVerificationPINInstructions.Render(l10n.Params{"pin": pin})
 		}
 
 		// Start polling in background immediately so it's running while the user enters the PIN
@@ -685,7 +693,7 @@ func (ll *LineEmailLogin) handleLoginResponse(ctx context.Context, res *line.Log
 		return &bridgev2.LoginStep{
 			Type:         bridgev2.LoginStepTypeDisplayAndWait,
 			StepID:       "dev.highest.matrix.line.enter_pin",
-			Instructions: fmt.Sprintf("Please open the LINE app on your mobile device and enter this PIN code: **%s**\n\nAfter entering the code, click Continue below.", res.Certificate),
+			Instructions: msgStepEnterPINInstructions.Render(l10n.Params{"pin": res.Certificate}),
 			DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
 				Type: bridgev2.LoginDisplayTypeNothing,
 			},
@@ -859,7 +867,7 @@ func (ll *LineEmailLogin) finishLogin(ctx context.Context, res *line.LoginResult
 	return &bridgev2.LoginStep{
 		Type:           bridgev2.LoginStepTypeComplete,
 		StepID:         "dev.highest.matrix.line.complete",
-		Instructions:   "Successfully logged in",
+		Instructions:   msgStepCompleteInstructions.Message(),
 		CompleteParams: &bridgev2.LoginCompleteParams{UserLoginID: ul.ID, UserLogin: ul},
 	}, nil
 }

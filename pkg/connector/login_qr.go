@@ -28,8 +28,6 @@ var _ bridgev2.LoginProcessDisplayAndWait = (*LineQRLogin)(nil)
 var _ bridgev2.LoginProcessUserInput = (*LineQRLogin)(nil)
 var _ bridgev2.LoginProcessWithOverride = (*LineQRLogin)(nil)
 
-const qrSessionRevokedInstructions = "LINE signed this QR login out right away. Log in with your LINE email and password instead."
-
 func (lq *LineQRLogin) StartWithOverride(ctx context.Context, override *bridgev2.UserLogin) (*bridgev2.LoginStep, error) {
 	meta, ok := override.Metadata.(*UserLoginMetadata)
 	if !ok {
@@ -79,7 +77,7 @@ func (lq *LineQRLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	}, true)
 	return &bridgev2.LoginStep{
 		Type: bridgev2.LoginStepTypeDisplayAndWait, StepID: "dev.highest.matrix.line.qr",
-		Instructions:         "Scan this QR code with the LINE mobile app.",
+		Instructions:         msgStepQRInstructions.Message(),
 		DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{Type: bridgev2.LoginDisplayTypeQR, Data: qr.CallbackURL},
 	}, nil
 }
@@ -149,7 +147,7 @@ func (lq *LineQRLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 		lq.startPoll(lq.client.CheckPinCodeVerifiedContext, false)
 		return &bridgev2.LoginStep{
 			Type: bridgev2.LoginStepTypeDisplayAndWait, StepID: "dev.highest.matrix.line.qr_pin",
-			Instructions:         "Enter the displayed PIN in the LINE mobile app.",
+			Instructions:         msgStepQRPINInstructions.Message(),
 			DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{Type: bridgev2.LoginDisplayTypeCode, Data: pin},
 		}, nil
 	}
@@ -172,7 +170,7 @@ func (lq *LineQRLogin) finish(ctx context.Context) (*bridgev2.LoginStep, error) 
 	lq.email = email
 	lq.emailMu.Unlock()
 	step = email.loginErrorStep("")
-	step.Instructions = qrSessionRevokedInstructions
+	step.Instructions = msgStepCredsQRRevokedInstructions.Message()
 	return step, nil
 }
 
