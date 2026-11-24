@@ -63,9 +63,6 @@ var getProfileWithToken = func(ctx context.Context, token string) (*line.Profile
 }
 
 type LineClient struct {
-	backfillRetryMu      sync.Mutex
-	backfillRetryReady   bool
-	backfillRetryActive  map[networkid.PortalKey]bool
 	stickerPacksMu       sync.Mutex
 	stickerPacksFetching chan struct{}
 	stickerPacks         map[string]line.ShopProduct
@@ -937,7 +934,7 @@ func (lc *LineClient) startSession(ctx context.Context) bool {
 		return false
 	}
 	lc.syncChatsNow(ctx)
-	if lc.UserLogin.Bridge.Config.Backfill.Enabled {
+	if lc.backfillEnabled() {
 		lc.syncMessageBoxes(ctx)
 	} else {
 		lc.wg.Add(2)
