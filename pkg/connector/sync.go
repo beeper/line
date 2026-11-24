@@ -739,7 +739,7 @@ func (lc *LineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMe
 				return nil, ctx.Err()
 			}
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Str("msg_id", msg.ID).Str("chat_mid", chatMID).Msg("Failed to convert message for backfill")
-			continue
+			converted = lc.unavailableBackfillMessage(msg)
 		}
 		if converted != nil {
 			backfillMsgs = append(backfillMsgs, converted)
@@ -789,6 +789,23 @@ func backfillCursorEnd(params bridgev2.FetchMessagesParams) (line.MessageIDWrapp
 		DeliveredTime: json.Number(strconv.FormatInt(params.AnchorMessage.Timestamp.UnixMilli(), 10)),
 		MessageID:     string(params.AnchorMessage.ID),
 	}, true
+}
+
+func (lc *LineClient) unavailableBackfillMessage(msg *line.Message) *bridgev2.BackfillMessage {
+	return &bridgev2.BackfillMessage{
+		ID:        networkid.MessageID(msg.ID),
+		Sender:    lc.eventSenderForMID(msg.From),
+		Timestamp: lc.parseMessageTimestamp(msg),
+		ConvertedMessage: &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{{
+				Type: event.EventMessage,
+				Content: &event.MessageEventContent{
+					MsgType: event.MsgNotice,
+					Body:    "[LINE message unavailable. Open LINE to view it.]",
+				},
+			}},
+		},
+	}
 }
 
 func (lc *LineClient) convertBackfillMessage(ctx context.Context, portal *bridgev2.Portal, msg *line.Message) (*bridgev2.BackfillMessage, error) {
@@ -866,7 +883,7 @@ func (lc *LineClient) fetchMessagesSince(ctx context.Context, chatMID string, an
 		if err != nil {
 			return nil, err
 		}
-		if appendUnique(page) == 0 || len(page) < reqCount || (reqCount == backfillPageSize && limit-len(msgs) <= 2) {
+		if appendUnique(page) == 0 || len(page) < reqCount {
 			break
 		}
 	}
@@ -1959,14 +1976,15 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 				lc.queueUnblockedDMRestore(ctx, mid, "full_sync")
 			}
 			if lc.backfillEnabled() {
-				lc.wg.Add(1)
-				go func() {
-					defer lc.wg.Done()
-					lc.syncChatsNow(ctx)
-					if boxes, ok := lc.syncMessageBoxes(ctx); ok {
+				// Queue chat portals and catch-up resyncs before later live ops can advance the backfill anchor.
+				lc.syncChatsNow(ctx)
+				if boxes, ok := lc.syncMessageBoxes(ctx); ok {
+					lc.wg.Add(1)
+					go func() {
+						defer lc.wg.Done()
 						lc.prefetchMessageBoxes(ctx, boxes)
-					}
-				}()
+					}()
+				}
 			} else {
 				lc.wg.Add(3)
 				go lc.syncChats(ctx)
