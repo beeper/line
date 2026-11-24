@@ -50,6 +50,8 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 	}
 	downloadOptions := lineOBSDownloadOptions(data.ContentMetadata, isPlainMedia)
 	talkMetaMessageID := obsTalkMetaMessageID(data.ID, isPlainMedia)
+	width, height := lineMediaInfoDimensions(data.ContentMetadata["MEDIA_CONTENT_INFO"])
+	thumbWidth, thumbHeight := lineMediaInfoDimensions(data.ContentMetadata["MEDIA_THUMB_INFO"])
 	if h.GenerateDirectMediaURI != nil {
 		directMedia, err := newDirectMedia(
 			"video", oid, "", sid, downloadOptions, decryptedBody, data.ContentMetadata,
@@ -57,8 +59,18 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 		if err != nil {
 			return nil, err
 		}
-		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
-			MsgType: event.MsgVideo, RelatesTo: relatesTo,
+		info := &event.FileInfo{Width: width, Height: height}
+		if thumbWidth > 0 && portal != nil {
+			if thumbnailURI, thumbnailFile, _, err := h.GenerateDirectMediaURI(ctx, portal.MXID, data.ID, directMedia.Preview()); err != nil {
+				h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to generate LINE video preview URI")
+			} else {
+				info.ThumbnailURL = thumbnailURI
+				info.ThumbnailFile = thumbnailFile
+				info.ThumbnailInfo = &event.FileInfo{MimeType: "image/jpeg", Width: thumbWidth, Height: thumbHeight}
+			}
+		}
+		if converted, err := h.generateDirectMedia(ctx, portal, data.ID, directMedia, &event.MessageEventContent{
+			MsgType: event.MsgVideo, RelatesTo: relatesTo, Info: info,
 		}); converted != nil || err != nil {
 			return converted, err
 		}
@@ -138,6 +150,23 @@ func (h *Handler) ConvertVideo(ctx context.Context, portal *bridgev2.Portal, int
 	videoInfo := &event.FileInfo{
 		MimeType: mimeType,
 		Size:     len(videoData),
+		Width:    width,
+		Height:   height,
+	}
+	previewOID, previewOptions := oid+"__ud-preview", downloadOptions
+	if isPlainMedia {
+		previewOID, previewOptions.TID = oid, "preview"
+	}
+	if thumbnail, err := client.DownloadOBSWithSIDOptions(ctx, previewOID, talkMetaMessageID, sid, previewOptions); err != nil {
+		h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to download LINE video preview")
+	} else if thumbnail, err = h.decryptDownloadedMedia(thumbnail, decryptedBody, data.ContentMetadata, "video preview"); err != nil {
+		h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to decrypt LINE video preview")
+	} else if thumbnailURL, thumbnailFile, err := intent.UploadMedia(ctx, portal.MXID, thumbnail, "thumbnail.jpg", "image/jpeg"); err != nil {
+		h.Log.Warn().Err(err).Str("msg_id", data.ID).Msg("Failed to upload LINE video preview")
+	} else {
+		videoInfo.ThumbnailURL = thumbnailURL
+		videoInfo.ThumbnailFile = thumbnailFile
+		videoInfo.ThumbnailInfo = &event.FileInfo{MimeType: "image/jpeg", Size: len(thumbnail), Width: thumbWidth, Height: thumbHeight}
 	}
 	if duration > 0 {
 		videoInfo.Duration = duration

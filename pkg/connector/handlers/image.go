@@ -1,11 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"mime"
+	"net/http"
+	"strings"
 	"time"
 
+	"go.mau.fi/util/exmime"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
 
@@ -32,6 +38,7 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 	} else if downloadSource.publicPath != "" {
 		sid = ""
 	}
+	width, height := lineMediaInfoDimensions(data.ContentMetadata["MEDIA_CONTENT_INFO"])
 	if h.GenerateDirectMediaURI != nil {
 		directMedia, err := newDirectMedia(
 			"image", downloadSource.oid, downloadSource.publicPath, sid, downloadOptions,
@@ -40,8 +47,8 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		if err != nil {
 			return nil, err
 		}
-		if converted, err := h.generateDirectMedia(ctx, data.ID, directMedia, &event.MessageEventContent{
-			MsgType: event.MsgImage, RelatesTo: relatesTo,
+		if converted, err := h.generateDirectMedia(ctx, portal, data.ID, directMedia, &event.MessageEventContent{
+			MsgType: event.MsgImage, RelatesTo: relatesTo, Info: &event.FileInfo{Width: width, Height: height},
 		}); converted != nil || err != nil {
 			return converted, err
 		}
@@ -111,9 +118,17 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 		return oversized, nil
 	}
 
+	fileName, mimeType := lineImageType(data.ContentMetadata)
+	if sniffed := http.DetectContentType(imgData); strings.HasPrefix(sniffed, "image/") {
+		fileName, mimeType = imageTypeForMime(sniffed)
+	}
+	if config, _, err := image.DecodeConfig(bytes.NewReader(imgData)); err == nil {
+		width, height = config.Width, config.Height
+	}
+
 	// Upload to Matrix
 	uploadStart := time.Now()
-	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, "image.jpg", "image/jpeg")
+	mxc, file, err := intent.UploadMedia(ctx, portal.MXID, imgData, fileName, mimeType)
 	uploadDuration := time.Since(uploadStart)
 	if err != nil {
 		h.Log.Error().
@@ -144,10 +159,16 @@ func (h *Handler) ConvertImage(ctx context.Context, portal *bridgev2.Portal, int
 			{
 				Type: event.EventMessage,
 				Content: &event.MessageEventContent{
-					MsgType:   event.MsgImage,
-					Body:      "image.jpg",
-					URL:       mxc,
-					File:      file,
+					MsgType: event.MsgImage,
+					Body:    fileName,
+					URL:     mxc,
+					File:    file,
+					Info: &event.FileInfo{
+						MimeType: mimeType,
+						Size:     len(imgData),
+						Width:    width,
+						Height:   height,
+					},
 					RelatesTo: relatesTo,
 				},
 			},
@@ -188,6 +209,32 @@ func lineMediaCategory(metadata map[string]string) string {
 	}
 
 	return info.Category
+}
+
+func lineMediaInfoDimensions(raw string) (width, height int) {
+	var info struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+	if json.Unmarshal([]byte(raw), &info) == nil && info.Width > 0 && info.Height > 0 {
+		return info.Width, info.Height
+	}
+	return 0, 0
+}
+
+func lineImageType(metadata map[string]string) (fileName, mimeType string) {
+	var info struct {
+		Extension string `json:"extension"`
+	}
+	_ = json.Unmarshal([]byte(metadata["MEDIA_CONTENT_INFO"]), &info)
+	return imageTypeForMime(mime.TypeByExtension("." + strings.ToLower(info.Extension)))
+}
+
+func imageTypeForMime(mimeType string) (string, string) {
+	if !strings.HasPrefix(mimeType, "image/") {
+		mimeType = "image/jpeg"
+	}
+	return "image" + exmime.ExtensionFromMimetype(mimeType), mimeType
 }
 
 func lineOBSDownloadOptions(metadata map[string]string, isPlainMedia bool) line.OBSDownloadOptions {

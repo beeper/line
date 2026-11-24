@@ -1066,6 +1066,9 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	if chat.Extra.GroupExtra != nil {
 		if chat.Extra.GroupExtra.CreatorMid == lc.Mid {
 			members[0].PowerLevel = ptr.Ptr(100)
+		} else if isEditableGroupMID(chat.ChatMid) {
+			// Matrix only allows kicking users with a lower power level than the kicker.
+			members[0].PowerLevel = ptr.Ptr(1)
 		}
 		// If the bridge user is invited but not yet a full member of a GROUP (type 0), surface the
 		// chat as a Beeper message request (Requests section) via info.MessageRequest below. The
@@ -1177,6 +1180,13 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	}
 	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
 		info.Members.PowerLevels = lineGroupPowerLevels()
+	}
+	if chat.Extra.GroupExtra != nil {
+		mutedUntil := bridgev2.Unmuted
+		if chat.NotificationDisabled {
+			mutedUntil = event.MutedForever
+		}
+		info.UserLocal = &bridgev2.UserLocalPortalInfo{MutedUntil: &mutedUntil}
 	}
 	// GetChats can omit self from both lists, so only confirmed membership clears a request.
 	if selfInvitePending {
@@ -1941,37 +1951,12 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		// is never useful; without batch sending, restore the empty room instead.
 		lc.queueUnblockedDMRestore(ctx, mid, "op_unblock")
 
-	case OpContactUpdate:
-		mid := op.Param1
-		lc.cacheMu.Lock()
-		delete(lc.contactCache, mid)
-		lc.cacheMu.Unlock()
-		contact := lc.getContact(ctx, mid)
-		name := contact.EffectiveDisplayName()
-		lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Str("name", name).Msg("Contact updated")
-		ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, makeUserID(mid))
-		if err == nil && ghost != nil {
-			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{
-				Identifiers: []string{mid},
-				Name:        &name,
-				Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
-			})
-		}
-		dmType := database.RoomTypeDM
-		portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
-		lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatResync,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-			ChatInfo: &bridgev2.ChatInfo{
-				Type:   &dmType,
-				Name:   &name,
-				Avatar: lc.avatarFromPicturePath(contact.PicturePath),
-			},
-		})
-		lc.refreshGroupsForContact(ctx, mid)
+	case OpContactUpdate, OpNotifiedUpdateProfile:
+		lc.wg.Add(1)
+		go func() {
+			defer lc.wg.Done()
+			lc.refreshContact(context.Background(), op.Param1)
+		}()
 
 	case OpDeleteSelfFromChat:
 		lc.handleSelfLeave(op.Param1)
@@ -2209,6 +2194,44 @@ func (lc *LineClient) handleOperation(ctx context.Context, op line.Operation) {
 		}
 		logEvt.Msg("Unhandled SSE operation")
 	}
+}
+
+func (lc *LineClient) refreshContact(ctx context.Context, mid string) {
+	lc.contactRefreshMu.Lock()
+	defer lc.contactRefreshMu.Unlock()
+	lc.cacheMu.Lock()
+	delete(lc.contactCache, mid)
+	lc.cacheMu.Unlock()
+	contact := lc.getContact(ctx, mid)
+	name := contact.EffectiveDisplayName()
+	if name == mid {
+		lc.UserLogin.Bridge.Log.Warn().Str("mid", mid).Msg("Failed to fetch updated contact")
+		return
+	}
+	lc.UserLogin.Bridge.Log.Info().Str("mid", mid).Str("name", name).Msg("Contact updated")
+	ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, makeUserID(mid))
+	if err == nil && ghost != nil {
+		ghost.UpdateInfo(ctx, &bridgev2.UserInfo{
+			Identifiers: []string{mid},
+			Name:        &name,
+			Avatar:      lc.avatarFromPicturePath(contact.PicturePath),
+		})
+	}
+	dmType := database.RoomTypeDM
+	portalKey := networkid.PortalKey{ID: makePortalID(mid), Receiver: lc.UserLogin.ID}
+	lc.UserLogin.Bridge.QueueRemoteEvent(lc.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventChatResync,
+			PortalKey: portalKey,
+			Timestamp: time.Now(),
+		},
+		ChatInfo: &bridgev2.ChatInfo{
+			Type:   &dmType,
+			Name:   &name,
+			Avatar: lc.avatarFromPicturePath(contact.PicturePath),
+		},
+	})
+	lc.refreshGroupsForContact(ctx, mid)
 }
 
 func (lc *LineClient) prepareReadReceiptFallback(ctx context.Context, portal *bridgev2.Portal, receipt *simplevent.Receipt) {

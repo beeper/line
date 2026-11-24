@@ -7,15 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"image"
 	"image/jpeg"
 	"maps"
 	"math"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"go.mau.fi/util/ffmpeg"
 	"maunium.net/go/mautrix/bridgev2"
@@ -36,8 +37,6 @@ type mentionEntry struct {
 	M string `json:"M,omitempty"`
 	A string `json:"A,omitempty"`
 }
-
-var mentionLinkRegex = regexp.MustCompile(`<a\s+[^>]*href="https://matrix\.to/#/([^"]+)"[^>]*>([^<]+)</a>`)
 
 var lineMediaSizeLimits = map[event.MessageType]int{
 	event.MsgImage: 20 * 1024 * 1024,
@@ -219,11 +218,25 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	var mediaData []byte
+	var imageMimeType, imageFileName string
 	switch effectiveMsgType {
 	case event.MsgImage, event.MsgFile, event.MsgVideo, event.MsgAudio:
 		mediaData, err = lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
+		}
+		originalData := mediaData
+		if effectiveMsgType == event.MsgImage && len(mediaData) <= lineMediaSizeLimits[event.MsgImage] {
+			var imageData []byte
+			imageData, imageMimeType, imageFileName, err = prepareLineImage(ctx, mediaData, msg.Content.GetFileName())
+			if errors.Is(err, errSendImageAsFile) {
+				lc.UserLogin.Bridge.Log.Info().Err(err).Msg("LINE can't show this image, sending it as a file")
+				effectiveMsgType = event.MsgFile
+			} else if err != nil {
+				return nil, err
+			} else {
+				mediaData = imageData
+			}
 		}
 		if sizeLimit, ok := lineMediaSizeLimits[effectiveMsgType]; ok && len(mediaData) > sizeLimit {
 			lc.UserLogin.Bridge.Log.Info().
@@ -232,6 +245,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				Int("limit", sizeLimit).
 				Msg("Media exceeds LINE's limit for its type, sending as a file")
 			effectiveMsgType = event.MsgFile
+			mediaData = originalData
 		}
 	}
 
@@ -255,6 +269,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	var payload []byte
 	var plainTextBody string // used when plainText == true for text messages
 	textBody := msg.Content.Body
+	var textMentions []textMention
 
 	// For plain media: we send the message first, then upload media to r/talk/m/{msgId}.
 	var plainMediaData []byte // raw media data to upload after sending
@@ -289,7 +304,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	case event.MsgText:
 		contentType = int(ContentText)
 		var sticonMetadata map[string]string
-		textBody, sticonMetadata = outgoingSticons(ctx, msg.Content, func(mxc id.ContentURIString) *lineSticker {
+		textBody, sticonMetadata, textMentions = outgoingText(ctx, msg.Content, func(mxc id.ContentURIString) *lineSticker {
 			resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			sticon, err := lc.resolveSticker(resolveCtx, mxc, nil, true)
@@ -297,6 +312,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				lc.UserLogin.Bridge.Log.Debug().Err(err).Msg("Failed to resolve LINE emoji, sending alt text")
 			}
 			return sticon
+		}, func(userID id.UserID) (string, bool) {
+			mid, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(userID)
+			return string(mid), ok
 		})
 		maps.Copy(contentMetadata, sticonMetadata)
 		if plainText {
@@ -315,24 +333,15 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	case event.MsgImage:
 		data := mediaData
 
-		mimeType := msg.Content.Info.MimeType
-		fileName := msg.Content.GetFileName()
-		if isHEICImage(mimeType, fileName) {
-			data, err = convertHEICToJPEG(ctx, data)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaConvertFailed, err)
-			}
-			mimeType = "image/jpeg"
-			fileName = jpegFileName(fileName)
-		}
+		mimeType := imageMimeType
+		fileName := imageFileName
 		isGif := mimeType == "image/gif"
 		isAnimated := isGif && isAnimatedGif(data)
 
 		extension := "jpg"
-		if isGif {
-			extension = "gif"
-		} else if mimeType == "image/png" {
-			extension = "png"
+		switch mimeType {
+		case "image/gif", "image/png":
+			extension = strings.TrimPrefix(mimeType, "image/")
 		}
 
 		contentType = int(ContentImage)
@@ -720,17 +729,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	}
 
 	// Process mentions — set MENTION content metadata for LINE notification
-	if msg.Content.Mentions == nil {
-		msg.Content.Mentions = &event.Mentions{}
-	}
-	// Detect implicit @room/@all/@everyone in body for LINE group-wide mentions
-	if !msg.Content.Mentions.Room {
-		lowerBody := strings.ToLower(msg.Content.Body)
-		if strings.Contains(lowerBody, "@room") || strings.Contains(lowerBody, "@all") || strings.Contains(lowerBody, "@everyone") {
-			msg.Content.Mentions.Room = true
-		}
-	}
-	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.FormattedBody, msg.Content.Mentions)
+	mentionMeta := lc.buildMentionMetadata(ctx, textBody, msg.Content.Mentions, textMentions)
 	for k, v := range mentionMeta {
 		contentMetadata[k] = v
 	}
@@ -1141,28 +1140,6 @@ func (lc *LineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridge
 	return wrapSendError(err)
 }
 
-func (lc *LineClient) HandleMatrixLeaveRoom(ctx context.Context, portal *bridgev2.Portal) error {
-	reqSeq := int(time.Now().UnixMilli() % 1_000_000_000)
-
-	// A still-pending invite (the user declined the Request without accepting it) must be
-	// rejected, not removed — the user was never a member of the LINE chat. The framework
-	// clears MessageRequest once the invite is accepted, so an accepted chat falls through to
-	// the normal SendChatRemoved leave path below.
-	if portal.MessageRequest {
-		_, err := lc.callLine(ctx, func(client *line.Client) error {
-			return client.RejectChatInvitation(int64(reqSeq), string(portal.ID))
-		})
-		return wrapSendError(err)
-	}
-
-	lc.trackReqSeq(reqSeq)
-
-	_, err := lc.callLine(ctx, func(client *line.Client) error {
-		return client.SendChatRemoved(int64(reqSeq), string(portal.ID), "0", 0)
-	})
-	return wrapSendError(err)
-}
-
 // Compile-time assertion that LineClient handles Beeper message-request acceptance.
 var _ bridgev2.MessageRequestAcceptingNetworkAPI = (*LineClient)(nil)
 
@@ -1176,94 +1153,144 @@ func (lc *LineClient) HandleMatrixAcceptMessageRequest(ctx context.Context, msg 
 	return wrapSendError(err)
 }
 
-func (lc *LineClient) buildMentionMetadata(ctx context.Context, body, formattedBody string, mentions *event.Mentions) map[string]string {
-	if mentions == nil || (len(mentions.UserIDs) == 0 && !mentions.Room) {
+func (lc *LineClient) buildMentionMetadata(ctx context.Context, body string, mentions *event.Mentions, placed []textMention) map[string]string {
+	type spanEntry struct {
+		start, end int
+		entry      mentionEntry
+	}
+	var spans []spanEntry
+	addMentionee := func(start, end int, entry mentionEntry) bool {
+		if start < 0 || start >= end || end > len(body) {
+			return false
+		}
+		for _, span := range spans {
+			if start < span.end && end > span.start {
+				return false
+			}
+		}
+		startUTF16, startOK := byteIndexToUTF16Offset(body, start)
+		endUTF16, endOK := byteIndexToUTF16Offset(body, end)
+		if !startOK || !endOK {
+			return false
+		}
+		entry.S, entry.E = strconv.Itoa(startUTF16), strconv.Itoa(endUTF16)
+		spans = append(spans, spanEntry{start, end, entry})
+		return true
+	}
+
+	handled := make(map[id.UserID]bool, len(placed))
+	nameCount := make(map[string]int, len(placed))
+	for _, mention := range placed {
+		if addMentionee(mention.start, mention.end, mentionEntry{M: mention.mid}) {
+			handled[mention.userID] = true
+			nameCount[strings.TrimPrefix(body[mention.start:mention.end], "@")]++
+		}
+	}
+	if mentions != nil {
+		type nameMention struct {
+			mid  networkid.UserID
+			name string
+		}
+		var byName []nameMention
+		for _, userID := range mentions.UserIDs {
+			if handled[userID] {
+				continue
+			}
+			handled[userID] = true
+			mid, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(userID)
+			if !ok {
+				continue
+			}
+			ghost, err := lc.UserLogin.Bridge.GetExistingGhostByID(ctx, mid)
+			if err != nil || ghost == nil || ghost.Name == "" {
+				continue
+			}
+			byName = append(byName, nameMention{mid, ghost.Name})
+			nameCount[ghost.Name]++
+		}
+		for _, mention := range byName {
+			if nameCount[mention.name] > 1 {
+				continue
+			}
+			for cursor := 0; cursor < len(body); {
+				start, end, ok := findWholeWord(body, cursor, "@"+mention.name)
+				if !ok || addMentionee(start, end, mentionEntry{M: string(mention.mid)}) {
+					break
+				}
+				cursor = end
+			}
+		}
+	}
+	for cursor := 0; cursor < len(body); {
+		start, end, ok := findRoomMention(body, cursor)
+		if !ok || addMentionee(start, end, mentionEntry{A: "1"}) {
+			break
+		}
+		cursor = end
+	}
+
+	if len(spans) == 0 {
 		return nil
 	}
-
-	var mentionees []mentionEntry
-
-	if mentions.Room {
-		lowerBody := strings.ToLower(body)
-		roomMentionTexts := []string{"@room", "@all", "@everyone"}
-		pos := -1
-		matchLen := 0
-		for _, text := range roomMentionTexts {
-			if p := strings.Index(lowerBody, text); p >= 0 {
-				pos = p
-				matchLen = len(text)
-				break
-			}
-		}
-		if pos >= 0 {
-			start, startOK := byteIndexToUTF16Offset(body, pos)
-			end, endOK := byteIndexToUTF16Offset(body, pos+matchLen)
-			if startOK && endOK {
-				mentionees = append(mentionees, mentionEntry{
-					S: strconv.Itoa(start),
-					E: strconv.Itoa(end),
-					A: "1",
-				})
-			}
-		}
+	slices.SortFunc(spans, func(a, b spanEntry) int { return a.start - b.start })
+	mentionees := make([]mentionEntry, len(spans))
+	for i, span := range spans {
+		mentionees[i] = span.entry
 	}
-
-	nameByUserID := map[string]string{}
-	if formattedBody != "" {
-		for _, m := range mentionLinkRegex.FindAllStringSubmatch(formattedBody, -1) {
-			if len(m) >= 3 {
-				nameByUserID[m[1]] = strings.TrimPrefix(html.UnescapeString(m[2]), "@")
-			}
-		}
-	}
-
-	for _, userID := range mentions.UserIDs {
-		mid, ok := lc.UserLogin.Bridge.Matrix.ParseGhostMXID(userID)
-		if !ok {
-			continue
-		}
-
-		displayName := nameByUserID[string(userID)]
-
-		if displayName == "" {
-			existingGhost, err := lc.UserLogin.Bridge.GetExistingGhostByID(ctx, mid)
-			if err == nil && existingGhost != nil && existingGhost.Name != "" {
-				displayName = existingGhost.Name
-			}
-		}
-
-		if displayName == "" {
-			continue
-		}
-
-		searchStr := "@" + displayName
-		pos := strings.Index(body, searchStr)
-		if pos >= 0 {
-			start, startOK := byteIndexToUTF16Offset(body, pos)
-			end, endOK := byteIndexToUTF16Offset(body, pos+len(searchStr))
-			if startOK && endOK {
-				mentionees = append(mentionees, mentionEntry{
-					S: strconv.Itoa(start),
-					E: strconv.Itoa(end),
-					M: string(mid),
-				})
-			}
-		}
-	}
-
-	if len(mentionees) == 0 {
-		return nil
-	}
-
-	mentionData := map[string]interface{}{
-		"MENTIONEES": mentionees,
-	}
-	mentionJSON, err := json.Marshal(mentionData)
+	mentionJSON, err := json.Marshal(map[string]any{"MENTIONEES": mentionees})
 	if err != nil {
 		return nil
 	}
+	return map[string]string{"MENTION": string(mentionJSON)}
+}
 
-	return map[string]string{
-		"MENTION": string(mentionJSON),
+func findWholeWord(body string, from int, text string) (int, int, bool) {
+	for offset := from; offset < len(body); {
+		pos := strings.Index(body[offset:], text)
+		if pos < 0 {
+			break
+		}
+		start := offset + pos
+		end := start + len(text)
+		before, _ := utf8.DecodeLastRuneInString(body[:start])
+		after, _ := utf8.DecodeRuneInString(body[end:])
+		if !isLatinWordRune(before) && !isLatinWordRune(after) {
+			return start, end, true
+		}
+		offset = start + 1
 	}
+	return 0, 0, false
+}
+
+var roomMentionTexts = []string{"@room", "@all", "@everyone"}
+
+func findRoomMention(body string, from int) (int, int, bool) {
+	for i := from; i < len(body); i++ {
+		if body[i] != '@' {
+			continue
+		}
+		before, _ := utf8.DecodeLastRuneInString(body[:i])
+		if isMentionWordRune(before) || strings.ContainsRune("._-+@", before) {
+			continue
+		}
+		for _, text := range roomMentionTexts {
+			end := i + len(text)
+			if end > len(body) || !strings.EqualFold(body[i:end], text) {
+				continue
+			}
+			if after, _ := utf8.DecodeRuneInString(body[end:]); !isMentionWordRune(after) && after != '-' {
+				return i, end, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func isMentionWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+// CJK names are often written without spaces around them, so only Latin letters break a name match.
+func isLatinWordRune(r rune) bool {
+	return unicode.In(r, unicode.Latin) || unicode.IsDigit(r) || r == '_'
 }

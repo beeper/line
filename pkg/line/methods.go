@@ -1098,10 +1098,51 @@ func (c *Client) RegisterE2EEGroupKey(keyVersion int, chatMid string, members []
 	return nil
 }
 
-// InviteIntoChat invites users into an existing LINE group chat.
-func (c *Client) InviteIntoChat(chatMid string, mids []string) error {
-	_, err := c.callRPC("TalkService", "inviteIntoChat", 1, chatMid, mids)
-	return err
+type ChatMembersRequest struct {
+	ReqSeq         int64    `json:"reqSeq"`
+	ChatMid        string   `json:"chatMid"`
+	TargetUserMids []string `json:"targetUserMids"`
+}
+
+func (c *Client) InviteIntoChat(ctx context.Context, reqSeq int64, chatMid string, mids []string) error {
+	return c.callChatMembershipRPC(ctx, "inviteIntoChat", ChatMembersRequest{ReqSeq: reqSeq, ChatMid: chatMid, TargetUserMids: mids})
+}
+
+func (c *Client) DeleteOtherFromChat(ctx context.Context, reqSeq int64, chatMid string, mids []string) error {
+	return c.callChatMembershipRPC(ctx, "deleteOtherFromChat", ChatMembersRequest{ReqSeq: reqSeq, ChatMid: chatMid, TargetUserMids: mids})
+}
+
+func (c *Client) CancelChatInvitation(ctx context.Context, reqSeq int64, chatMid string, mids []string) error {
+	return c.callChatMembershipRPC(ctx, "cancelChatInvitation", ChatMembersRequest{ReqSeq: reqSeq, ChatMid: chatMid, TargetUserMids: mids})
+}
+
+func (c *Client) DeleteSelfFromChat(ctx context.Context, reqSeq int64, chatMid string) error {
+	return c.callChatMembershipRPC(ctx, "deleteSelfFromChat", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
+}
+
+func (c *Client) InviteIntoRoom(ctx context.Context, reqSeq int64, roomMid string, mids []string) error {
+	return c.callChatMembershipRPC(ctx, "inviteIntoRoom", reqSeq, roomMid, mids)
+}
+
+func (c *Client) LeaveRoom(ctx context.Context, reqSeq int64, roomMid string) error {
+	return c.callChatMembershipRPC(ctx, "leaveRoom", reqSeq, roomMid)
+}
+
+func (c *Client) callChatMembershipRPC(ctx context.Context, method string, args ...any) error {
+	resp, err := c.callRPCContext(ctx, "TalkService", method, args...)
+	if err != nil {
+		return err
+	}
+	var wrapper struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return fmt.Errorf("failed to parse %s response: %w", method, err)
+	}
+	if wrapper.Code != 0 {
+		return fmt.Errorf("%s failed: %s", method, resp)
+	}
+	return nil
 }
 
 // ChatInvitationRequest is the single struct argument taken by acceptChatInvitation and
@@ -1125,20 +1166,7 @@ func (c *Client) RejectChatInvitation(reqSeq int64, chatMid string) error {
 }
 
 func (c *Client) RejectChatInvitationContext(ctx context.Context, reqSeq int64, chatMid string) error {
-	resp, err := c.callRPCContext(ctx, "TalkService", "rejectChatInvitation", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
-	if err != nil {
-		return err
-	}
-	var wrapper struct {
-		Code int `json:"code"`
-	}
-	if err := json.Unmarshal(resp, &wrapper); err != nil {
-		return fmt.Errorf("failed to parse rejectChatInvitation response: %w", err)
-	}
-	if wrapper.Code != 0 {
-		return fmt.Errorf("rejectChatInvitation failed: %s", resp)
-	}
-	return nil
+	return c.callChatMembershipRPC(ctx, "rejectChatInvitation", ChatInvitationRequest{ReqSeq: reqSeq, ChatMid: chatMid})
 }
 
 // FindContactByUserid looks up a LINE user by their user ID (not MID).
@@ -1159,6 +1187,31 @@ func (c *Client) FindContactByUserid(userid string) (*Contact, error) {
 		return nil, fmt.Errorf("findContactByUserid failed: %s", wrapper.Message)
 	}
 	return &wrapper.Data, nil
+}
+
+// FindContactByPhone looks up a LINE user by a phone number formatted as "+<country code> <number>".
+func (c *Client) FindContactByPhone(phone string) (*Contact, error) {
+	resp, err := c.callRPC("TalkService", "findContactsByPhone", []string{phone})
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Code    int                `json:"code"`
+		Message string             `json:"message"`
+		Data    map[string]Contact `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse findContactsByPhone response: %w", err)
+	}
+	if wrapper.Code != 0 {
+		return nil, fmt.Errorf("findContactsByPhone failed: %s", wrapper.Message)
+	}
+	for _, contact := range wrapper.Data {
+		if contact.Mid != "" {
+			return &contact, nil
+		}
+	}
+	return nil, nil
 }
 
 // GetAllContactIds returns the MIDs of all contacts.

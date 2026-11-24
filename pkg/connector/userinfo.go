@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/nyaruka/phonenumbers"
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -54,7 +57,7 @@ func (lc *LineClient) HandleMatrixReadReceipt(ctx context.Context, read *bridgev
 
 func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	caps := &event.RoomFeatures{
-		ID:               "dev.highest.matrix.line.capabilities.2026_11_11_1",
+		ID:               "dev.highest.matrix.line.capabilities.2026_11_23",
 		MaxTextLength:    10000,
 		Reply:            event.CapLevelFullySupported,
 		Reaction:         event.CapLevelPartialSupport,
@@ -162,12 +165,35 @@ func (lc *LineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Port
 	if portal != nil && portal.RoomType == database.RoomTypeDM && !lc.isOwnMID(string(portal.ID)) {
 		caps.ID += "+dm"
 		caps.BlockUser = true
+	} else if portal != nil && isLegacyRoomMID(string(portal.ID)) {
+		caps.ID += "+room"
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite: event.CapLevelFullySupported,
+			event.MemberActionLeave:  event.CapLevelFullySupported,
+		}
 	} else if portal != nil && isEditableGroupMID(string(portal.ID)) {
 		caps.ID += "+group"
 		caps.State = event.StateFeatureMap{
 			event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
 			event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
 		}
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite:       event.CapLevelFullySupported,
+			event.MemberActionKick:         event.CapLevelFullySupported,
+			event.MemberActionLeave:        event.CapLevelFullySupported,
+			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
+		}
+	} else if portal == nil {
+		caps.MemberActions = event.MemberFeatureMap{
+			event.MemberActionInvite:       event.CapLevelFullySupported,
+			event.MemberActionKick:         event.CapLevelFullySupported,
+			event.MemberActionLeave:        event.CapLevelFullySupported,
+			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
+		}
+	}
+	if lc.UserLogin == nil || lc.UserLogin.Bridge == nil || lc.UserLogin.Bridge.Config == nil || !lc.UserLogin.Bridge.Config.BridgeMatrixLeave {
+		delete(caps.MemberActions, event.MemberActionLeave)
+		caps.ID += "+no-leave"
 	}
 	return caps
 }
@@ -210,6 +236,9 @@ func (lc *LineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) 
 			chat = &res.Chats[0]
 		}
 		info := lc.chatToChatInfo(ctx, chat, true)
+		if strings.HasPrefix(lowerMid, "r") {
+			info.UserLocal = nil
+		}
 		if portal.MXID == "" && lc.shouldSkipDeletedChat(mid, "") {
 			lc.stripRemoteMembersFromInitialChatInfo(info)
 		}
@@ -407,8 +436,60 @@ func (lc *LineClient) setCachedContact(mid string, contact line.Contact) {
 	lc.cacheMu.Unlock()
 }
 
+var lineUserMIDRegex = regexp.MustCompile(`^[Uu][A-Za-z0-9_-]{32,}$`)
+
+func linePhoneQuery(identifier string) (string, bool) {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(identifier), "tel:")
+	if !strings.HasPrefix(trimmed, "+") {
+		return "", false
+	}
+	cleaned, err := bridgev2.CleanPhoneNumber(trimmed)
+	if err != nil {
+		return "", false
+	}
+	num, err := phonenumbers.Parse(cleaned, "")
+	if err != nil || !phonenumbers.IsPossibleNumber(num) {
+		return "", false
+	}
+	return fmt.Sprintf("+%d %s", num.GetCountryCode(), phonenumbers.GetNationalSignificantNumber(num)), true
+}
+
+func isInvalidUseridError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), `"reason":"userid is invalid"`)
+}
+
+func (lc *LineClient) resolveIdentifierMID(ctx context.Context, identifier string) (string, error) {
+	identifier = strings.TrimSpace(identifier)
+	if lineUserMIDRegex.MatchString(identifier) {
+		return identifier, nil
+	}
+	var contact *line.Contact
+	var err error
+	if phone, ok := linePhoneQuery(identifier); ok {
+		_, contact, err = callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByPhone(phone)
+		})
+	} else {
+		userID := strings.ToLower(strings.TrimPrefix(identifier, "@"))
+		_, contact, err = callLineResult(lc, ctx, func(client *line.Client) (*line.Contact, error) {
+			return client.FindContactByUserid(userID)
+		})
+	}
+	if line.IsTalkExceptionNotFound(err) || isInvalidUseridError(err) || (err == nil && (contact == nil || contact.Mid == "")) {
+		return "", bridgev2.WrapRespErr(fmt.Errorf("no LINE user found for %q", identifier), mautrix.MNotFound)
+	} else if err != nil {
+		return "", fmt.Errorf("failed to look up LINE user: %w", err)
+	}
+	lc.setCachedContact(contact.Mid, *contact)
+	return contact.Mid, nil
+}
+
 func (lc *LineClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
-	userID := makeUserID(strings.TrimSpace(identifier))
+	mid, err := lc.resolveIdentifierMID(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	userID := makeUserID(mid)
 	portalID := networkid.PortalKey{ID: makePortalID(string(userID)), Receiver: lc.UserLogin.ID}
 	ghost, err := lc.UserLogin.Bridge.GetGhostByID(ctx, userID)
 	if err != nil {

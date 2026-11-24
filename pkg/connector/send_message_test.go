@@ -44,7 +44,15 @@ func TestBuildMentionMetadataUsesUTF16Offsets(t *testing.T) {
 		`<a href="https://matrix.to/#/@line_kik:example.com">กิ๊ก</a> ` +
 		`<a href="https://matrix.to/#/@line_alice:example.com">Alice</a>`
 
-	metadata := lc.buildMentionMetadata(t.Context(), body, formattedBody, &event.Mentions{UserIDs: userIDs})
+	mentions := &event.Mentions{UserIDs: userIDs}
+	text, _, placed := outgoingText(t.Context(), &event.MessageEventContent{Body: body, Format: event.FormatHTML, FormattedBody: formattedBody, Mentions: mentions}, nil, func(userID id.UserID) (string, bool) {
+		mid, ok := matrix.ParseGhostMXID(userID)
+		return string(mid), ok
+	})
+	if text != body {
+		t.Fatalf("text = %q, want %q", text, body)
+	}
+	metadata := lc.buildMentionMetadata(t.Context(), text, mentions, placed)
 	var payload struct {
 		Mentionees []mentionEntry `json:"MENTIONEES"`
 	}
@@ -64,7 +72,7 @@ func TestBuildMentionMetadataUsesUTF16Offsets(t *testing.T) {
 
 func TestBuildRoomMentionMetadataUsesUTF16Offsets(t *testing.T) {
 	lc := &LineClient{}
-	metadata := lc.buildMentionMetadata(t.Context(), "你好🙂 @room", "", &event.Mentions{Room: true})
+	metadata := lc.buildMentionMetadata(t.Context(), "你好🙂 @room", &event.Mentions{Room: true}, nil)
 	var payload struct {
 		Mentionees []mentionEntry `json:"MENTIONEES"`
 	}
