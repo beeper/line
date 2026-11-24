@@ -26,7 +26,7 @@ func TestOutgoingSticons(t *testing.T) {
 			`<img data-mx-emoticon src="mxc://example.com/cat" alt=":cat:"><img data-mx-emoticon src="mxc://example.com/moon" alt=":moon:"> ` +
 			`<img data-mx-emoticon src="mxc://example.com/other" alt=":other:">`,
 	}
-	body, metadata := outgoingSticons(context.Background(), content, resolve)
+	body, metadata, _ := outgoingText(context.Background(), content, resolve, nil)
 	if body != "😀 (moon) and (cat)(moon) :other:" || calls != 3 {
 		t.Fatalf("body = %q, resolve calls = %d", body, calls)
 	}
@@ -48,8 +48,8 @@ func TestOutgoingSticonsFallsBackToBody(t *testing.T) {
 		{Body: "plain"},
 		{Body: ":other:", Format: event.FormatHTML, FormattedBody: `<img data-mx-emoticon src="mxc://example.com/other" alt=":other:">`},
 	} {
-		if body, metadata := outgoingSticons(context.Background(), content, resolve); body != content.Body || metadata != nil {
-			t.Fatalf("outgoingSticons(%q) = %q, %v", content.Body, body, metadata)
+		if body, metadata, _ := outgoingText(context.Background(), content, resolve, nil); body != content.Body || metadata != nil {
+			t.Fatalf("outgoingText(%q) = %q, %v", content.Body, body, metadata)
 		}
 	}
 }
