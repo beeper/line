@@ -42,6 +42,9 @@ const (
 	groupPortalCreateWait                     = 30 * time.Second
 	beeperExcludeFromTimelineKey              = "com.beeper.exclude_from_timeline"
 	maxReconnectDelay                         = 5 * time.Minute
+	opRevisionSaveInterval                    = 30 * time.Second
+	maxResumeRevisionAge                      = 5 * time.Minute
+	maxResumeRevisionClockSkew                = time.Minute
 )
 
 var (
@@ -1905,6 +1908,20 @@ func (lc *LineClient) pollLoop(ctx context.Context) {
 }
 
 func (lc *LineClient) seedLocalRevision(ctx context.Context) (int64, bool) {
+	var meta *UserLoginMetadata
+	if lc.UserLogin.UserLogin != nil {
+		meta, _ = lc.UserLogin.Metadata.(*UserLoginMetadata)
+	}
+	var savedRevAge time.Duration
+	if meta != nil {
+		savedRevAge = time.Since(time.UnixMilli(meta.LastOpRevisionAt))
+	}
+	// Only a fresh save (a deploy or restart) is resumed; replaying longer downtime would flood ops and undo the startup chat sync.
+	if meta != nil && meta.OpRevision > 0 && meta.LastOpRevisionAt > 0 &&
+		savedRevAge <= maxResumeRevisionAge && savedRevAge >= -maxResumeRevisionClockSkew {
+		lc.UserLogin.Bridge.Log.Info().Int64("local_rev", meta.OpRevision).Dur("age", savedRevAge).Msg("Resuming operation stream from saved revision")
+		return meta.OpRevision, true
+	}
 	_, rev, err := callLineResult(lc, ctx, func(client *line.Client) (int64, error) {
 		return getLastOpRevisionWithClient(ctx, client)
 	})
@@ -1923,14 +1940,57 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 	defer lc.wg.Done()
 
 	var client *line.Client
+	var meta *UserLoginMetadata
+	if lc.UserLogin.UserLogin != nil {
+		meta, _ = lc.UserLogin.Metadata.(*UserLoginMetadata)
+	}
 	lc.UserLogin.Bridge.Log.Info().Msg("Starting LINE SSE loop...")
+
+	var savedRev int64
+	if meta != nil {
+		savedRev = meta.OpRevision
+	}
+	var savedAt time.Time
+	ownsLogin := func() bool {
+		return meta != nil && !lc.isSessionInvalidated() && (lc.UserLogin.Client == nil || lc.UserLogin.Client == lc)
+	}
+	saveRevision := func(force bool) {
+		if localRev == savedRev || (!force && time.Since(savedAt) < opRevisionSaveInterval) || lc.superseded.Load() || !ownsLogin() {
+			return
+		}
+		meta.OpRevision = localRev
+		meta.LastOpRevisionAt = time.Now().UnixMilli()
+		if err := lc.UserLogin.Save(ctx); err != nil {
+			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save operation revision")
+			return
+		}
+		savedRev = localRev
+		savedAt = time.Now()
+	}
+	saveRevision(true)
+	// Runs on stop (Disconnect waits for this loop) and on op handler panics, so a poison op is skipped after restart.
+	var liveAt time.Time
+	defer func() {
+		if localRev > 0 && liveAt.After(savedAt) && ownsLogin() {
+			meta.OpRevision = localRev
+			meta.LastOpRevisionAt = liveAt.UnixMilli()
+			if err := lc.UserLogin.Save(context.WithoutCancel(ctx)); err != nil {
+				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to save operation revision on stop")
+			}
+		}
+	}()
 
 	var listenCtx context.Context
 	var cancelListen context.CancelCauseFunc
+	rejectedRev := int64(-1)
+	var reseededAt time.Time
 	sseDisconnected := false
 	var backoff, requestedBackoff reconnectBackoff
 	handler := func(eventType, data string) {
 		backoff.reset()
+		if eventType != "talkException" {
+			liveAt = time.Now()
+		}
 		if eventType != line.SSEEventOpen && eventType != "reconnect" && eventType != "talkException" {
 			requestedBackoff.reset()
 		}
@@ -1947,7 +2007,19 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			err := line.NewSSETalkException(data)
 			lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Received talkException on the operation stream")
 			if !line.IsAuthError(err) {
-				return
+				// A repeat at the same revision means LINE rejects it, so re-seed instead of retrying it forever.
+				if rejectedRev != localRev || time.Since(reseededAt) < maxReconnectDelay {
+					rejectedRev = localRev
+				} else if rev, seedErr := getLastOpRevisionWithClient(ctx, client); seedErr != nil {
+					lc.UserLogin.Bridge.Log.Warn().Err(seedErr).Msg("Failed to get last op revision after talkException")
+				} else if rev > 0 && rev != localRev {
+					lc.UserLogin.Bridge.Log.Info().Int64("old", localRev).Int64("new", rev).Msg("Re-seeded local revision after talkException")
+					localRev = rev
+					reseededAt = time.Now()
+					saveRevision(true)
+					lc.resyncSkippedOperations(ctx, "talk_exception")
+				}
+				cancelListen(errSSEReconnect)
 			} else if lc.handleReceiveAuthError(ctx, client, err) {
 				cancelListen(errSSEStop)
 			} else {
@@ -1960,37 +2032,25 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			var fsPayload struct {
 				NextRevision string `json:"nextRevision"`
 			}
+			var newRev int64
 			if err := json.Unmarshal([]byte(data), &fsPayload); err == nil && fsPayload.NextRevision != "" {
-				if newRev, err := strconv.ParseInt(fsPayload.NextRevision, 10, 64); err == nil && newRev != localRev {
-					lc.UserLogin.Bridge.Log.Info().Int64("old", localRev).Int64("new", newRev).Msg("Updating local revision from fullSync")
+				newRev, _ = strconv.ParseInt(fsPayload.NextRevision, 10, 64)
+			}
+			if newRev <= 0 {
+				if rev, err := getLastOpRevisionWithClient(ctx, client); err != nil {
+					lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to get last op revision for fullSync")
+				} else {
+					newRev = rev
+				}
+			}
+			if newRev > 0 && newRev != localRev {
+				lc.UserLogin.Bridge.Log.Info().Int64("old", localRev).Int64("new", newRev).Msg("Updating local revision from fullSync")
 
-					localRev = newRev
-					revUpdated = true
-				}
+				localRev = newRev
+				revUpdated = true
+				saveRevision(true)
 			}
-			newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
-			if err != nil {
-				lc.UserLogin.Bridge.Log.Warn().Err(err).Msg("Failed to refresh blocked contacts during fullSync")
-			}
-			for _, mid := range newlyUnblocked {
-				lc.queueUnblockedDMRestore(ctx, mid, "full_sync")
-			}
-			if lc.backfillEnabled() {
-				// Queue chat portals and catch-up resyncs before later live ops can advance the backfill anchor.
-				lc.syncChatsNow(ctx)
-				if boxes, ok := lc.syncMessageBoxes(ctx); ok {
-					lc.wg.Add(1)
-					go func() {
-						defer lc.wg.Done()
-						lc.prefetchMessageBoxes(ctx, boxes)
-					}()
-				}
-			} else {
-				lc.wg.Add(3)
-				go lc.syncChats(ctx)
-				go lc.syncDMChats(ctx)
-				go lc.prefetchMessages(ctx)
-			}
+			lc.resyncSkippedOperations(ctx, "full_sync")
 			if revUpdated {
 				cancelListen(errSSEResync)
 			}
@@ -2007,6 +2067,7 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			}
 
 			lc.handleOperation(ctx, op)
+			saveRevision(false)
 		default:
 			lc.UserLogin.Bridge.Log.Debug().Str("event_type", eventType).Str("data", data).Msg("Unhandled SSE event")
 		}
@@ -2051,6 +2112,32 @@ func (lc *LineClient) pollLoopFrom(ctx context.Context, localRev int64) {
 			waitForSSEReconnect(ctx, backoff.next())
 		}
 	}
+}
+
+func (lc *LineClient) resyncSkippedOperations(ctx context.Context, reason string) {
+	newlyUnblocked, err := lc.refreshBlockedContacts(ctx)
+	if err != nil {
+		lc.UserLogin.Bridge.Log.Warn().Err(err).Str("reason", reason).Msg("Failed to refresh blocked contacts during resync")
+	}
+	for _, mid := range newlyUnblocked {
+		lc.queueUnblockedDMRestore(ctx, mid, reason)
+	}
+	if lc.backfillEnabled() {
+		// Queue chat portals and catch-up resyncs before later live ops can advance the backfill anchor.
+		lc.syncChatsNow(ctx)
+		if boxes, ok := lc.syncMessageBoxes(ctx); ok {
+			lc.wg.Add(1)
+			go func() {
+				defer lc.wg.Done()
+				lc.prefetchMessageBoxes(ctx, boxes)
+			}()
+		}
+		return
+	}
+	lc.wg.Add(3)
+	go lc.syncChats(ctx)
+	go lc.syncDMChats(ctx)
+	go lc.prefetchMessages(ctx)
 }
 
 // handleReceiveAuthProbe checks Talk auth independently of SSE activity. The

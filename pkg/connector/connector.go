@@ -147,6 +147,8 @@ type UserLoginMetadata struct {
 	BlockedMIDs        []string          `json:"blocked_mids,omitempty"`
 
 	BlockedRecommendationMIDs []string `json:"blocked_recommendation_mids"`
+	OpRevision                int64    `json:"op_revision,omitempty"`
+	LastOpRevisionAt          int64    `json:"op_revision_at,omitempty"`
 }
 
 func (lc *LineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
