@@ -1178,6 +1178,13 @@ func (lc *LineClient) chatToChatInfo(ctx context.Context, chat *line.Chat, exclu
 	if chat.Extra.GroupExtra != nil && isEditableGroupMID(chat.ChatMid) {
 		info.Members.PowerLevels = lineGroupPowerLevels()
 	}
+	if chat.Extra.GroupExtra != nil {
+		mutedUntil := bridgev2.Unmuted
+		if chat.NotificationDisabled {
+			mutedUntil = event.MutedForever
+		}
+		info.UserLocal = &bridgev2.UserLocalPortalInfo{MutedUntil: &mutedUntil}
+	}
 	// GetChats can omit self from both lists, so only confirmed membership clears a request.
 	if selfInvitePending {
 		info.MessageRequest = ptr.Ptr(true)
