@@ -221,6 +221,7 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 
 	var mediaData []byte
 	var imageMimeType, imageFileName string
+	var videoDurationMS int
 	switch effectiveMsgType {
 	case event.MsgImage, event.MsgFile, event.MsgVideo, event.MsgAudio:
 		mediaData, err = lc.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
@@ -240,9 +241,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 				mediaData = imageData
 			}
 		}
-		if effectiveMsgType == event.MsgVideo {
+		if effectiveMsgType == event.MsgVideo && len(mediaData) <= lineMediaSizeLimits[event.MsgVideo] {
 			var videoData []byte
-			videoData, err = prepareLineVideo(ctx, mediaData, msg.Content.Info)
+			videoData, videoDurationMS, err = prepareLineVideo(ctx, mediaData, msg.Content.Info)
 			if errors.Is(err, errSendVideoAsFile) {
 				lc.UserLogin.Bridge.Log.Info().Err(err).Msg("LINE can't play this video, sending it as a file")
 				effectiveMsgType = event.MsgFile
@@ -544,7 +545,9 @@ func (lc *LineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		contentMetadata["FILE_SIZE"] = fmt.Sprintf("%d", len(data))
 		contentMetadata["contentType"] = fmt.Sprintf("%d", ContentVideo)
 
-		if msg.Content.Info != nil && msg.Content.Info.Duration > 0 {
+		if videoDurationMS > 0 {
+			contentMetadata["DURATION"] = fmt.Sprintf("%d", videoDurationMS)
+		} else if msg.Content.Info != nil && msg.Content.Info.Duration > 0 {
 			contentMetadata["DURATION"] = fmt.Sprintf("%d", msg.Content.Info.Duration)
 		}
 

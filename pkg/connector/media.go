@@ -17,7 +17,6 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -558,64 +557,91 @@ func generateChunkHashes(encryptedData []byte) []byte {
 
 const (
 	maxLineVideoDuration    = 300 * time.Second
-	maxLineVideoConvertTime = 5 * time.Minute
+	maxLineVideoConvertSize = 50 * 1024 * 1024
+	maxLineVideoConvertTime = 2 * time.Minute
 )
 
 var errSendVideoAsFile = errors.New("video must be sent to LINE as a file")
 
-func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([]byte, error) {
+// prepareLineVideo returns the video to send to LINE and its duration in milliseconds, 0 if unknown.
+func prepareLineVideo(ctx context.Context, data []byte, info *event.FileInfo) ([]byte, int, error) {
+	var durationMS int
+	if info != nil {
+		durationMS = info.Duration
+	}
+	if int64(durationMS) > maxLineVideoDuration.Milliseconds() {
+		return nil, 0, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
+	}
 	ctx, cancel := context.WithTimeout(ctx, maxLineVideoConvertTime)
 	defer cancel()
+	probed, playable, probedMS := probeLineVideo(ctx, data)
+	if probedMS > 0 {
+		durationMS = probedMS
+	}
+	if int64(durationMS) > maxLineVideoDuration.Milliseconds() {
+		return nil, 0, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
+	}
+	// Without ffprobe an MP4 keeps the old passthrough instead of every video becoming a file.
+	if playable || (!probed && len(data) >= 12 && string(data[4:8]) == "ftyp") {
+		return data, durationMS, nil
+	}
 	mimeType := http.DetectContentType(data)
-	if info != nil && int64(info.Duration) > maxLineVideoDuration.Milliseconds() {
-		return nil, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
+	if len(data) > maxLineVideoConvertSize || !mauffmpeg.Supported() {
+		return nil, 0, fmt.Errorf("%w: not converting %d byte %s", errSendVideoAsFile, len(data), mimeType)
 	}
-	duration, formatName := probeLineVideo(ctx, data)
-	if duration <= 0 {
-		return nil, fmt.Errorf("%w: video duration is unknown", errSendVideoAsFile)
-	}
-	if duration > maxLineVideoDuration {
-		return nil, fmt.Errorf("%w: %s is longer than %s", errSendVideoAsFile, duration, maxLineVideoDuration)
-	}
-	if strings.Contains(","+formatName+",", ",mov,") {
-		return data, nil
-	}
-	if !mauffmpeg.Supported() {
-		return nil, fmt.Errorf("%w: %s needs ffmpeg", errSendVideoAsFile, mimeType)
-	}
-	converted, err := mauffmpeg.ConvertBytes(ctx, data, ".mp4", nil, []string{
-		"-pix_fmt", "yuv420p", "-c:v", "h264", "-b:v", "2M", "-c:a", "aac", "-movflags", "+faststart",
-		"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
-	}, mimeType)
+	converted, err := mauffmpeg.ConvertBytes(ctx, data, ".mp4", []string{"-threads", "2"}, []string{
+		"-pix_fmt", "yuv420p", "-c:v", "h264", "-preset", "veryfast", "-b:v", "2M", "-c:a", "aac", "-threads", "2",
+		"-movflags", "+faststart", "-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
+	}, "") // An empty mime keeps the input path from colliding with the .mp4 output.
 	if err != nil {
-		return nil, fmt.Errorf("%w: converting %s to mp4: %w", errSendVideoAsFile, mimeType, err)
+		return nil, 0, fmt.Errorf("%w: converting %s to mp4: %w", errSendVideoAsFile, mimeType, err)
 	}
-	return converted, nil
+	if durationMS <= 0 {
+		_, _, durationMS = probeLineVideo(ctx, converted)
+		if int64(durationMS) > maxLineVideoDuration.Milliseconds() {
+			return nil, 0, fmt.Errorf("%w: duration exceeds %s", errSendVideoAsFile, maxLineVideoDuration)
+		}
+	}
+	return converted, durationMS, nil
 }
 
-func probeLineVideo(ctx context.Context, data []byte) (time.Duration, string) {
+// probeLineVideo reports whether ffprobe read the video, whether LINE can play it as is, and its duration in milliseconds.
+func probeLineVideo(ctx context.Context, data []byte) (bool, bool, int) {
 	if !mauffmpeg.ProbeSupported() {
-		return 0, ""
+		return false, false, 0
 	}
 	file, err := os.CreateTemp("", "line-video-probe-*")
 	if err != nil {
-		return 0, ""
+		return false, false, 0
 	}
 	defer os.Remove(file.Name())
 	_, err = file.Write(data)
 	if closeErr := file.Close(); err != nil || closeErr != nil {
-		return 0, ""
+		return false, false, 0
 	}
 	probe, err := mauffmpeg.Probe(ctx, file.Name())
 	if err != nil || probe.Format == nil {
-		return 0, ""
+		return false, false, 0
 	}
-	seconds := probe.Format.Duration
-	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
-		return 0, ""
+	var durationMS int
+	if seconds := probe.Format.Duration; seconds > maxLineVideoDuration.Seconds() {
+		durationMS = int(maxLineVideoDuration.Milliseconds()) + 1000
+	} else if seconds > 0 {
+		durationMS = int(seconds * 1000)
 	}
-	if seconds > maxLineVideoDuration.Seconds() {
-		return maxLineVideoDuration + time.Second, probe.Format.FormatName
+	playable := strings.Contains(","+probe.Format.FormatName+",", ",mov,")
+	hasVideo := false
+	for _, stream := range probe.Streams {
+		if stream.Disposition.AttachedPic != 0 {
+			continue
+		}
+		switch stream.CodecType {
+		case "video":
+			hasVideo = true
+			playable = playable && stream.CodecName == "h264" && (stream.PixFmt == "yuv420p" || stream.PixFmt == "yuvj420p")
+		case "audio":
+			playable = playable && (stream.CodecName == "aac" || stream.CodecName == "mp3")
+		}
 	}
-	return time.Duration(seconds * float64(time.Second)), probe.Format.FormatName
+	return true, playable && hasVideo, durationMS
 }
