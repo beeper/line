@@ -12,7 +12,9 @@ import (
 
 const noE2EETTL = 1 * time.Hour
 
-var keyFetchRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+var keyFetchRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+const keyFetchRetryCooldown = 1 * time.Minute
 
 var (
 	negotiateE2EEPublicKeyWithClient = func(client *line.Client, mid string) (*line.E2EEPublicKey, error) {
@@ -28,13 +30,44 @@ func callLineKeyFetch[T any](lc *LineClient, ctx context.Context, client *line.C
 		var res T
 		var err error
 		client, res, err = callLineResultUsing(lc, ctx, client, call)
-		if err == nil || attempt >= len(keyFetchRetryDelays) || !isTransientLineError(err) {
+		if err == nil {
+			lc.keyFetchRetryCooldownUntil.Store(0)
+			return client, res, nil
+		}
+		if !isTransientLineError(err) || lc.inKeyFetchRetryCooldown() {
+			return client, res, err
+		}
+		if attempt >= len(keyFetchRetryDelays) {
+			lc.keyFetchRetryCooldownUntil.Store(time.Now().Add(keyFetchRetryCooldown).UnixNano())
 			return client, res, err
 		}
 		lc.UserLogin.Bridge.Log.Debug().Err(err).Int("attempt", attempt+1).Msg("Retrying LINE key fetch after transient error")
-		if !waitForSSEReconnect(ctx, keyFetchRetryDelays[attempt]) {
+		if !lc.waitForKeyFetchRetry(ctx, keyFetchRetryDelays[attempt]) {
 			return client, res, err
 		}
+	}
+}
+
+func (lc *LineClient) inKeyFetchRetryCooldown() bool {
+	return time.Now().UnixNano() < lc.keyFetchRetryCooldownUntil.Load()
+}
+
+func (lc *LineClient) waitForKeyFetchRetry(ctx context.Context, delay time.Duration) bool {
+	var runDone <-chan struct{}
+	lc.runMu.Lock()
+	if lc.activeRun != nil {
+		runDone = lc.activeRun.ctx.Done()
+	}
+	lc.runMu.Unlock()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-runDone:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
