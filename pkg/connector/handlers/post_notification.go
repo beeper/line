@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 
@@ -33,6 +34,8 @@ type albumPreviewContext struct {
 	CreatedTime       string
 	PreviewCount      int
 	FromPreviewMedias bool
+	RawPreviewCount   int
+	RawPreviewKinds   string
 }
 
 // ConvertPostNotification converts a LINE note, album, or unknown post
@@ -103,6 +106,9 @@ func (h *Handler) ConvertPostNotification(
 	previewContext.CreatedTime = data.CreatedTime.String()
 	previewContext.PreviewCount = len(previewMedias)
 	previewContext.FromPreviewMedias = fromPreviewMedias
+	if !fromPreviewMedias {
+		previewContext.RawPreviewCount, previewContext.RawPreviewKinds = describeAlbumPreviewMedias(data.ContentMetadata)
+	}
 	if previewContext.ChatID == "" {
 		h.Log.Warn().
 			Str("msg_id", data.ID).
@@ -238,6 +244,8 @@ func (h *Handler) convertAlbumPreview(
 			Int("preview_count", previewContext.PreviewCount).
 			Bool("from_preview_medias", previewContext.FromPreviewMedias).
 			Bool("has_album_id", previewContext.AlbumID != "").
+			Int("raw_preview_count", previewContext.RawPreviewCount).
+			Str("raw_preview_kinds", previewContext.RawPreviewKinds).
 			Msg("LINE album preview image expired before it could be bridged")
 		return nil, nil
 	} else if err != nil {
@@ -346,6 +354,23 @@ func parseAlbumPreviewMedias(metadata map[string]string) ([]postPreviewMedia, bo
 		}
 	}
 	return medias, fromPreviewMedias, parseErr
+}
+
+func describeAlbumPreviewMedias(metadata map[string]string) (int, string) {
+	var parsed []postPreviewMedia
+	if err := json.Unmarshal([]byte(strings.TrimSpace(metadata["previewMedias"])), &parsed); err != nil {
+		return 0, ""
+	}
+	kinds := make([]string, 0, len(parsed))
+	for _, media := range parsed {
+		kind := strings.ToLower(strings.TrimSpace(media.Service)) + "/" +
+			strings.ToLower(strings.TrimSpace(media.SID)) + "/" +
+			strings.ToUpper(strings.TrimSpace(media.MediaType))
+		if !slices.Contains(kinds, kind) {
+			kinds = append(kinds, kind)
+		}
+	}
+	return len(parsed), strings.Join(kinds, ",")
 }
 
 func albumPreviewImageType(data []byte) (mimeType, extension string) {
