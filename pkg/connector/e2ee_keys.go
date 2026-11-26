@@ -12,6 +12,10 @@ import (
 
 const noE2EETTL = 1 * time.Hour
 
+var keyFetchRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+const keyFetchRetryCooldown = 1 * time.Minute
+
 var (
 	negotiateE2EEPublicKeyWithClient = func(client *line.Client, mid string) (*line.E2EEPublicKey, error) {
 		return client.NegotiateE2EEPublicKey(mid)
@@ -20,6 +24,52 @@ var (
 		return client.GetE2EEPublicKey(mid, keyVersion, keyID)
 	}
 )
+
+func callLineKeyFetch[T any](lc *LineClient, ctx context.Context, client *line.Client, call func(*line.Client) (T, error)) (*line.Client, T, error) {
+	for attempt := 0; ; attempt++ {
+		var res T
+		var err error
+		client, res, err = callLineResultUsing(lc, ctx, client, call)
+		if err == nil {
+			lc.keyFetchRetryCooldownUntil.Store(0)
+			return client, res, nil
+		}
+		if !isTransientLineError(err) || lc.inKeyFetchRetryCooldown() {
+			return client, res, err
+		}
+		if attempt >= len(keyFetchRetryDelays) {
+			lc.keyFetchRetryCooldownUntil.Store(time.Now().Add(keyFetchRetryCooldown).UnixNano())
+			return client, res, err
+		}
+		lc.UserLogin.Bridge.Log.Debug().Err(err).Int("attempt", attempt+1).Msg("Retrying LINE key fetch after transient error")
+		if !lc.waitForKeyFetchRetry(ctx, keyFetchRetryDelays[attempt]) {
+			return client, res, err
+		}
+	}
+}
+
+func (lc *LineClient) inKeyFetchRetryCooldown() bool {
+	return time.Now().UnixNano() < lc.keyFetchRetryCooldownUntil.Load()
+}
+
+func (lc *LineClient) waitForKeyFetchRetry(ctx context.Context, delay time.Duration) bool {
+	var runDone <-chan struct{}
+	lc.runMu.Lock()
+	if lc.activeRun != nil {
+		runDone = lc.activeRun.ctx.Done()
+	}
+	lc.runMu.Unlock()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-runDone:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
 
 func groupKeyFetchError(groupKeyID int, err error) error {
 	if groupKeyID == 0 && line.IsNotAMemberError(err) {
@@ -73,7 +123,7 @@ func (lc *LineClient) fetchAndUnwrapGroupKey(ctx context.Context, chatMid string
 		return sharedKey, groupKeyFetchError(groupKeyID, err)
 	}
 
-	client, sharedKey, err := callLineResultUsing(lc, ctx, client, fetch)
+	client, sharedKey, err := callLineKeyFetch(lc, ctx, client, fetch)
 	if err != nil && groupKeyID == 0 && line.IsGroupKeyNotFound(err) {
 		lc.UserLogin.Bridge.Log.Info().Str("chat_mid", chatMid).
 			Msg("No group key found, auto-registering")
@@ -169,7 +219,7 @@ func (lc *LineClient) ensurePeerKey(ctx context.Context, mid string) (int, strin
 			return cached.raw, cached.pub, nil
 		}
 	}
-	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.E2EEPublicKey, error) {
+	_, res, err := callLineKeyFetch(lc, ctx, nil, func(client *line.Client) (*line.E2EEPublicKey, error) {
 		return negotiateE2EEPublicKeyWithClient(client, mid)
 	})
 	if err != nil {
@@ -257,7 +307,7 @@ func (lc *LineClient) ensurePeerKeyByID(ctx context.Context, mid string, keyID i
 	}
 
 	// keyVersion 1
-	_, res, err := callLineResult(lc, ctx, func(client *line.Client) (*line.E2EEPublicKey, error) {
+	_, res, err := callLineKeyFetch(lc, ctx, nil, func(client *line.Client) (*line.E2EEPublicKey, error) {
 		return getE2EEPublicKeyWithClient(client, mid, 1, keyID)
 	})
 	if err != nil {

@@ -131,6 +131,8 @@ type LineClient struct {
 	avatarSlotsOnce sync.Once
 	avatarSlots     chan struct{}
 
+	keyFetchRetryCooldownUntil atomic.Int64
+
 	wg sync.WaitGroup
 }
 
