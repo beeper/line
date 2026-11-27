@@ -579,12 +579,7 @@ func (lc *LineClient) resolveMatrixReaction(ctx context.Context, msg *bridgev2.M
 		return lineReactionRef{}, errors.New("reaction target database context is missing")
 	}
 
-	reactions, err := msg.Portal.Bridge.DB.Reaction.GetAllToMessagePart(
-		ctx,
-		msg.Portal.Receiver,
-		msg.TargetMessage.ID,
-		msg.TargetMessage.PartID,
-	)
+	reactions, err := msg.Portal.Bridge.DB.Reaction.GetAllToMessage(ctx, msg.Portal.Receiver, msg.TargetMessage.ID)
 	if err != nil {
 		return lineReactionRef{}, fmt.Errorf("get target message reactions: %w", err)
 	}
