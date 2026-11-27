@@ -220,6 +220,7 @@ func (h *Handler) convertAlbumPreview(
 	imageData, err := h.downloadAlbumPreview(
 		ctx,
 		client,
+		media.SID,
 		media.OID,
 		previewContext.ChatID,
 		previewContext.AlbumID,
@@ -229,6 +230,7 @@ func (h *Handler) convertAlbumPreview(
 		imageData, err = h.downloadAlbumPreview(
 			ctx,
 			client,
+			media.SID,
 			media.OID,
 			previewContext.ChatID,
 			previewContext.AlbumID,
@@ -239,6 +241,7 @@ func (h *Handler) convertAlbumPreview(
 		h.Log.Warn().
 			Str("msg_id", messageID).
 			Str("media_oid", media.OID).
+			Str("media_sid", media.SID).
 			Str("created_time", previewContext.CreatedTime).
 			Int("preview_index", index).
 			Int("preview_count", previewContext.PreviewCount).
@@ -328,7 +331,7 @@ func parseAlbumPreviewMedias(metadata map[string]string) ([]postPreviewMedia, bo
 		media.SID = strings.ToLower(strings.TrimSpace(media.SID))
 		media.OID = strings.TrimSpace(media.OID)
 		media.MediaType = strings.ToUpper(strings.TrimSpace(media.MediaType))
-		if media.Service != "album" || media.SID != "a" || media.OID == "" || media.MediaType != "I" {
+		if media.Service != "album" || (media.SID != "a" && media.SID != "o") || media.OID == "" || media.MediaType != "I" {
 			continue
 		}
 		if _, duplicate := seen[media.OID]; duplicate {

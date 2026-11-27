@@ -909,9 +909,9 @@ func (c *Client) DownloadOBSResource(ctx context.Context, service, sid, oid, mes
 // DownloadAlbumPreview retrieves the thumbnail referenced by an album post
 // notification. Album thumbnails use a dedicated TID and are authorized by the
 // notification's chatId through LINE's Chrome home channel token.
-func (c *Client) DownloadAlbumPreview(ctx context.Context, oid, chatID, albumID string) ([]byte, error) {
-	if oid == "" || chatID == "" {
-		return nil, errors.New("album preview OID and chat ID are required")
+func (c *Client) DownloadAlbumPreview(ctx context.Context, sid, oid, chatID, albumID string) ([]byte, error) {
+	if sid == "" || oid == "" || chatID == "" {
+		return nil, errors.New("album preview SID, OID and chat ID are required")
 	}
 	channelToken, err := c.AcquireChannelAccessToken(albumPreviewChannelID)
 	if err != nil {
@@ -919,8 +919,9 @@ func (c *Client) DownloadAlbumPreview(ctx context.Context, oid, chatID, albumID 
 	}
 
 	requestURL := fmt.Sprintf(
-		"%s/r/album/a/%s/%s",
+		"%s/r/album/%s/%s/%s",
 		OBSBaseURL,
+		url.PathEscape(sid),
 		url.PathEscape(oid),
 		albumPreviewTID,
 	)

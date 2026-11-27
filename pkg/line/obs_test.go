@@ -454,6 +454,7 @@ func TestDownloadAlbumPreviewMatchesLINERequestContract(t *testing.T) {
 	for range 2 {
 		data, err := client.DownloadAlbumPreview(
 			context.Background(),
+			"a",
 			"preview-oid",
 			"chat-id",
 			"album-id",
@@ -540,6 +541,7 @@ func TestDownloadAlbumPreviewClassifiesHTTPStatus(t *testing.T) {
 
 			_, err := client.DownloadAlbumPreview(
 				context.Background(),
+				"a",
 				"preview-oid",
 				"chat-id",
 				"",
