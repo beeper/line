@@ -900,8 +900,7 @@ func (c *Client) DownloadOBSPublicResource(ctx context.Context, resource string)
 }
 
 // DownloadOBSResource retrieves a non-talk resource using the service, SID,
-// and OID supplied by LINE metadata. Album post previews use service "album"
-// and SID "a".
+// and OID supplied by LINE metadata.
 func (c *Client) DownloadOBSResource(ctx context.Context, service, sid, oid, messageID string) ([]byte, error) {
 	return c.downloadOBSWithServiceAndSIDOptions(ctx, service, sid, oid, messageID, OBSDownloadOptions{})
 }

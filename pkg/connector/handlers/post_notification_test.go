@@ -22,11 +22,15 @@ import (
 
 type postNotificationTestMatrix struct {
 	bridgev2.MatrixAPI
-	mu      sync.Mutex
-	uploads [][]byte
+	mu        sync.Mutex
+	uploads   [][]byte
+	uploadErr error
 }
 
 func (m *postNotificationTestMatrix) UploadMedia(_ context.Context, _ id.RoomID, data []byte, fileName, _ string) (id.ContentURIString, *event.EncryptedFileInfo, error) {
+	if m.uploadErr != nil {
+		return "", nil, m.uploadErr
+	}
 	m.mu.Lock()
 	m.uploads = append(m.uploads, append([]byte(nil), data...))
 	m.mu.Unlock()
@@ -105,9 +109,9 @@ func TestConvertPostNotificationUploadsAlbumPreviewImages(t *testing.T) {
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		DownloadAlbumPreview: func(_ context.Context, _ *line.Client, oid, chatID, albumID string) ([]byte, error) {
+		DownloadAlbumPreview: func(_ context.Context, _ *line.Client, sid, oid, chatID, albumID string) ([]byte, error) {
 			downloadsMu.Lock()
-			downloads = append(downloads, chatID+"/"+albumID+"/"+oid)
+			downloads = append(downloads, chatID+"/"+albumID+"/"+sid+"/"+oid)
 			downloadNumber := len(downloads)
 			downloadsMu.Unlock()
 			return []byte{0xff, 0xd8, 0xff, byte(downloadNumber)}, nil
@@ -126,7 +130,7 @@ func TestConvertPostNotificationUploadsAlbumPreviewImages(t *testing.T) {
 				"postEndUrl":  "line://group/home/albums/album?albumId=legacy-id&albumIdV2=album-id-v2",
 				"previewMedias": `[
 					{"svc":"album","sid":"a","mediaOid":"oid-one","mediaType":"I"},
-					{"svc":"album","sid":"a","mediaOid":"oid-two","mediaType":"I"},
+					{"svc":"album","sid":"o","mediaOid":"oid-two","mediaType":"I"},
 					{"svc":"album","sid":"a","mediaOid":"oid-one","mediaType":"I"},
 					{"svc":"album","sid":"a","mediaOid":"video-oid","mediaType":"V"}
 				]`,
@@ -141,7 +145,7 @@ func TestConvertPostNotificationUploadsAlbumPreviewImages(t *testing.T) {
 	}
 	downloadsMu.Lock()
 	slices.Sort(downloads)
-	if got := strings.Join(downloads, ","); got != "chat-id/album-id-v2/oid-one,chat-id/album-id-v2/oid-two" {
+	if got := strings.Join(downloads, ","); got != "chat-id/album-id-v2/a/oid-one,chat-id/album-id-v2/o/oid-two" {
 		downloadsMu.Unlock()
 		t.Fatalf("downloads = %q", got)
 	}
@@ -192,7 +196,7 @@ func TestConvertPostNotificationProcessesAlbumPreviewsConcurrentlyInOrder(t *tes
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		DownloadAlbumPreview: func(ctx context.Context, _ *line.Client, oid, _, _ string) ([]byte, error) {
+		DownloadAlbumPreview: func(ctx context.Context, _ *line.Client, _, oid, _, _ string) ([]byte, error) {
 			current := active.Add(1)
 			defer active.Add(-1)
 			for {
@@ -310,20 +314,21 @@ func TestConvertPostNotificationCancelsQueuedAlbumPreviewsAfterFailure(t *testin
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		DownloadAlbumPreview: func(ctx context.Context, _ *line.Client, oid, _, _ string) ([]byte, error) {
+		DownloadAlbumPreview: func(ctx context.Context, _ *line.Client, _, oid, _, _ string) ([]byte, error) {
 			calls.Add(1)
 			if oid == "fatal-oid" {
-				return nil, line.ErrOBSEncodingIncomplete
+				return []byte{0xff, 0xd8, 0xff, 0x00}, nil
 			}
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
 	}
+	uploadErr := errors.New("upload failed")
 
 	converted, err := handler.ConvertPostNotification(
 		t.Context(),
 		&bridgev2.Portal{Portal: &database.Portal{MXID: id.RoomID("!room:example.com")}},
-		&postNotificationTestMatrix{},
+		&postNotificationTestMatrix{uploadErr: uploadErr},
 		line.Message{ContentMetadata: map[string]string{
 			"serviceType": "AB",
 			"chatId":      "chat-id",
@@ -341,8 +346,8 @@ func TestConvertPostNotificationCancelsQueuedAlbumPreviewsAfterFailure(t *testin
 	if converted != nil {
 		t.Fatalf("converted = %#v, want nil after fatal preview failure", converted)
 	}
-	if !errors.Is(err, line.ErrOBSEncodingIncomplete) || !errors.Is(err, bridgev2.ErrIgnoringRemoteEvent) {
-		t.Fatalf("err = %v, want encoding and ignoring sentinels", err)
+	if !errors.Is(err, uploadErr) {
+		t.Fatalf("err = %v, want upload error", err)
 	}
 	if got := calls.Load(); got > albumPreviewWorkerLimit {
 		t.Fatalf("download calls = %d, want at most %d after cancellation", got, albumPreviewWorkerLimit)
@@ -356,7 +361,7 @@ func TestConvertPostNotificationUsesTopLevelAlbumMediaFallback(t *testing.T) {
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		DownloadAlbumPreview: func(_ context.Context, _ *line.Client, oid, _, _ string) ([]byte, error) {
+		DownloadAlbumPreview: func(_ context.Context, _ *line.Client, _, oid, _, _ string) ([]byte, error) {
 			downloadedOID = oid
 			return []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, nil
 		},
@@ -391,7 +396,7 @@ func TestConvertPostNotificationKeepsSuccessfulAlbumImagesWhenOneExpired(t *test
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		DownloadAlbumPreview: func(_ context.Context, _ *line.Client, oid, _, _ string) ([]byte, error) {
+		DownloadAlbumPreview: func(_ context.Context, _ *line.Client, _, oid, _, _ string) ([]byte, error) {
 			if oid == "expired-oid" {
 				return nil, line.ErrOBSObjectNotFound
 			}
@@ -423,12 +428,12 @@ func TestConvertPostNotificationKeepsSuccessfulAlbumImagesWhenOneExpired(t *test
 	}
 }
 
-func TestConvertPostNotificationLeavesTransientAlbumFailureRetryable(t *testing.T) {
+func TestConvertPostNotificationKeepsNoticeWhenAlbumPreviewDownloadFails(t *testing.T) {
 	handler := &Handler{
 		NewClient: func() *line.Client {
 			return line.NewClient("token")
 		},
-		DownloadAlbumPreview: func(context.Context, *line.Client, string, string, string) ([]byte, error) {
+		DownloadAlbumPreview: func(context.Context, *line.Client, string, string, string, string) ([]byte, error) {
 			return nil, line.ErrOBSEncodingIncomplete
 		},
 	}
@@ -443,18 +448,18 @@ func TestConvertPostNotificationLeavesTransientAlbumFailureRetryable(t *testing.
 		}},
 		nil,
 	)
-	if converted != nil {
-		t.Fatalf("converted = %#v, want nil for retryable failure", converted)
+	if err != nil {
+		t.Fatalf("ConvertPostNotification returned error: %v", err)
 	}
-	if !errors.Is(err, line.ErrOBSEncodingIncomplete) || !errors.Is(err, bridgev2.ErrIgnoringRemoteEvent) {
-		t.Fatalf("err = %v, want encoding and ignoring sentinels", err)
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgNotice {
+		t.Fatalf("converted = %#v, want notice only", converted)
 	}
 }
 
 func TestConvertPostNotificationKeepsNoticeWhenAlbumChatIDIsMissing(t *testing.T) {
 	var downloads atomic.Int32
 	handler := &Handler{
-		DownloadAlbumPreview: func(context.Context, *line.Client, string, string, string) ([]byte, error) {
+		DownloadAlbumPreview: func(context.Context, *line.Client, string, string, string, string) ([]byte, error) {
 			downloads.Add(1)
 			return nil, errors.New("unexpected download")
 		},

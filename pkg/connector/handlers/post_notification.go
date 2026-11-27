@@ -225,39 +225,43 @@ func (h *Handler) convertAlbumPreview(
 		previewContext.ChatID,
 		previewContext.AlbumID,
 	)
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		imageData, err = h.downloadAlbumPreview(
-			ctx,
-			client,
-			media.SID,
-			media.OID,
-			previewContext.ChatID,
-			previewContext.AlbumID,
-		)
+	if line.HTTPStatusCode(err) != http.StatusForbidden {
+		if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
+			client = newClient
+			imageData, err = h.downloadAlbumPreview(
+				ctx,
+				client,
+				media.SID,
+				media.OID,
+				previewContext.ChatID,
+				previewContext.AlbumID,
+			)
+		}
 	}
 	h.handleFinalAuthError(ctx, client, err)
-	if errors.Is(err, line.ErrOBSObjectNotFound) {
-		h.Log.Warn().
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		logEvt := h.Log.Warn().
+			Err(err).
 			Str("msg_id", messageID).
 			Str("media_oid", media.OID).
 			Str("media_sid", media.SID).
+			Int("status", line.HTTPStatusCode(err)).
 			Str("created_time", previewContext.CreatedTime).
 			Int("preview_index", index).
 			Int("preview_count", previewContext.PreviewCount).
 			Bool("from_preview_medias", previewContext.FromPreviewMedias).
 			Bool("has_album_id", previewContext.AlbumID != "").
 			Int("raw_preview_count", previewContext.RawPreviewCount).
-			Str("raw_preview_kinds", previewContext.RawPreviewKinds).
-			Msg("LINE album preview image expired before it could be bridged")
+			Str("raw_preview_kinds", previewContext.RawPreviewKinds)
+		if errors.Is(err, line.ErrOBSObjectNotFound) {
+			logEvt.Msg("LINE album preview image expired before it could be bridged")
+		} else {
+			logEvt.Msg("Failed to download LINE album preview, skipping it")
+		}
 		return nil, nil
-	} else if err != nil {
-		return nil, fmt.Errorf(
-			"%w: failed to download LINE album preview %q: %w",
-			bridgev2.ErrIgnoringRemoteEvent,
-			media.OID,
-			err,
-		)
 	}
 
 	mimeType, extension := albumPreviewImageType(imageData)
