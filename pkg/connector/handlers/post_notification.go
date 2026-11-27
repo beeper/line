@@ -220,41 +220,48 @@ func (h *Handler) convertAlbumPreview(
 	imageData, err := h.downloadAlbumPreview(
 		ctx,
 		client,
+		media.SID,
 		media.OID,
 		previewContext.ChatID,
 		previewContext.AlbumID,
 	)
-	if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
-		client = newClient
-		imageData, err = h.downloadAlbumPreview(
-			ctx,
-			client,
-			media.OID,
-			previewContext.ChatID,
-			previewContext.AlbumID,
-		)
+	if media.SID != "o" || line.HTTPStatusCode(err) != http.StatusForbidden {
+		if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
+			client = newClient
+			imageData, err = h.downloadAlbumPreview(
+				ctx,
+				client,
+				media.SID,
+				media.OID,
+				previewContext.ChatID,
+				previewContext.AlbumID,
+			)
+		}
 	}
 	h.handleFinalAuthError(ctx, client, err)
-	if errors.Is(err, line.ErrOBSObjectNotFound) {
-		h.Log.Warn().
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		logEvt := h.Log.Warn().
+			Err(err).
 			Str("msg_id", messageID).
 			Str("media_oid", media.OID).
+			Str("media_sid", media.SID).
+			Int("status", line.HTTPStatusCode(err)).
 			Str("created_time", previewContext.CreatedTime).
 			Int("preview_index", index).
 			Int("preview_count", previewContext.PreviewCount).
 			Bool("from_preview_medias", previewContext.FromPreviewMedias).
 			Bool("has_album_id", previewContext.AlbumID != "").
 			Int("raw_preview_count", previewContext.RawPreviewCount).
-			Str("raw_preview_kinds", previewContext.RawPreviewKinds).
-			Msg("LINE album preview image expired before it could be bridged")
+			Str("raw_preview_kinds", previewContext.RawPreviewKinds)
+		if errors.Is(err, line.ErrOBSObjectNotFound) {
+			logEvt.Msg("LINE album preview image expired before it could be bridged")
+		} else {
+			logEvt.Msg("Failed to download LINE album preview, skipping it")
+		}
 		return nil, nil
-	} else if err != nil {
-		return nil, fmt.Errorf(
-			"%w: failed to download LINE album preview %q: %w",
-			bridgev2.ErrIgnoringRemoteEvent,
-			media.OID,
-			err,
-		)
 	}
 
 	mimeType, extension := albumPreviewImageType(imageData)
@@ -328,7 +335,7 @@ func parseAlbumPreviewMedias(metadata map[string]string) ([]postPreviewMedia, bo
 		media.SID = strings.ToLower(strings.TrimSpace(media.SID))
 		media.OID = strings.TrimSpace(media.OID)
 		media.MediaType = strings.ToUpper(strings.TrimSpace(media.MediaType))
-		if media.Service != "album" || media.SID != "a" || media.OID == "" || media.MediaType != "I" {
+		if media.Service != "album" || (media.SID != "a" && media.SID != "o") || media.OID == "" || media.MediaType != "I" {
 			continue
 		}
 		if _, duplicate := seen[media.OID]; duplicate {

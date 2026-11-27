@@ -36,7 +36,7 @@ type Handler struct {
 	DownloadOBSResource func(ctx context.Context, client *line.Client, service, sid, oid string) ([]byte, error)
 
 	// DownloadAlbumPreview overrides album thumbnail downloads in tests.
-	DownloadAlbumPreview func(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error)
+	DownloadAlbumPreview func(ctx context.Context, client *line.Client, sid, oid, chatID, albumID string) ([]byte, error)
 
 	// DecryptMedia decrypts E2EE encrypted media data using the given key material.
 	DecryptMedia func(data []byte, keyMaterial string) ([]byte, error)
@@ -105,11 +105,11 @@ func (h *Handler) decryptMediaWithKeys(data []byte, keys []string, encrypted boo
 	return nil, fmt.Errorf("%w: failed to decrypt %s data: %w", bridgev2.ErrIgnoringRemoteEvent, strings.ToLower(kind), errors.Join(decryptErrors...))
 }
 
-func (h *Handler) downloadAlbumPreview(ctx context.Context, client *line.Client, oid, chatID, albumID string) ([]byte, error) {
+func (h *Handler) downloadAlbumPreview(ctx context.Context, client *line.Client, sid, oid, chatID, albumID string) ([]byte, error) {
 	if h.DownloadAlbumPreview != nil {
-		return h.DownloadAlbumPreview(ctx, client, oid, chatID, albumID)
+		return h.DownloadAlbumPreview(ctx, client, sid, oid, chatID, albumID)
 	}
-	return client.DownloadAlbumPreview(ctx, oid, chatID, albumID)
+	return client.DownloadAlbumPreview(ctx, sid, oid, chatID, albumID)
 }
 
 func obsTalkMetaMessageID(messageID string, isPlainMedia bool) string {
