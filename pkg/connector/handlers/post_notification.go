@@ -225,7 +225,7 @@ func (h *Handler) convertAlbumPreview(
 		previewContext.ChatID,
 		previewContext.AlbumID,
 	)
-	if line.HTTPStatusCode(err) != http.StatusForbidden {
+	if media.SID != "o" || line.HTTPStatusCode(err) != http.StatusForbidden {
 		if newClient, ok := h.tryRecoverClient(ctx, client, err); ok {
 			client = newClient
 			imageData, err = h.downloadAlbumPreview(
