@@ -28,6 +28,10 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 	if stkTxt == "" {
 		stkTxt = "[Sticker]"
 	}
+	var stickerMessage string
+	if stkOpt == "CT" {
+		stickerMessage = strings.TrimSpace(data.ContentMetadata["STK_MESSAGE"])
+	}
 
 	if stkID != "" {
 		baseURL := lineStickerBaseURL(stkID, data.ContentMetadata["STKHASH"])
@@ -40,6 +44,8 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 			stickerURL, isAnimated = baseURL+"/sticker_popup.png", true
 		case "T":
 			stickerURL = baseURL + "/base/sticker.png"
+		case "CT":
+			stickerURL = baseURL + "/base/plus/sticker.png"
 		}
 
 		var nameOverlay []byte
@@ -116,25 +122,36 @@ func (h *Handler) ConvertSticker(ctx context.Context, portal *bridgev2.Portal, i
 			if err != nil {
 				h.Log.Warn().Err(err).Msg("Failed to upload sticker to Matrix")
 			} else {
-				return &bridgev2.ConvertedMessage{
-					Parts: []*bridgev2.ConvertedMessagePart{
-						{
-							Type:  event.EventSticker,
-							Extra: map[string]any{"fi.mau.line.sticker": stickerInfo},
-							Content: &event.MessageEventContent{
-								Body:      bodyName,
-								URL:       mxc,
-								File:      file,
-								Info:      info,
-								RelatesTo: relatesTo,
-							},
-						},
+				parts := []*bridgev2.ConvertedMessagePart{{
+					Type:  event.EventSticker,
+					Extra: map[string]any{"fi.mau.line.sticker": stickerInfo},
+					Content: &event.MessageEventContent{
+						Body:      bodyName,
+						URL:       mxc,
+						File:      file,
+						Info:      info,
+						RelatesTo: relatesTo,
 					},
-				}, nil
+				}}
+				if stickerMessage != "" {
+					parts = append(parts, &bridgev2.ConvertedMessagePart{
+						ID:   "message",
+						Type: event.EventMessage,
+						Content: &event.MessageEventContent{
+							MsgType:   event.MsgText,
+							Body:      stickerMessage,
+							RelatesTo: relatesTo,
+						},
+					})
+				}
+				return &bridgev2.ConvertedMessage{Parts: parts}, nil
 			}
 		}
 	}
 
+	if stickerMessage != "" {
+		stkTxt = stickerMessage
+	}
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{
 			{
