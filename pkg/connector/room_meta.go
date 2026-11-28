@@ -58,7 +58,8 @@ func lineGroupPowerLevels() *bridgev2.PowerLevelOverrides {
 			event.StateRoomName:   0,
 			event.StateRoomAvatar: 0,
 		},
-		Kick: ptr.Ptr(1),
+		Kick:        ptr.Ptr(1),
+		RoomMention: ptr.Ptr(0),
 	}
 }
 

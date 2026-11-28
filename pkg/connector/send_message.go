@@ -1325,6 +1325,31 @@ func findRoomMention(body string, from int) (int, int, bool) {
 	return 0, 0, false
 }
 
+func roomMentionToLine(content *event.MessageEventContent, text string) string {
+	if content.Mentions == nil || !content.Mentions.Room {
+		return text
+	}
+	var out strings.Builder
+	last := 0
+	for cursor := 0; cursor < len(text); {
+		start, end, ok := findRoomMention(text, cursor)
+		if !ok {
+			break
+		}
+		if strings.EqualFold(text[start:end], "@room") {
+			out.WriteString(text[last:start])
+			out.WriteString("@All")
+			last = end
+		}
+		cursor = end
+	}
+	if last == 0 {
+		return text
+	}
+	out.WriteString(text[last:])
+	return out.String()
+}
+
 func isMentionWordRune(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
