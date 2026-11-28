@@ -29,7 +29,7 @@ func outgoingText(ctx context.Context, content *event.MessageEventContent, resol
 		}
 	}
 	if content.Format != event.FormatHTML || (len(mentioned) == 0 && !strings.Contains(content.FormattedBody, "data-mx-emoticon")) {
-		return content.Body, nil, nil
+		return roomMentionToLine(content, content.Body), nil, nil
 	}
 	type token struct {
 		text    string
@@ -69,7 +69,10 @@ func outgoingText(ctx context.Context, content *event.MessageEventContent, resol
 	}
 	parts := strings.Split(parser.Parse(content.FormattedBody, format.NewContext(ctx)), "\x00")
 	if len(tokens) == 0 || len(parts) != len(tokens)+1 {
-		return content.Body, nil, nil
+		return roomMentionToLine(content, content.Body), nil, nil
+	}
+	for i := range parts {
+		parts[i] = roomMentionToLine(content, parts[i])
 	}
 	var body strings.Builder
 	var offset int
